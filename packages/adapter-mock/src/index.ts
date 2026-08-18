@@ -1,5 +1,6 @@
 import {
   NOXSCOPE_PROTOCOL,
+  validateOperationInput,
   validateRecord,
   validateRuntimeDescriptor,
   type ConnectOptions,
@@ -11,6 +12,7 @@ import {
   type OperationRecord,
   type OperationTerminal,
   type RequestOptions,
+  type RecordMeta,
   type Result,
   type RuntimeDescriptor,
   type RuntimeSession,
@@ -26,11 +28,21 @@ export type MockScenario =
   | "prover-failure"
   | "node-disconnect"
   | "dust-registration"
-  | "queue";
+  | "queue"
+  | "malformed-descriptor"
+  | "malformed-raw-detail"
+  | "multiple-streams"
+  | "timestamp-skew"
+  | "stream-gap"
+  | "unavailable"
+  | "reconnection"
+  | "cancellation-race"
+  | "unknown-progress";
 
-const at = (second: number) => `2026-08-18T12:00:0${second}.000Z`;
+const mockTimestampAtSecond = (second: number) => `2026-08-18T12:00:0${second}.000Z`;
 
 export function createMockAdapter(scenario: MockScenario): NoxscopeAdapter {
+  let connectionAttempt = 0;
   return {
     async connect(options) {
       if (options.signal.aborted) {
@@ -39,31 +51,39 @@ export function createMockAdapter(scenario: MockScenario): NoxscopeAdapter {
           error: { code: "cancelled", message: "Connection was cancelled", retryable: false },
         };
       }
-      return { ok: true, value: new MockRuntimeSession(scenario, options) };
+      connectionAttempt += 1;
+      return {
+        ok: true,
+        value: new MockRuntimeSession(scenario, options, connectionAttempt),
+      };
     },
   };
 }
 
 class MockRuntimeSession implements RuntimeSession {
   readonly descriptor: RuntimeDescriptor;
-  readonly #records: NoxscopeRecord[];
   readonly #signal: AbortSignal;
   readonly #scenario: MockScenario;
+  readonly #queue = new AsyncRecordQueue(128);
+  readonly #latestSnapshot: Snapshot;
+  #operationSequence = 0;
   #submittedTransactions = 0;
 
-  constructor(scenario: MockScenario, options: ConnectOptions) {
+  constructor(scenario: MockScenario, options: ConnectOptions, connectionAttempt: number) {
     this.#signal = options.signal;
     this.#scenario = scenario;
-    this.descriptor = descriptorFor(scenario);
-    this.#records = recordsFor(scenario, this.descriptor);
-    assertProtocol(this.descriptor, this.#records);
+    this.descriptor = descriptorFor(scenario, connectionAttempt);
+    const records = recordsFor(scenario, this.descriptor);
+    const latest = [...records].reverse().find((record) => record.kind === "snapshot");
+    if (latest?.kind !== "snapshot") throw new Error("Mock scenario is missing a snapshot");
+    this.#latestSnapshot = latest.snapshot;
+    if (!scenario.startsWith("malformed-")) assertProtocol(this.descriptor, records);
+    for (const record of records) this.#queue.push(record);
+    this.#signal.addEventListener("abort", () => this.#queue.close(), { once: true });
   }
 
-  async *[Symbol.asyncIterator](): AsyncIterator<NoxscopeRecord> {
-    for (const record of this.#records) {
-      if (this.#signal.aborted) return;
-      yield record;
-    }
+  [Symbol.asyncIterator](): AsyncIterator<NoxscopeRecord> {
+    return this.#queue.iterator();
   }
 
   request(request: SnapshotRequest, options?: RequestOptions): Promise<Result<Snapshot>>;
@@ -76,15 +96,38 @@ class MockRuntimeSession implements RuntimeSession {
     request: SnapshotRequest | InvokeRequest | CancelRequest,
     options?: RequestOptions,
   ): Promise<Result<Snapshot | OperationTerminal | { readonly accepted: boolean }>> {
-    if (options?.signal?.aborted) {
+    if (this.#signal.aborted || options?.signal?.aborted) {
       return {
         ok: false,
         error: { code: "cancelled", message: "Request wait was cancelled", retryable: false },
       };
     }
     if (request.kind === "snapshot") {
-      const latest = [...this.#records].reverse().find((record) => record.kind === "snapshot");
-      if (latest?.kind === "snapshot") return { ok: true, value: latest.snapshot };
+      return { ok: true, value: this.#latestSnapshot };
+    }
+    if (request.kind === "invoke") {
+      const checked = validateOperationInput(request.operation);
+      if (!checked.ok) return checked;
+      if (this.#scenario === "unavailable") {
+        return {
+          ok: false,
+          error: {
+            code: "unavailable",
+            message: "Deterministic operation is temporarily unavailable",
+            retryable: true,
+          },
+        };
+      }
+    }
+    if (
+      request.kind === "invoke" &&
+      this.#scenario === "cancellation-race" &&
+      request.operation.kind === "transaction.prove"
+    ) {
+      this.#appendOperations(request, [
+        { kind: "transaction.prove", phase: "proving", state: "running" },
+      ]);
+      return this.#waitForCancellation(options?.signal);
     }
     if (request.kind === "invoke" && request.operation.kind === "transaction.submit") {
       if (this.#scenario === "failed-transaction") {
@@ -151,12 +194,13 @@ class MockRuntimeSession implements RuntimeSession {
     updates: readonly OperationRecord["operation"][],
   ): void {
     for (const [index, operation] of updates.entries()) {
-      const sequence = this.#records.length + 1;
-      const time = at(Math.min(9, 4 + index + 1));
+      this.#operationSequence += 1;
+      const time = mockTimestampAtSecond(Math.min(9, 4 + index + 1));
       const record: OperationRecord = {
         kind: "operation",
         meta: {
-          ...meta(this.descriptor, sequence, time),
+          ...meta(this.descriptor, this.#operationSequence, time),
+          streamId: `${this.descriptor.sessionId}-operations`,
           correlation: {
             requestId: request.requestId,
             operationId: request.operationId,
@@ -169,15 +213,100 @@ class MockRuntimeSession implements RuntimeSession {
       };
       const checked = validateRecord(record);
       if (!checked.ok) throw new Error(checked.error.message);
-      this.#records.push(record);
+      this.#queue.push(record);
     }
+  }
+
+  async #waitForCancellation(signal: AbortSignal | undefined): Promise<Result<OperationTerminal>> {
+    if (signal?.aborted || this.#signal.aborted) {
+      return {
+        ok: false,
+        error: { code: "cancelled", message: "Request wait was cancelled", retryable: false },
+      };
+    }
+    return new Promise((resolve) => {
+      const finish = () => {
+        signal?.removeEventListener("abort", finish);
+        this.#signal.removeEventListener("abort", finish);
+        resolve({
+          ok: false,
+          error: { code: "cancelled", message: "Request wait was cancelled", retryable: false },
+        });
+      };
+      signal?.addEventListener("abort", finish, { once: true });
+      this.#signal.addEventListener("abort", finish, { once: true });
+    });
   }
 }
 
-function descriptorFor(scenario: MockScenario): RuntimeDescriptor {
-  return {
+class AsyncRecordQueue {
+  readonly #capacity: number;
+  readonly #buffer: NoxscopeRecord[] = [];
+  #waiting: ((result: IteratorResult<NoxscopeRecord>) => void) | undefined;
+  #closed = false;
+  #active = false;
+
+  constructor(capacity: number) {
+    this.#capacity = capacity;
+  }
+
+  push(record: NoxscopeRecord): void {
+    if (this.#closed) return;
+    if (this.#waiting !== undefined) {
+      const resolve = this.#waiting;
+      this.#waiting = undefined;
+      resolve({ done: false, value: record });
+      return;
+    }
+    if (this.#buffer.length >= this.#capacity) {
+      throw new Error(`Mock Runtime Session queue exceeded ${this.#capacity} records`);
+    }
+    this.#buffer.push(record);
+  }
+
+  close(): void {
+    this.#closed = true;
+    this.#buffer.length = 0;
+    this.#finishWaiting();
+  }
+
+  iterator(): AsyncIterator<NoxscopeRecord> {
+    if (this.#active) throw new Error("Mock Runtime Session supports one record consumer");
+    this.#active = true;
+    let detached = false;
+    return {
+      next: async () => {
+        if (detached) return { done: true, value: undefined };
+        const buffered = this.#buffer.shift();
+        if (buffered !== undefined) return { done: false, value: buffered };
+        if (this.#closed) {
+          this.#active = false;
+          return { done: true, value: undefined };
+        }
+        return new Promise<IteratorResult<NoxscopeRecord>>((resolve) => {
+          this.#waiting = resolve;
+        });
+      },
+      return: async () => {
+        detached = true;
+        this.#active = false;
+        this.#finishWaiting();
+        return { done: true, value: undefined };
+      },
+    };
+  }
+
+  #finishWaiting(): void {
+    const resolve = this.#waiting;
+    this.#waiting = undefined;
+    resolve?.({ done: true, value: undefined });
+  }
+}
+
+function descriptorFor(scenario: MockScenario, connectionAttempt: number): RuntimeDescriptor {
+  const descriptor: RuntimeDescriptor = {
     protocol: NOXSCOPE_PROTOCOL,
-    sessionId: `session-${scenario}-1`,
+    sessionId: `session-${scenario}-${connectionAttempt}`,
     runtimeId: `runtime-${scenario}-1`,
     adapter: { id: "dev.noxscope.adapter-mock", version: "0.1.0" },
     runtime: {
@@ -190,10 +319,39 @@ function descriptorFor(scenario: MockScenario): RuntimeDescriptor {
       capability("sync.observe", "snapshot"),
       capability("balances.read", "snapshot"),
       capability("diagnostics.observe", "event"),
-      capability("operation.submit", "operation"),
-      capability("dev.noxscope.dust.register", "operation"),
+      scenario === "unavailable"
+        ? unavailableCapability("operation.submit", "operation")
+        : capability("operation.submit", "operation"),
+      scenario === "cancellation-race"
+        ? capability("operation.prove", "operation")
+        : unsupportedCapability("operation.prove", "operation"),
+      scenario === "dust-registration"
+        ? capability("dev.noxscope.dust.register", "operation")
+        : unsupportedCapability("dev.noxscope.dust.register", "operation"),
     ],
   };
+  if (scenario === "malformed-descriptor") {
+    return {
+      ...descriptor,
+      capabilities: descriptor.capabilities.map((capability, index) =>
+        index === 0
+          ? {
+              ...capability,
+              support: {
+                state: "supported",
+                version: "1",
+                evidence: {
+                  source: "runtime-declaration",
+                  observedAt: "not-a-timestamp",
+                  summary: "Malformed deterministic evidence",
+                },
+              },
+            }
+          : capability,
+      ),
+    };
+  }
+  return descriptor;
 }
 
 function capability(id: string, kind: "snapshot" | "event" | "operation") {
@@ -205,11 +363,44 @@ function capability(id: string, kind: "snapshot" | "event" | "operation") {
       version: "1",
       evidence: {
         source: "runtime-declaration" as const,
-        observedAt: at(0),
+        observedAt: mockTimestampAtSecond(0),
         summary: "Declared by deterministic scenario",
       },
     },
     availability: { state: "available" as const },
+  };
+}
+
+function unsupportedCapability(id: string, kind: "snapshot" | "event" | "operation") {
+  return {
+    id,
+    kind,
+    support: {
+      state: "unsupported" as const,
+      reason: "Deterministic scenario does not implement this operation",
+      evidence: {
+        source: "runtime-declaration" as const,
+        observedAt: mockTimestampAtSecond(0),
+        summary: "Declared by deterministic scenario",
+      },
+    },
+    availability: {
+      state: "unavailable" as const,
+      reason: "Capability is unsupported",
+      retryable: false,
+    },
+  };
+}
+
+function unavailableCapability(id: string, kind: "snapshot" | "event" | "operation") {
+  const supported = capability(id, kind);
+  return {
+    ...supported,
+    availability: {
+      state: "unavailable" as const,
+      reason: "Deterministic dependency is unavailable",
+      retryable: true,
+    },
   };
 }
 
@@ -219,7 +410,7 @@ function recordsFor(scenario: MockScenario, descriptor: RuntimeDescriptor): Noxs
     percentage: number,
     state: "syncing" | "synced",
   ): SnapshotRecord => {
-    const time = at(sequence);
+    const time = mockTimestampAtSecond(sequence);
     return {
       kind: "snapshot",
       meta: meta(descriptor, sequence, time),
@@ -259,7 +450,7 @@ function recordsFor(scenario: MockScenario, descriptor: RuntimeDescriptor): Noxs
   };
   const event: DiagnosticEventRecord = {
     kind: "diagnostic-event",
-    meta: meta(descriptor, 4, at(4)),
+    meta: meta(descriptor, 4, mockTimestampAtSecond(4)),
     event: {
       type: "diagnostic",
       name: "sync.complete",
@@ -310,7 +501,7 @@ function recordsFor(scenario: MockScenario, descriptor: RuntimeDescriptor): Noxs
   if (scenario === "prover-failure") {
     records[3] = {
       kind: "diagnostic-event",
-      meta: meta(descriptor, 4, at(4)),
+      meta: meta(descriptor, 4, mockTimestampAtSecond(4)),
       event: {
         type: "capability-availability",
         capabilityId: "operation.submit",
@@ -326,7 +517,7 @@ function recordsFor(scenario: MockScenario, descriptor: RuntimeDescriptor): Noxs
     records[3] = {
       kind: "operation",
       meta: {
-        ...meta(descriptor, 4, at(4)),
+        ...meta(descriptor, 4, mockTimestampAtSecond(4)),
         correlation: { operationId: "operation-failed-fixture" },
       },
       operation: {
@@ -341,10 +532,84 @@ function recordsFor(scenario: MockScenario, descriptor: RuntimeDescriptor): Noxs
       },
     };
   }
+  if (scenario === "malformed-raw-detail") {
+    const malformed: unknown = {
+      ...event,
+      event: {
+        ...event.event,
+        raw: [
+          {
+            namespace: "dev.noxscope.mock",
+            schemaVersion: "1",
+            value: { leaked: undefined },
+            sanitization: {
+              policy: "mock",
+              policyVersion: "1",
+              redactions: [],
+            },
+          },
+        ],
+      },
+    };
+    records[3] = malformed as NoxscopeRecord;
+  }
+  if (scenario === "multiple-streams") {
+    records[0] = updateRecordMeta(records[0]!, {
+      streamId: `${descriptor.sessionId}-state`,
+      sequence: "1",
+    });
+    records[1] = updateRecordMeta(records[1]!, {
+      streamId: `${descriptor.sessionId}-state`,
+      sequence: "2",
+    });
+    records[2] = updateRecordMeta(records[2]!, {
+      streamId: `${descriptor.sessionId}-state`,
+      sequence: "3",
+    });
+    records[3] = updateRecordMeta(records[3]!, {
+      streamId: `${descriptor.sessionId}-events`,
+      sequence: "1",
+    });
+  }
+  if (scenario === "timestamp-skew") {
+    records[0] = updateRecordMeta(records[0]!, {
+      observedAt: mockTimestampAtSecond(3),
+      receivedAt: mockTimestampAtSecond(3),
+    });
+  }
+  if (scenario === "stream-gap") {
+    for (let index = 1; index < records.length; index += 1) {
+      records[index] = updateRecordMeta(records[index]!, { sequence: String(index + 2) });
+    }
+  }
+  if (scenario === "unknown-progress") {
+    records[2] = {
+      ...final,
+      snapshot: {
+        ...final.snapshot,
+        sync: {
+          ...final.snapshot.sync!,
+          domains: (final.snapshot.sync?.domains ?? []).map((domain) =>
+            domain.domain === "dust" ? { domain: domain.domain, state: domain.state } : domain,
+          ),
+        },
+      },
+    };
+  }
   if (scenario === "dust-registration") {
     records[2] = { ...final, snapshot: { ...final.snapshot, dust: { state: "registered" } } };
   }
   return records;
+}
+
+function updateRecordMeta(record: NoxscopeRecord, updates: Partial<RecordMeta>): NoxscopeRecord {
+  if (record.kind === "operation") {
+    return {
+      ...record,
+      meta: { ...record.meta, ...updates, correlation: record.meta.correlation },
+    };
+  }
+  return { ...record, meta: { ...record.meta, ...updates } };
 }
 
 function meta(descriptor: RuntimeDescriptor, sequence: number, time: string) {

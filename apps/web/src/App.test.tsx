@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { createMockAdapter } from "@noxscope/adapter-mock";
+import { createMockAdapter, type MockScenario } from "@noxscope/adapter-mock";
 import { createCore } from "@noxscope/core";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
@@ -20,5 +20,15 @@ describe("Overview", () => {
     expect(screen.getByText("42,000,000")).toBeTruthy();
     expect(screen.getByText("sync.complete")).toBeTruthy();
     expect(screen.getByText("#4")).toBeTruthy();
+  });
+
+  it("renders missing sync progress as unknown instead of zero", async () => {
+    const core = createCore({ signal: new AbortController().signal });
+    render(<App core={core} />);
+
+    await core.connect(createMockAdapter("unknown-progress" as MockScenario));
+
+    expect(await screen.findByText("Unknown progress")).toBeTruthy();
+    expect(screen.queryByText("0%")).toBeNull();
   });
 });

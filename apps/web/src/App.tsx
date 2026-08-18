@@ -136,13 +136,14 @@ function Status({ value }: { readonly value: string }) {
 
 function SyncBar({
   label,
-  percentage = 0,
+  percentage,
   state,
 }: {
   readonly label: string;
   readonly percentage?: number | undefined;
   readonly state: string;
 }) {
+  const knownPercentage = percentage !== undefined;
   return (
     <div className="sync-row">
       <div>
@@ -150,9 +151,13 @@ function SyncBar({
         <span>{state}</span>
       </div>
       <div className="track">
-        <span style={{ width: `${Math.max(0, Math.min(100, percentage))}%` }} />
+        <span
+          style={{
+            width: knownPercentage ? `${Math.max(0, Math.min(100, percentage))}%` : undefined,
+          }}
+        />
       </div>
-      <code>{percentage}%</code>
+      <code>{knownPercentage ? `${percentage}%` : "Unknown progress"}</code>
     </div>
   );
 }
