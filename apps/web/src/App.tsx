@@ -1,6 +1,12 @@
 import type { Core, CoreView, RuntimeView } from "@noxscope/core";
 import type { NoxscopeRecord } from "@noxscope/protocol";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  createRecordingSession,
+  type RecordingSession,
+  type RecordingSessionState,
+} from "./recording-session.js";
+import { createMemoryRecordingStore } from "./recording-store.js";
 
 const emptyView: CoreView = {
   runtimes: [],
@@ -10,11 +16,32 @@ const emptyView: CoreView = {
 
 export interface AppProps {
   readonly core: Core;
+  readonly recordingSession?: RecordingSession;
 }
 
-export function App({ core }: AppProps) {
+export function App({ core, recordingSession: providedRecordingSession }: AppProps) {
   const [view, setView] = useState<CoreView>(emptyView);
+  const recordingSession = useMemo(
+    () =>
+      providedRecordingSession ??
+      createRecordingSession(core, { store: createMemoryRecordingStore() }),
+    [core, providedRecordingSession],
+  );
+  const [recording, setRecording] = useState<RecordingSessionState>({
+    phase: "idle",
+    summaries: [],
+  });
+  const fileInput = useRef<HTMLInputElement>(null);
   useEffect(() => core.subscribe(setView), [core]);
+  useEffect(() => recordingSession.subscribe(setRecording), [recordingSession]);
+  useEffect(
+    () => () => {
+      if (providedRecordingSession === undefined) recordingSession.dispose();
+    },
+    [providedRecordingSession, recordingSession],
+  );
+
+  const offline = recording.offline;
 
   return (
     <main className="workbench">
@@ -27,9 +54,45 @@ export function App({ core }: AppProps) {
           <strong>{view.runtimes.length}</strong>
           <span>Runtime Sessions</span>
         </div>
+        <RecordingControls
+          state={recording}
+          onStart={() => void recordingSession.start()}
+          onStop={() => void recordingSession.stop()}
+          onImport={() => fileInput.current?.click()}
+          onCloseOffline={() => recordingSession.closeOffline()}
+        />
       </header>
 
-      {view.runtimes.length === 0 ? (
+      <input
+        ref={fileInput}
+        className="visually-hidden"
+        type="file"
+        accept=".noxscope,.recording,application/octet-stream"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = "";
+          if (file !== undefined) void recordingSession.importFile(file);
+        }}
+      />
+
+      <RecordingStatus state={recording} />
+
+      {offline === undefined ? null : (
+        <section className="offline-banner" aria-live="polite">
+          <div>
+            <p className="eyebrow">Offline inspection</p>
+            <strong>{offline.name}</strong>
+            <span>Replay-only view · no wallet, network, or runtime operations</span>
+          </div>
+          <button type="button" onClick={() => recordingSession.closeOffline()}>
+            Return to live view
+          </button>
+        </section>
+      )}
+
+      {offline !== undefined ? (
+        <OfflineOverview records={offline.imported.records} />
+      ) : view.runtimes.length === 0 ? (
         <section className="empty-panel">Waiting for a Runtime Session…</section>
       ) : (
         <div className="runtime-grid">
@@ -47,7 +110,10 @@ export function App({ core }: AppProps) {
           <span>Kind</span>
           <span>Observation</span>
         </div>
-        {view.timeline.map(({ runtimeId, record }) => (
+        {(
+          offline?.imported.records.map((record) => ({ runtimeId: "offline", record })) ??
+          view.timeline
+        ).map(({ runtimeId, record }) => (
           <div
             className="timeline-row"
             key={`${record.meta.sessionId}-${record.meta.streamId}-${record.meta.sequence}`}
@@ -59,8 +125,156 @@ export function App({ core }: AppProps) {
           </div>
         ))}
       </section>
+
+      <RecordingLibrary
+        state={recording}
+        onLoad={(id) => void recordingSession.load(id)}
+        onDelete={(id) => void recordingSession.delete(id)}
+        onExport={(id) => void recordingSession.export(id)}
+      />
     </main>
   );
+}
+
+function RecordingControls({
+  state,
+  onStart,
+  onStop,
+  onImport,
+  onCloseOffline,
+}: {
+  readonly state: RecordingSessionState;
+  readonly onStart: () => void;
+  readonly onStop: () => void;
+  readonly onImport: () => void;
+  readonly onCloseOffline: () => void;
+}) {
+  const recording = state.phase === "recording" || state.phase === "finalizing";
+  return (
+    <div className="recording-controls" aria-label="Recording controls">
+      {recording ? (
+        <button type="button" onClick={onStop} disabled={state.phase === "finalizing"}>
+          {state.phase === "finalizing" ? "Finalizing…" : "Stop Recording"}
+        </button>
+      ) : (
+        <button type="button" onClick={onStart} disabled={state.phase === "offline"}>
+          Start Recording
+        </button>
+      )}
+      <button type="button" onClick={onImport} disabled={recording}>
+        Import Recording
+      </button>
+      {state.phase === "offline" ? (
+        <button type="button" onClick={onCloseOffline}>
+          Close Offline Mode
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function RecordingStatus({ state }: { readonly state: RecordingSessionState }) {
+  if (state.error === undefined && state.phase === "idle") return null;
+  return (
+    <p
+      className={`recording-status recording-status-${state.phase}`}
+      role="status"
+      aria-live="polite"
+    >
+      {state.error?.message ??
+        (state.phase === "recording"
+          ? "Recording live canonical events"
+          : state.phase === "finalizing"
+            ? "Sanitizing and finalizing Recording"
+            : state.phase === "offline"
+              ? "Offline replay is active; runtime operations are disabled"
+              : "Recording storage is unavailable")}
+    </p>
+  );
+}
+
+function RecordingLibrary({
+  state,
+  onLoad,
+  onDelete,
+  onExport,
+}: {
+  readonly state: RecordingSessionState;
+  readonly onLoad: (id: string) => void;
+  readonly onDelete: (id: string) => void;
+  readonly onExport: (id: string) => void;
+}) {
+  return (
+    <section className="panel recording-library" aria-labelledby="recordings-title">
+      <div className="panel-heading">
+        <div>
+          <p>Local-only storage</p>
+          <h3 id="recordings-title">Recordings</h3>
+        </div>
+        <span className="muted">No automatic upload</span>
+      </div>
+      {state.summaries.length === 0 ? (
+        <p className="muted">No saved Recordings</p>
+      ) : (
+        <div className="recording-list">
+          {state.summaries.map((summary) => (
+            <div className="recording-row" key={summary.id}>
+              <div>
+                <strong>{summary.name}</strong>
+                <small>
+                  {summary.recordCount} records · {formatBytes(summary.bytes)} · {summary.createdAt}
+                </small>
+              </div>
+              <div className="recording-row-actions">
+                <button
+                  type="button"
+                  onClick={() => onLoad(summary.id)}
+                  disabled={state.phase === "recording"}
+                >
+                  Inspect
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onExport(summary.id)}
+                  disabled={state.phase === "offline"}
+                >
+                  Export
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDelete(summary.id)}
+                  disabled={state.phase === "recording"}
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function OfflineOverview({ records }: { readonly records: readonly NoxscopeRecord[] }) {
+  return (
+    <section className="panel offline-overview" aria-label="Offline replay summary">
+      <PanelHeading kicker="ImportedRecording.replay" title="Replay-only evidence" />
+      <p className="muted">
+        {records.length} canonical Records are available for inspection. This mode does not connect
+        to Adapters or issue runtime operations.
+      </p>
+      <button type="button" disabled aria-disabled="true">
+        Runtime operations disabled offline
+      </button>
+    </section>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function RuntimeOverview({ runtime }: { readonly runtime: RuntimeView }) {

@@ -3,6 +3,8 @@ import { createCore } from "@noxscope/core";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.js";
+import { createRecordingSession } from "./recording-session.js";
+import { createIndexedDbRecordingStore } from "./recording-store.js";
 import "./styles.css";
 
 const lifetime = new AbortController();
@@ -17,6 +19,11 @@ if (element === null) throw new Error("Noxscope root element is missing");
 
 createRoot(element).render(
   <StrictMode>
-    <App core={core} />
+    <App
+      core={core}
+      recordingSession={createRecordingSession(core, {
+        store: createIndexedDbRecordingStore(),
+      })}
+    />
   </StrictMode>,
 );
