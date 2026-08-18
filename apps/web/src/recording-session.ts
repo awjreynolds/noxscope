@@ -14,12 +14,21 @@ import {
   type RecordingStore,
   type RecordingSummary,
 } from "./recording-store.js";
+import {
+  DEFAULT_RECORDING_MANIFEST,
+  RECORDING_POLICY,
+  defaultRecordingProvenanceRegistry,
+  preflightRecordingProvenance,
+  type RecordingProvenanceRegistry,
+} from "./recording-provenance.js";
 
 export interface RecordingSessionOptions {
   readonly store?: RecordingStore;
   readonly now?: () => string;
   /** Injected only for deterministic tests; production uses browser crypto. */
   readonly randomValues?: (bytes: Uint8Array) => Uint8Array;
+  /** Checked-in/local adapter manifests trusted for importing portable Recordings. */
+  readonly provenanceRegistry?: RecordingProvenanceRegistry;
 }
 
 export type RecordingSessionPhase = "idle" | "recording" | "finalizing" | "offline" | "error";
@@ -61,18 +70,6 @@ interface TransitionToken {
   readonly epoch: number;
 }
 
-const POLICY = Object.freeze({ id: "noxscope.redaction", version: "1.0.0", digest: "core-v1" });
-const DEFAULT_ADAPTER = Object.freeze({
-  id: "noxscope.browser",
-  version: "0.1.0",
-  sourceVersions: ["noxscope/adapter/1"],
-});
-const DEFAULT_ADAPTER_MANIFEST: AdapterSanitizationManifest = {
-  adapter: DEFAULT_ADAPTER,
-  policy: POLICY,
-  projections: [],
-};
-
 export function createRecordingSession(
   core: Core,
   options: RecordingSessionOptions = {},
@@ -82,6 +79,7 @@ export function createRecordingSession(
     createMemoryRecordingStore(options.now === undefined ? {} : { now: options.now });
   const now = options.now ?? (() => new Date().toISOString());
   const randomValues = options.randomValues ?? secureRandomValues;
+  const provenanceRegistry = options.provenanceRegistry ?? defaultRecordingProvenanceRegistry();
   const listeners = new Set<(state: RecordingSessionState) => void>();
   let currentView: CoreView = { runtimes: [], timeline: [], ordering: "display-time-only" };
   let current: RecordingSessionState = { phase: "idle", summaries: [] };
@@ -196,6 +194,11 @@ export function createRecordingSession(
       }
       recordingName = name;
       const manifests = manifestsFor(currentView);
+      const registered = provenanceRegistry.register(manifests);
+      if (!registered.ok) {
+        publish({ ...current, phase: "error", error: registered.error });
+        return registered;
+      }
       recordingContext = {
         manifest: manifests[0]!,
         adapters: manifests,
@@ -402,7 +405,11 @@ export function createRecordingSession(
   async function importBytes(
     bytes: Uint8Array,
   ): Promise<Result<{ readonly imported: ImportedRecording }>> {
-    const manifests = manifestsFor(currentView);
+    const provenance = preflightRecordingProvenance(bytes);
+    if (!provenance.ok) return provenance;
+    const resolved = provenanceRegistry.resolve(provenance.value);
+    if (!resolved.ok) return resolved;
+    const manifests = resolved.value;
     const context = {
       manifest: manifests[0]!,
       adapters: manifests,
@@ -410,7 +417,11 @@ export function createRecordingSession(
     };
     if (!context.pseudonymKey.ok) return context.pseudonymKey;
     const imported = await importRecording(bytes, {
-      sanitization: { manifest: context.manifest, pseudonymKey: context.pseudonymKey.value },
+      sanitization: {
+        manifest: context.manifest,
+        adapters: context.adapters,
+        pseudonymKey: context.pseudonymKey.value,
+      },
     });
     return imported.ok ? { ok: true, value: { imported: imported.value } } : imported;
   }
@@ -492,10 +503,10 @@ function manifestsFor(view: CoreView): readonly AdapterSanitizationManifest[] {
         .map((version) => `${version.subject}@${version.version}`)
         .sort(),
     },
-    policy: POLICY,
+    policy: RECORDING_POLICY,
     projections: [],
   }));
-  return manifests.length === 0 ? [DEFAULT_ADAPTER_MANIFEST] : manifests;
+  return manifests.length === 0 ? [DEFAULT_RECORDING_MANIFEST] : manifests;
 }
 
 function recordKey(

@@ -18,6 +18,7 @@ export {
   NOXSCOPE_RECORDING_MAGIC,
   NOXSCOPE_RECORDING_SCHEMA_VERSION,
   RECORDING_LIMITS,
+  adapterReferences,
   createRecorder,
 } from "./recording.js";
 export type {

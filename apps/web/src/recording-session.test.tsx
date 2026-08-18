@@ -1,4 +1,5 @@
-import type { Core, CoreView } from "@noxscope/core";
+import { createRecorder, type Core, type CoreView } from "@noxscope/core";
+import type { AdapterSanitizationManifest } from "@noxscope/core";
 import { describe, expect, it, vi } from "vitest";
 import { createMemoryRecordingStore } from "./recording-store.js";
 import {
@@ -116,7 +117,58 @@ describe("recording session", () => {
     expect(text.indexOf('"id":"adapter.alpha"')).toBeGreaterThanOrEqual(0);
     expect(text.indexOf('"id":"adapter.beta"')).toBeGreaterThanOrEqual(0);
     expect(text.indexOf('"id":"adapter.alpha"')).toBeLessThan(text.indexOf('"id":"adapter.beta"'));
+    const fresh = createRecordingSession(fakeCore(), {
+      store,
+      randomValues: (bytes) => bytes.fill(11),
+    });
+    expect(await fresh.load(stopped.value.id)).toMatchObject({ ok: true });
+    fresh.dispose();
     session.dispose();
+  });
+
+  it("imports an empty-live Recording in a fresh session through the trusted default provenance", async () => {
+    const store = createMemoryRecordingStore({ now: () => "2026-08-19T12:00:00.000Z" });
+    const source = createRecordingSession(fakeCore(), {
+      store,
+      now: () => "2026-08-19T12:00:02.000Z",
+      randomValues: (bytes) => bytes.fill(12),
+    });
+    expect(await source.start("empty-live")).toMatchObject({ ok: true });
+    const saved = await source.stop();
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) throw new Error(saved.error.message);
+    const fresh = createRecordingSession(fakeCore(), {
+      store,
+      randomValues: (bytes) => bytes.fill(13),
+    });
+    expect(await fresh.load(saved.value.id)).toMatchObject({ ok: true });
+    fresh.dispose();
+    source.dispose();
+  });
+
+  it("rejects an unknown policy even when the file is otherwise a valid Recording", async () => {
+    const foreignManifest: AdapterSanitizationManifest = {
+      adapter: { id: "adapter.foreign", version: "9.0.0", sourceVersions: ["foreign"] },
+      policy: { id: "unknown.policy", version: "9.0.0", digest: "unknown" },
+      projections: [],
+    };
+    const recorder = createRecorder({
+      now: () => "2026-08-19T12:00:02.000Z",
+      sanitization: { manifest: foreignManifest, pseudonymKey: new Uint8Array(32).fill(14) },
+    });
+    const finalized = await recorder.finalize();
+    expect(finalized.ok).toBe(true);
+    if (!finalized.ok) throw new Error(finalized.error.message);
+    const store = createMemoryRecordingStore();
+    const saved = await store.save({ name: "foreign", bytes: finalized.value.bytes });
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) throw new Error(saved.error.message);
+    const fresh = createRecordingSession(fakeCore(), { store });
+    expect(await fresh.load(saved.value.id)).toMatchObject({
+      ok: false,
+      error: { code: "incompatible" },
+    });
+    fresh.dispose();
   });
 
   it("imports hostile input through the bounded parser and enters explicit offline replay", async () => {
