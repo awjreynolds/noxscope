@@ -14,6 +14,7 @@ import {
 
 export * from "./sanitizer.js";
 export * from "./recording.js";
+export * from "./recording-import.js";
 
 export interface CoreOptions {
   readonly signal: AbortSignal;

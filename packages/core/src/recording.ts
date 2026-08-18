@@ -114,6 +114,12 @@ export interface Recorder {
   finalize(): Promise<Result<RecordingExport>>;
 }
 
+export interface SanitizedRecordingRecord {
+  readonly record: NoxscopeRecord;
+  readonly droppedAttributes: number;
+  readonly redactions: number;
+}
+
 interface ResolvedRecordingOptions {
   readonly now: () => string;
   readonly limits: RecordingLimits;
@@ -171,6 +177,14 @@ const FINALIZATION_RESERVE_BYTES = 256 * 1024;
 
 export function createRecorder(options: RecordingOptions = {}): Recorder {
   return new RecordingBuilder(resolveOptions(options));
+}
+
+/** Reuses the recorder's strict canonical projection for hostile imports. */
+export async function sanitizeRecordingRecord(
+  record: NoxscopeRecord,
+  context: RecordingSanitizationContext,
+): Promise<Result<SanitizedRecordingRecord>> {
+  return sanitizeCanonicalRecord(record, createSanitizer(), context);
 }
 
 class RecordingBuilder implements Recorder {
