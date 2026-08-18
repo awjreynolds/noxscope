@@ -746,6 +746,47 @@ describe("Sanitizer", () => {
     });
   });
 
+  it("runs global secret detectors before S2 pseudonymization while keeping benign identifiers", async () => {
+    const sanitizer = createSanitizer();
+    const pseudonymManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: [
+        {
+          source: "wallet.secretLike",
+          target: "snapshot.secretLike",
+          classification: "S2",
+          transform: "pseudonym",
+        },
+        {
+          source: "wallet.address",
+          target: "snapshot.address",
+          classification: "S2",
+          transform: "pseudonym",
+        },
+      ],
+    };
+    const result = await sanitizer.sanitize(
+      {
+        wallet: {
+          secretLike:
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+          address: "addr_test1 benign_identifier",
+        },
+      },
+      pseudonymManifest,
+      { pseudonymKey: new Uint8Array(32).fill(3) },
+    );
+
+    expect(result.ok && result.value.value).toEqual({
+      snapshot: { address: expect.stringMatching(/^hmac-sha256:[0-9a-f]{64}$/) },
+    });
+    expect(result.ok && result.value.audit.redactions).toContainEqual({
+      path: "wallet.secretlike",
+      reason: "secret",
+    });
+    expect(JSON.stringify(result)).not.toContain("abandon abandon");
+  });
+
   it("keeps recording pseudonyms stable, domain-separated, isolated, and mutation-safe", async () => {
     const sanitizer = createSanitizer();
     const input = {

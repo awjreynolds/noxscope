@@ -1,6 +1,11 @@
-import { NOXSCOPE_RECORDING_MAGIC, createRecorder, type RecordingRecord } from "./recording.js";
+import {
+  NOXSCOPE_RECORDING_MAGIC,
+  RECORDING_LIMITS,
+  createRecorder,
+  type RecordingRecord,
+} from "./recording.js";
 import type { AdapterSanitizationManifest } from "./sanitizer.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 const record: RecordingRecord = {
   kind: "diagnostic-event",
@@ -62,8 +67,6 @@ describe("Recording v1 codec", () => {
   it("writes explicit magic, byte-length framed JSON, digests, and an immutable export", async () => {
     const recorder = makeRecorder({
       now: () => "2026-08-18T12:00:02.000Z",
-      adapters: [{ id: "mock", version: "1.0.0", sourceVersions: ["fixture"] }],
-      policies: [{ id: "noxscope.redaction", version: "1.0.0", digest: "policy-digest" }],
     });
 
     await expect(recorder.append(record)).resolves.toEqual({ ok: true, value: undefined });
@@ -231,6 +234,21 @@ describe("Recording v1 codec", () => {
       "manifest",
       "integrity",
     ]);
+    const header = JSON.parse(frames[0]!.payload) as {
+      adapters: readonly [{ id: string; version: string; sourceVersions: readonly string[] }];
+      policies: readonly [{ id: string; version: string; digest: string }];
+    };
+    const manifestPayload = JSON.parse(
+      frames.find((frame) => frame.type === "manifest")!.payload,
+    ) as typeof header;
+    expect(header.adapters[0]).toEqual({
+      id: manifest.adapter.id,
+      version: manifest.adapter.version,
+      sourceVersions: manifest.adapter.sourceVersions,
+    });
+    expect(header.policies[0]).toEqual(manifest.policy);
+    expect(manifestPayload.adapters).toEqual(header.adapters);
+    expect(manifestPayload.policies).toEqual(header.policies);
     const manifestFrame = frames.find((frame) => frame.type === "manifest");
     const terminal = JSON.parse(frames.at(-1)!.payload) as {
       contentDigest: string;
@@ -284,5 +302,58 @@ describe("Recording v1 codec", () => {
       error: { code: "invalid", message: "Recording export time is invalid", retryable: false },
     });
     expect(JSON.stringify(result)).not.toContain("secret clock detail");
+
+    const nullClock = makeRecorder({ now: (() => null) as unknown as () => string });
+    await expect(nullClock.finalize()).resolves.toEqual({
+      ok: false,
+      error: { code: "invalid", message: "Recording export time is invalid", retryable: false },
+    });
+  });
+
+  it("snapshots candidates synchronously before queued asynchronous work", async () => {
+    const candidate = structuredClone(record) as unknown as Record<string, unknown>;
+    const pending = makeRecorder().append(candidate);
+    (candidate.event as Record<string, unknown>).message = "mutated-after-append";
+    await expect(pending).resolves.toEqual({ ok: true, value: undefined });
+
+    const recorder = makeRecorder();
+    await recorder.append(structuredClone(record));
+    const result = await recorder.finalize();
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(new TextDecoder().decode(result.value.bytes)).not.toContain("mutated-after-append");
+  });
+
+  it("contains digest failures and enforces hard global ceilings", async () => {
+    expect(() =>
+      makeRecorder({ limits: { maxFileBytes: RECORDING_LIMITS.maxFileBytes + 1 } }),
+    ).toThrow("Recording limits are invalid");
+    const tiny = makeRecorder({ limits: { maxFileBytes: 1 } });
+    await expect(tiny.append(record)).resolves.toEqual({
+      ok: false,
+      error: {
+        code: "overflow",
+        message: "Recording file exceeds a resource limit",
+        retryable: false,
+      },
+    });
+
+    const digestSpy = vi
+      .spyOn(crypto.subtle, "digest")
+      .mockRejectedValue(new Error("secret digest exception"));
+    try {
+      const result = await makeRecorder().finalize();
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          code: "invalid",
+          message: "Recording integrity could not be computed",
+          retryable: false,
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain("secret digest exception");
+    } finally {
+      digestSpy.mockRestore();
+    }
   });
 });

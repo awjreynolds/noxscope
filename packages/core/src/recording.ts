@@ -22,6 +22,7 @@ export interface RecordingAdapterReference {
   readonly id: string;
   readonly version: string;
   readonly sourceVersions: readonly string[];
+  readonly raw?: { readonly namespace: string; readonly schemaVersion: string };
 }
 
 export interface RecordingPolicyReference {
@@ -61,10 +62,6 @@ export interface RecordingSanitizationContext {
 export interface RecordingOptions {
   /** A clock is injectable so test fixtures can remain deterministic. */
   readonly now?: () => string;
-  readonly adapters?: readonly RecordingAdapterReference[];
-  readonly policies?: readonly RecordingPolicyReference[];
-  /** Convenience for callers that already have the reviewed adapter manifest. */
-  readonly manifest?: AdapterSanitizationManifest;
   readonly sanitization?: RecordingSanitizationContext;
   readonly limits?: Partial<RecordingLimits>;
 }
@@ -119,8 +116,6 @@ export interface Recorder {
 
 interface ResolvedRecordingOptions {
   readonly now: () => string;
-  readonly adapters: readonly RecordingAdapterReference[];
-  readonly policies: readonly RecordingPolicyReference[];
   readonly limits: RecordingLimits;
   readonly sanitization: RecordingSanitizationContext;
 }
@@ -172,6 +167,7 @@ interface SanitizationAccumulator {
 
 const INTEGRITY_WARNING =
   "Integrity digests detect accidental or modifying changes; they do not authenticate the producer." as const;
+const FINALIZATION_RESERVE_BYTES = 256 * 1024;
 
 export function createRecorder(options: RecordingOptions = {}): Recorder {
   return new RecordingBuilder(resolveOptions(options));
@@ -189,6 +185,7 @@ class RecordingBuilder implements Recorder {
     redactions: 0,
   };
   #appendTail: Promise<void> = Promise.resolve();
+  #queuedBytes = utf8(`${NOXSCOPE_RECORDING_MAGIC}\n`).byteLength;
   #finalizing = false;
   #finalized = false;
 
@@ -198,8 +195,21 @@ class RecordingBuilder implements Recorder {
 
   append(candidate: unknown): Promise<Result<void>> {
     if (this.#finalized || this.#finalizing) return Promise.resolve(lifecycleError());
+    if (this.#queuedBytes + FINALIZATION_RESERVE_BYTES >= this.#options.limits.maxFileBytes) {
+      this.#counts.droppedRecords += 1;
+      return Promise.resolve(overflow("Recording file exceeds a resource limit"));
+    }
+    const snapshot = snapshotInert(candidate, this.#options.limits);
+    if (snapshot.state !== "valid") {
+      this.#counts.droppedRecords += 1;
+      return Promise.resolve(
+        snapshot.state === "overflow"
+          ? overflow("Recording record exceeds a resource limit")
+          : invalid("Recording record is invalid"),
+      );
+    }
     const next = this.#appendTail.then(async () => {
-      const result = await this.#appendInternal(candidate);
+      const result = await this.#appendInternal(snapshot.value);
       if (!result.ok) this.#counts.droppedRecords += 1;
       return result;
     });
@@ -215,7 +225,7 @@ class RecordingBuilder implements Recorder {
     this.#finalizing = true;
     await this.#appendTail;
     this.#finalized = true;
-    let exportedAt: string;
+    let exportedAt: unknown;
     try {
       exportedAt = this.#options.now();
     } catch {
@@ -229,8 +239,8 @@ class RecordingBuilder implements Recorder {
       protocol: NOXSCOPE_PROTOCOL,
       schemaVersion: NOXSCOPE_RECORDING_SCHEMA_VERSION,
       exportedAt,
-      adapters: this.#options.adapters,
-      policies: this.#options.policies,
+      adapters: [adapterReference(this.#options.sanitization.manifest)],
+      policies: [policyReference(this.#options.sanitization.manifest)],
     };
     const encodedHeader = encodeJson(header);
     if (!encodedHeader.ok) return encodedHeader;
@@ -269,19 +279,25 @@ class RecordingBuilder implements Recorder {
       }
     }
     const prefix = concat(prefixParts, totalBytes);
+    let prefixDigest: string;
+    try {
+      prefixDigest = await sha256Hex(prefix);
+    } catch {
+      return invalid("Recording integrity could not be computed");
+    }
     const manifest: RecordingManifest = deepFreeze({
       format: NOXSCOPE_RECORDING_FORMAT,
       formatVersion: 1,
       protocol: NOXSCOPE_PROTOCOL,
       schemaVersion: NOXSCOPE_RECORDING_SCHEMA_VERSION,
       exportedAt,
-      adapters: this.#options.adapters,
-      policies: this.#options.policies,
+      adapters: [adapterReference(this.#options.sanitization.manifest)],
+      policies: [policyReference(this.#options.sanitization.manifest)],
       counts: { ...this.#counts },
       integrity: {
         algorithm: "SHA-256",
         frameDigests: digests,
-        contentDigest: await sha256Hex(prefix),
+        contentDigest: prefixDigest,
         authenticated: false,
         warning: INTEGRITY_WARNING,
       },
@@ -344,13 +360,7 @@ class RecordingBuilder implements Recorder {
     if (this.#counts.records >= this.#options.limits.maxRecords) {
       return overflow("Recording record count exceeds a resource limit");
     }
-    const snapshot = snapshotInert(candidate, this.#options.limits);
-    if (snapshot.state !== "valid") {
-      return snapshot.state === "overflow"
-        ? overflow("Recording record exceeds a resource limit")
-        : invalid("Recording record is invalid");
-    }
-    const checked = validateRecord(snapshot.value);
+    const checked = validateRecord(candidate);
     if (!checked.ok) return checked;
     let sanitized: SanitizedRecordResult;
     try {
@@ -368,7 +378,15 @@ class RecordingBuilder implements Recorder {
     if (encoded.value.byteLength > this.#options.limits.maxRecordBytes) {
       return overflow("Recording record exceeds a resource limit");
     }
+    const frameBytes = framedPayloadSize("record", encoded.value.byteLength);
+    if (
+      this.#queuedBytes + frameBytes + FINALIZATION_RESERVE_BYTES >
+      this.#options.limits.maxFileBytes
+    ) {
+      return overflow("Recording file exceeds a resource limit");
+    }
     this.#frames.push({ type: "record", payload: encoded.value });
+    this.#queuedBytes += frameBytes;
     this.#counts.records += 1;
     this.#counts.droppedAttributes += sanitized.value.droppedAttributes;
     this.#counts.redactions += sanitized.value.redactions;
@@ -1231,6 +1249,25 @@ function isJsonValue(value: unknown): value is JsonValue {
   return false;
 }
 
+function adapterReference(manifest: AdapterSanitizationManifest): RecordingAdapterReference {
+  return {
+    id: manifest.adapter.id,
+    version: manifest.adapter.version,
+    sourceVersions: [...manifest.adapter.sourceVersions],
+    ...(manifest.raw === undefined
+      ? {}
+      : { raw: { namespace: manifest.raw.namespace, schemaVersion: manifest.raw.schemaVersion } }),
+  };
+}
+
+function policyReference(manifest: AdapterSanitizationManifest): RecordingPolicyReference {
+  return {
+    id: manifest.policy.id,
+    version: manifest.policy.version,
+    digest: manifest.policy.digest,
+  };
+}
+
 function resolveOptions(options: RecordingOptions): ResolvedRecordingOptions {
   const sanitization = options.sanitization;
   if (sanitization === undefined) {
@@ -1247,26 +1284,8 @@ function resolveOptions(options: RecordingOptions): ResolvedRecordingOptions {
   if (manifestSnapshot.state !== "valid" || !isRecord(manifestSnapshot.value)) {
     throw new Error("Recording sanitization context is invalid");
   }
-  const adapters = [...(options.adapters ?? [])];
-  const policies = [...(options.policies ?? [])];
-  if (options.manifest !== undefined) {
-    if (!adapters.some((adapter) => adapter.id === options.manifest!.adapter.id)) {
-      adapters.push({
-        id: options.manifest.adapter.id,
-        version: options.manifest.adapter.version,
-        sourceVersions: [...options.manifest.adapter.sourceVersions],
-      });
-    }
-    if (!policies.some((policy) => policy.id === options.manifest!.policy.id)) {
-      policies.push({ ...options.manifest.policy });
-    }
-  }
   return {
     now: options.now ?? (() => new Date().toISOString()),
-    adapters: deepFreeze(
-      adapters.map((adapter) => ({ ...adapter, sourceVersions: [...adapter.sourceVersions] })),
-    ),
-    policies: deepFreeze(policies.map((policy) => ({ ...policy }))),
     limits: resolveLimits(options.limits),
     sanitization: {
       manifest: manifestSnapshot.value as unknown as AdapterSanitizationManifest,
@@ -1302,7 +1321,15 @@ function resolveLimits(overrides: Partial<RecordingLimits> | undefined): Recordi
     values.maxDepth <= 0 ||
     values.maxObjectProperties <= 0 ||
     values.maxArrayElements <= 0 ||
-    values.maxStringBytes <= 0
+    values.maxStringBytes <= 0 ||
+    values.maxFileBytes > RECORDING_LIMITS.maxFileBytes ||
+    values.maxRecords > RECORDING_LIMITS.maxRecords ||
+    values.maxRecordBytes > RECORDING_LIMITS.maxRecordBytes ||
+    values.maxInputBytes > RECORDING_LIMITS.maxInputBytes ||
+    values.maxDepth > RECORDING_LIMITS.maxDepth ||
+    values.maxObjectProperties > RECORDING_LIMITS.maxObjectProperties ||
+    values.maxArrayElements > RECORDING_LIMITS.maxArrayElements ||
+    values.maxStringBytes > RECORDING_LIMITS.maxStringBytes
   ) {
     throw new Error("Recording limits are invalid");
   }
@@ -1339,6 +1366,17 @@ function encodeFrame(control: FrameControl, payload: Uint8Array): Result<Uint8Ar
   };
 }
 
+function framedPayloadSize(
+  type: "header" | "record" | "manifest" | "integrity",
+  bytes: number,
+): number {
+  return (
+    utf8(JSON.stringify(canonicalJson({ type, bytes, sha256: "0".repeat(64) }))).byteLength +
+    bytes +
+    2
+  );
+}
+
 function sha256Hex(value: Uint8Array): Promise<string> {
   return crypto.subtle
     .digest("SHA-256", value as BufferSource)
@@ -1367,8 +1405,12 @@ function deepFreeze<T>(value: T): T {
   return Object.freeze(value);
 }
 
-function validTimestamp(value: string): boolean {
-  return value.length > 0 && !Number.isNaN(Date.parse(value));
+function validTimestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value) &&
+    !Number.isNaN(Date.parse(value))
+  );
 }
 
 function lifecycleError(): Result<never> {

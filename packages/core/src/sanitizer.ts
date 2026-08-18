@@ -332,6 +332,8 @@ async function transformValue(
     if (projection.classification !== "S2" || typeof value !== "string" || !pseudonymKey) {
       return { state: "invalid" };
     }
+    const detected = detectValue(value);
+    if (detected !== undefined) return { state: "removed", reason: detected };
     return {
       state: "value",
       value: await pseudonymForRecording(value, projection.target, pseudonymKey),
