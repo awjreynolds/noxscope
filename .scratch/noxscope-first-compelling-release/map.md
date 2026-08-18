@@ -20,6 +20,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 ## Decisions so far
 
 - [Map GSD architecture and extraction seams](./issues/01-map-gsd-architecture-and-extraction-seams.md) — Adapt at GSD's worker/GSD Connect boundaries first, preserving the working runtime and diagnostics while translating them into a versioned canonical protocol before UI extraction.
+- [Map Moth supported integration surfaces](./issues/02-map-moth-supported-integration-surfaces.md) — Poll Moth daemon `version`/`getState` as a separate read-only runtime, expose its real capability gaps and freshness, and keep extension connector conformance distinct from daemon health.
 - [Which additional Midnight wallets should Noxscope validate?](./issues/03-identify-additional-wallet-validation-targets.md) — Prioritise the official Wallet SDK and Lace, qualify 1AM and Gero, keep inaccessible or announced wallets in later/watch tiers, and treat Ctrl as historical only.
 
 ## Not yet specified
