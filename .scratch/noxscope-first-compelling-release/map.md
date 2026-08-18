@@ -28,16 +28,6 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 
 ## Not yet specified
 
-- Exact repository provenance and extraction sequence after the GSD and Moth source audits.
-- Canonical protocol, capability negotiation, event correlation, and compatibility-versioning implementation.
-- Browser host and runtime topology, including extension/service-worker boundaries and remote process transport.
-- Central sanitisation policy, recording schema, offline import/viewing, and safe diagnostic overrides.
-- Workbench information architecture and the smallest useful Overview + event-stream vertical slice.
-- Deterministic mock/runtime fixtures and conformance harness.
-- GSD adapter extraction while preserving existing diagnostics.
-- Moth read-only adapter through supported process boundaries.
-- Official Wallet SDK baseline plus Lace, 1AM, and Gero connector qualification harnesses.
-- Packaging, localnet developer experience, CI, provenance verification, and release acceptance.
 - Differential Scenario and Comparison Run execution after the first compelling release.
 
 ## Out of scope
