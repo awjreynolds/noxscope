@@ -12,13 +12,29 @@ _Avoid_: Wallet app, wallet backend
 The wallet-specific boundary that discovers a Wallet Runtime's capabilities and translates its state, operations, and telemetry into Noxscope's canonical language.
 _Avoid_: Connector, integration layer, wallet implementation
 
+**Runtime Session**:
+A single connection through an Adapter to one observed Wallet Runtime, with its own identity, capability evidence, freshness, and ordered record stream.
+_Avoid_: Connection, adapter session
+
 **Capability**:
 An adapter-reported unit of observable or invokable behaviour that a Wallet Runtime actually supports.
 _Avoid_: Feature flag, assumed feature
 
+**Capability Support**:
+Evidence that a Runtime Session can or cannot provide a Capability under its negotiated contract.
+_Avoid_: Availability, enabled state
+
+**Capability Availability**:
+The current reachability or health of a supported Capability, independent of whether the Runtime Session supports it in principle.
+_Avoid_: Support, feature flag
+
 **Diagnostic Event**:
 A timestamped observation emitted through an Adapter and correlated with the operation or subsystem that produced it.
 _Avoid_: Log line, telemetry blob
+
+**Snapshot**:
+A freshness-qualified observation of the state a Runtime Session could expose at a point in time.
+_Avoid_: Wallet state, current state
 
 **Operation**:
 A correlated unit of wallet work, such as synchronising, balancing, proving, submitting, or answering a dApp request.
