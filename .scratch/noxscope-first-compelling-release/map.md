@@ -19,6 +19,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 
 ## Decisions so far
 
+- [Map GSD architecture and extraction seams](./issues/01-map-gsd-architecture-and-extraction-seams.md) — Adapt at GSD's worker/GSD Connect boundaries first, preserving the working runtime and diagnostics while translating them into a versioned canonical protocol before UI extraction.
 - [Which additional Midnight wallets should Noxscope validate?](./issues/03-identify-additional-wallet-validation-targets.md) — Prioritise the official Wallet SDK and Lace, qualify 1AM and Gero, keep inaccessible or announced wallets in later/watch tiers, and treat Ctrl as historical only.
 
 ## Not yet specified
@@ -42,4 +43,3 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - Mainnet mutation tests or testing with real user wallets: validation is limited to localnet and Preprod.
 - Native mobile Noxscope applications: mobile wallets may be qualified through available interfaces, but Noxscope's first host is browser/full-tab based unless source audits prove that infeasible.
 - Full multi-wallet Scenario execution and comparison reports: the protocol must preserve the path, but delivery belongs to a later destination.
-
