@@ -1165,4 +1165,37 @@ describe("Sanitizer", () => {
     ]);
     expect(JSON.stringify(result)).not.toMatch(/(?:zero-width|query-alias|fragment-alias)-canary/);
   });
+
+  it("denies credential assignments split by every JavaScript line terminator", async () => {
+    const sanitizer = createSanitizer();
+    const values = {
+      newline: "api_\nkey=newline-secret-canary",
+      carriageReturn: "api_\rkey=carriage-secret-canary",
+      lineSeparator: "api_\u2028key=line-separator-secret-canary",
+      paragraphSeparator: "api_\u2029key=paragraph-separator-secret-canary",
+      benign: "Indexer connected successfully.\nSecond diagnostic line remains public.",
+    };
+    const lineManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: Object.keys(values).map((source) => ({
+        source: `diagnostic.${source}`,
+        target: `event.${source}`,
+        classification: "S3" as const,
+        transform: "copy" as const,
+      })),
+    };
+
+    const result = await sanitizer.sanitize({ diagnostic: values }, lineManifest);
+
+    expect(result.ok && result.value.value).toEqual({ event: { benign: values.benign } });
+    expect(result.ok && result.value.audit.redactions).toEqual([
+      { path: "diagnostic.carriagereturn", reason: "secret" },
+      { path: "diagnostic.lineseparator", reason: "secret" },
+      { path: "diagnostic.newline", reason: "secret" },
+      { path: "diagnostic.paragraphseparator", reason: "secret" },
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(
+      /(?:newline|carriage|line-separator|paragraph-separator)-secret-canary/,
+    );
+  });
 });

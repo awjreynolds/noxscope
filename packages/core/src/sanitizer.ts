@@ -818,7 +818,7 @@ function detectForbiddenAssignment(
   value: string,
 ): SanitizationAudit["redactions"][number]["reason"] | undefined {
   for (const segment of value.split(/[?&;,{}]/u)) {
-    const match = /^\s*(.{1,64}?)\s*[:=]\s*\S+/u.exec(segment);
+    const match = /^\s*([\s\S]{1,64}?)\s*[:=]\s*\S+/u.exec(segment);
     if (!match) continue;
     const reason = forbiddenNameReason(match[1]!);
     if (reason !== undefined) return reason;
