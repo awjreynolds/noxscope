@@ -12,6 +12,7 @@ import {
   type DataClassification,
   type FieldTransform,
 } from "./sanitizer.js";
+import { isImportedRecordingRecord } from "./recording-internals.js";
 
 /** The first bytes of every portable Noxscope Recording. */
 export const NOXSCOPE_RECORDING_MAGIC = "NOXSCOPE-RECORDING/1" as const;
@@ -57,6 +58,8 @@ export interface RecordingSanitizationContext {
   readonly manifest: AdapterSanitizationManifest;
   /** A per-recording HMAC context; it is never serialized. */
   readonly pseudonymKey: Uint8Array;
+  /** @internal Import-only preservation of already canonical recording pseudonyms. */
+  readonly preserveRecordingPseudonyms?: boolean;
 }
 
 export interface RecordingOptions {
@@ -181,10 +184,38 @@ export function createRecorder(options: RecordingOptions = {}): Recorder {
 
 /** Reuses the recorder's strict canonical projection for hostile imports. */
 export async function sanitizeRecordingRecord(
-  record: NoxscopeRecord,
+  record: unknown,
   context: RecordingSanitizationContext,
 ): Promise<Result<SanitizedRecordingRecord>> {
-  return sanitizeCanonicalRecord(record, createSanitizer(), context);
+  try {
+    const snapshot = snapshotInert(record, RECORDING_LIMITS);
+    if (snapshot.state !== "valid") {
+      return snapshot.state === "overflow"
+        ? overflow("Recording record exceeds a resource limit")
+        : invalid("Recording record is invalid");
+    }
+    const checked = validateRecord(snapshot.value);
+    if (!checked.ok) return checked;
+    const manifest = snapshotInert(context.manifest, RECORDING_LIMITS);
+    if (manifest.state !== "valid" || !isRecord(manifest.value)) {
+      return invalid("Recording sanitization context is invalid");
+    }
+    if (
+      !(context.pseudonymKey instanceof Uint8Array) ||
+      context.pseudonymKey.byteLength < 32 ||
+      context.pseudonymKey.byteLength > 64
+    ) {
+      return invalid("Recording sanitization context is invalid");
+    }
+    const safeContext: RecordingSanitizationContext = {
+      manifest: manifest.value as unknown as AdapterSanitizationManifest,
+      pseudonymKey: Uint8Array.prototype.slice.call(context.pseudonymKey) as Uint8Array,
+      preserveRecordingPseudonyms: context.preserveRecordingPseudonyms === true,
+    };
+    return await sanitizeCanonicalRecord(checked.value, createSanitizer(), safeContext);
+  } catch {
+    return invalid("Recording record could not be sanitized");
+  }
 }
 
 class RecordingBuilder implements Recorder {
@@ -222,8 +253,10 @@ class RecordingBuilder implements Recorder {
           : invalid("Recording record is invalid"),
       );
     }
+    const preserveRecordingPseudonyms =
+      typeof candidate === "object" && candidate !== null && isImportedRecordingRecord(candidate);
     const next = this.#appendTail.then(async () => {
-      const result = await this.#appendInternal(snapshot.value);
+      const result = await this.#appendInternal(snapshot.value, preserveRecordingPseudonyms);
       if (!result.ok) this.#counts.droppedRecords += 1;
       return result;
     });
@@ -369,7 +402,10 @@ class RecordingBuilder implements Recorder {
     };
   }
 
-  async #appendInternal(candidate: unknown): Promise<Result<void>> {
+  async #appendInternal(
+    candidate: unknown,
+    preserveRecordingPseudonyms = false,
+  ): Promise<Result<void>> {
     if (this.#finalized || this.#finalizing) return lifecycleError();
     if (this.#counts.records >= this.#options.limits.maxRecords) {
       return overflow("Recording record count exceeds a resource limit");
@@ -381,7 +417,9 @@ class RecordingBuilder implements Recorder {
       sanitized = await sanitizeCanonicalRecord(
         checked.value,
         this.#sanitizer,
-        this.#options.sanitization,
+        preserveRecordingPseudonyms
+          ? { ...this.#options.sanitization, preserveRecordingPseudonyms: true }
+          : this.#options.sanitization,
       );
     } catch {
       return invalid("Recording record could not be sanitized");
@@ -1023,7 +1061,11 @@ async function sanitizeRawList(
       !isRecord(detail) ||
       rawManifest === undefined ||
       detail.namespace !== rawManifest.namespace ||
-      detail.schemaVersion !== rawManifest.schemaVersion
+      detail.schemaVersion !== rawManifest.schemaVersion ||
+      !matchesSanitizationProvenance(
+        detail as unknown as SanitizedRawDetail,
+        context.manifest.policy,
+      )
     ) {
       accumulator.droppedAttributes += 1;
       accumulator.redactions += 1;
@@ -1041,6 +1083,24 @@ async function sanitizeRawList(
     accumulator.redactions += result.value.sanitization.redactions.length;
   }
   return output;
+}
+
+function matchesSanitizationProvenance(
+  detail: SanitizedRawDetail,
+  policy: AdapterSanitizationManifest["policy"],
+): boolean {
+  const sanitization = detail.sanitization;
+  return (
+    sanitization.policy === policy.id &&
+    sanitization.policyVersion === policy.version &&
+    sanitization.redactions.every(
+      (redaction) =>
+        typeof redaction.path === "string" &&
+        redaction.path.length > 0 &&
+        redaction.path.length <= 256 &&
+        ["secret", "key-material", "private-payload", "policy"].includes(redaction.reason),
+    )
+  );
 }
 
 async function assignField(
@@ -1098,9 +1158,13 @@ async function project(
     ...context.manifest,
     projections: [{ source: "value", target: "value", classification, transform }],
   };
-  const result = await sanitizer.sanitize({ value }, manifest, {
-    pseudonymKey: context.pseudonymKey,
-  });
+  const result = await sanitizer.sanitize(
+    { value },
+    manifest,
+    context.preserveRecordingPseudonyms === true
+      ? { pseudonymKey: context.pseudonymKey, preserveRecordingPseudonyms: true }
+      : { pseudonymKey: context.pseudonymKey },
+  );
   if (!result.ok) return { state: "invalid" };
   if (!Object.prototype.hasOwnProperty.call(result.value.value, "value")) {
     return { state: "dropped", redactions: result.value.audit.redactions.length };
@@ -1231,20 +1295,35 @@ function hasUnpairedSurrogate(value: string): boolean {
   return false;
 }
 
-function countMissingFields(source: unknown, output: unknown): number {
+function countMissingFields(
+  source: unknown,
+  output: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): number {
+  if (depth > RECORDING_LIMITS.maxDepth) return 1;
   if (isRecord(source) && isRecord(output)) {
+    if (seen.has(source)) return 1;
+    seen.add(source);
     let count = 0;
     for (const key of Object.keys(source)) {
       if (!Object.prototype.hasOwnProperty.call(output, key)) count += 1;
-      else count += countMissingFields(source[key], output[key]);
+      else count += countMissingFields(source[key], output[key], depth + 1, seen);
     }
     return count;
   }
   if (Array.isArray(source) && Array.isArray(output)) {
-    return source.reduce(
-      (count, value, index) => count + countMissingFields(value, output[index]),
-      0,
-    );
+    if (seen.has(source)) return 1;
+    seen.add(source);
+    let count = 0;
+    for (
+      let index = 0;
+      index < Math.min(source.length, RECORDING_LIMITS.maxArrayElements);
+      index += 1
+    ) {
+      count += countMissingFields(source[index], output[index], depth + 1, seen);
+    }
+    return count + Math.max(0, source.length - RECORDING_LIMITS.maxArrayElements);
   }
   return 0;
 }

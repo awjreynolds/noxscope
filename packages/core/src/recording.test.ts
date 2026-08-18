@@ -150,6 +150,22 @@ describe("Recording v1 codec", () => {
     expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
   });
 
+  it("HMACs spoofed canonical-looking identifiers on first capture", async () => {
+    const spoof = {
+      ...record,
+      meta: { ...record.meta, sessionId: `hmac-sha256:${"a".repeat(64)}` },
+    };
+    const recorder = makeRecorder();
+    const result = await recorder.append(spoof);
+    expect(result).toEqual({ ok: true, value: undefined });
+    const exported = await recorder.finalize();
+    expect(exported.ok).toBe(true);
+    if (!exported.ok) return;
+    expect(new TextDecoder().decode(exported.value.bytes)).not.toContain(
+      `hmac-sha256:${"a".repeat(64)}`,
+    );
+  });
+
   it("rejects getters and cycles before protocol traversal", async () => {
     const getterRecord = structuredClone(record) as unknown as Record<string, unknown>;
     let invoked = false;

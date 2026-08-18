@@ -11,12 +11,14 @@ import {
   RECORDING_LIMITS,
   sanitizeRecordingRecord,
   type RecordingAdapterReference,
+  type RecordingCounts,
   type RecordingFrameDigest,
   type RecordingLimits,
   type RecordingManifest,
   type RecordingPolicyReference,
   type RecordingSanitizationContext,
 } from "./recording.js";
+import { markImportedRecordingRecord } from "./recording-internals.js";
 
 export interface RecordingImportOptions {
   readonly sanitization: RecordingSanitizationContext;
@@ -27,6 +29,8 @@ export interface RecordingImportAudit {
   readonly warnings: readonly string[];
   readonly droppedRawDetails: number;
   readonly redactions: number;
+  /** Source manifest claims retained for diagnostics only; never authoritative. */
+  readonly sourceCounts: RecordingCounts;
 }
 
 export interface OfflineReplayOptions {
@@ -74,6 +78,7 @@ interface ImportState {
   readonly context: RecordingSanitizationContext;
   readonly warnings: string[];
   droppedRawDetails: number;
+  droppedAttributes: number;
   redactions: number;
 }
 
@@ -97,30 +102,39 @@ export async function importRecording(
     return incompatible("Compressed or archived Recordings are unsupported");
   if (!sameBytes(bytes.value, MAGIC_BYTES, 0))
     return incompatible("Recording magic is incompatible");
+  let sanitization: RecordingSanitizationContext;
   try {
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes.value);
+    const candidate = options.sanitization;
+    if (
+      !candidate ||
+      !(candidate.pseudonymKey instanceof Uint8Array) ||
+      candidate.pseudonymKey.byteLength < 32 ||
+      candidate.pseudonymKey.byteLength > 64
+    ) {
+      return invalid("Recording import sanitization context is invalid");
+    }
+    sanitization = {
+      manifest: candidate.manifest,
+      pseudonymKey: Uint8Array.prototype.slice.call(candidate.pseudonymKey) as Uint8Array,
+      preserveRecordingPseudonyms: true,
+    };
   } catch {
-    return invalid("Recording contains invalid UTF-8");
-  }
-  if (
-    !(options.sanitization.pseudonymKey instanceof Uint8Array) ||
-    options.sanitization.pseudonymKey.byteLength < 32 ||
-    options.sanitization.pseudonymKey.byteLength > 64
-  ) {
     return invalid("Recording import sanitization context is invalid");
   }
   const state: ImportState = {
-    bytes: bytes.value.slice(),
+    bytes: bytes.value,
     limits,
-    context: {
-      manifest: options.sanitization.manifest,
-      pseudonymKey: options.sanitization.pseudonymKey.slice(),
-    },
+    context: sanitization,
     warnings: [],
     droppedRawDetails: 0,
+    droppedAttributes: 0,
     redactions: 0,
   };
-  return parseRecording(state);
+  try {
+    return await parseRecording(state);
+  } catch {
+    return invalid("Recording import failed within a bounded parser");
+  }
 }
 
 async function parseRecording(state: ImportState): Promise<Result<ImportedRecording>> {
@@ -148,6 +162,7 @@ async function parseRecording(state: ImportState): Promise<Result<ImportedRecord
       if (!checked.ok) return checked;
       const sanitized = await sanitizeRecordingRecord(checked.value, state.context);
       if (!sanitized.ok) return sanitized;
+      state.droppedAttributes += sanitized.value.droppedAttributes;
       state.redactions += sanitized.value.redactions;
       accountUnknownRaw(state, checked.value);
       const rechecked = validateRecord(sanitized.value.record);
@@ -158,7 +173,12 @@ async function parseRecording(state: ImportState): Promise<Result<ImportedRecord
     }
     if (frame.value.control.type !== "manifest") return invalid("Recording frame order is invalid");
     const manifestFrame = frame.value;
-    const manifest = validateManifest(manifestFrame.parsed);
+    const manifest = validateManifest(
+      manifestFrame.parsed,
+      state.limits,
+      header.value,
+      state.context,
+    );
     if (!manifest.ok) return manifest;
     if (offset >= state.bytes.byteLength) return invalid("Recording is truncated");
     const integrityFrame = await readFrame(state, offset);
@@ -184,9 +204,13 @@ async function parseRecording(state: ImportState): Promise<Result<ImportedRecord
       warnings: Object.freeze([...state.warnings]),
       droppedRawDetails: state.droppedRawDetails,
       redactions: state.redactions,
+      sourceCounts: deepFreeze(cloneJson(manifest.value.counts) as RecordingCounts),
     };
+    const recomputedCounts = recomputeCounts(state, records);
+    const returnedManifest = { ...manifest.value, counts: recomputedCounts };
     const frozenRecords = deepFreeze(records.map((record) => cloneJson(record) as NoxscopeRecord));
-    const frozenManifest = deepFreeze(cloneJson(manifest.value) as RecordingManifest);
+    for (const record of frozenRecords) markImportedRecordingRecord(record);
+    const frozenManifest = deepFreeze(cloneJson(returnedManifest) as RecordingManifest);
     return {
       ok: true,
       value: new ImportedRecordingImpl(frozenManifest, frozenRecords, audit),
@@ -261,7 +285,8 @@ async function readFrame(state: ImportState, start: number): Promise<Result<Pars
   const payloadStart = controlLine.value.next;
   const payloadEnd = payloadStart + control.value.bytes;
   if (
-    control.value.bytes > state.limits.maxRecordBytes ||
+    control.value.bytes >
+      (control.value.type === "record" ? state.limits.maxRecordBytes : state.limits.maxFileBytes) ||
     !Number.isSafeInteger(payloadEnd) ||
     payloadEnd < payloadStart ||
     payloadEnd + 1 > state.bytes.byteLength ||
@@ -269,7 +294,7 @@ async function readFrame(state: ImportState, start: number): Promise<Result<Pars
   ) {
     return overflow("Recording frame exceeds a resource limit");
   }
-  const payload = state.bytes.slice(payloadStart, payloadEnd);
+  const payload = state.bytes.subarray(payloadStart, payloadEnd);
   let digest: string;
   try {
     digest = await sha256Hex(payload);
@@ -277,7 +302,7 @@ async function readFrame(state: ImportState, start: number): Promise<Result<Pars
     return invalid("Recording integrity could not be computed");
   }
   if (digest !== control.value.sha256) return invalid("Recording frame digest does not match");
-  const parsed = parseCanonical(payload, state.limits);
+  const parsed = parseCanonical(payload, state.limits, control.value.type === "manifest");
   if (!parsed.ok) return parsed;
   return {
     ok: true,
@@ -307,14 +332,18 @@ function readLine(
   return invalid("Recording control line is truncated");
 }
 
-function parseCanonical(bytes: Uint8Array, limits: RecordingLimits): Result<unknown> {
+function parseCanonical(
+  bytes: Uint8Array,
+  limits: RecordingLimits,
+  allowLargeManifestDigests = false,
+): Result<unknown> {
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     return invalid("Recording payload is invalid UTF-8");
   }
-  const parsed = new JsonParser(text, limits).parse();
+  const parsed = new JsonParser(text, limits, allowLargeManifestDigests).parse();
   if (!parsed.ok) return parsed;
   try {
     const canonical = new TextEncoder().encode(JSON.stringify(canonicalJson(parsed.value)));
@@ -328,12 +357,15 @@ function parseCanonical(bytes: Uint8Array, limits: RecordingLimits): Result<unkn
 class JsonParser {
   readonly #text: string;
   readonly #limits: RecordingLimits;
+  readonly #allowLargeManifestDigests: boolean;
+  readonly #path: string[] = [];
   #index = 0;
   #depth = 0;
 
-  constructor(text: string, limits: RecordingLimits) {
+  constructor(text: string, limits: RecordingLimits, allowLargeManifestDigests: boolean) {
     this.#text = text;
     this.#limits = limits;
+    this.#allowLargeManifestDigests = allowLargeManifestDigests;
   }
 
   parse(): Result<unknown> {
@@ -352,7 +384,13 @@ class JsonParser {
     this.#space();
     const character = this.#text[this.#index];
     if (character === "{") return this.#object();
-    if (character === "[") return this.#array();
+    if (character === "[") {
+      const maximum =
+        this.#allowLargeManifestDigests && this.#path.join(".") === "integrity.frameDigests"
+          ? this.#limits.maxRecords + 1
+          : this.#limits.maxArrayElements;
+      return this.#array(maximum);
+    }
     if (character === '"') return this.#string();
     if (character === "t" && this.#text.startsWith("true", this.#index)) {
       this.#index += 4;
@@ -393,7 +431,12 @@ class JsonParser {
       keys.add(normalized);
       this.#space();
       if (this.#text[this.#index++] !== ":") throw new Error("colon");
-      output[key] = this.#value();
+      this.#path.push(key);
+      try {
+        output[key] = this.#value();
+      } finally {
+        this.#path.pop();
+      }
       this.#space();
       const separator = this.#text[this.#index++];
       if (separator === "}") break;
@@ -403,7 +446,7 @@ class JsonParser {
     return output;
   }
 
-  #array(): unknown[] {
+  #array(maximum: number): unknown[] {
     this.#depth += 1;
     if (this.#depth > this.#limits.maxDepth) throw new Error("depth");
     this.#index += 1;
@@ -415,7 +458,7 @@ class JsonParser {
       return output;
     }
     while (true) {
-      if (output.length >= this.#limits.maxArrayElements) throw new Error("array");
+      if (output.length >= maximum) throw new Error("array");
       output.push(this.#value());
       this.#space();
       const separator = this.#text[this.#index++];
@@ -471,6 +514,7 @@ function validateHeader(value: unknown): Result<ImportHeader> {
     value.protocol !== NOXSCOPE_PROTOCOL ||
     value.schemaVersion !== NOXSCOPE_RECORDING_SCHEMA_VERSION ||
     typeof value.exportedAt !== "string" ||
+    !validTimestamp(value.exportedAt) ||
     !Array.isArray(value.adapters) ||
     !Array.isArray(value.policies)
   )
@@ -478,7 +522,12 @@ function validateHeader(value: unknown): Result<ImportHeader> {
   return { ok: true, value: value as unknown as ImportHeader };
 }
 
-function validateManifest(value: unknown): Result<RecordingManifest> {
+function validateManifest(
+  value: unknown,
+  limits: RecordingLimits,
+  header: ImportHeader,
+  context: RecordingSanitizationContext,
+): Result<RecordingManifest> {
   if (
     !isRecord(value) ||
     value.format !== NOXSCOPE_RECORDING_FORMAT ||
@@ -486,17 +535,25 @@ function validateManifest(value: unknown): Result<RecordingManifest> {
     value.protocol !== NOXSCOPE_PROTOCOL ||
     value.schemaVersion !== NOXSCOPE_RECORDING_SCHEMA_VERSION ||
     typeof value.exportedAt !== "string" ||
+    !validTimestamp(value.exportedAt) ||
     !Array.isArray(value.adapters) ||
     !Array.isArray(value.policies) ||
+    value.adapters.length > limits.maxArrayElements ||
+    value.policies.length > limits.maxArrayElements ||
     !isRecord(value.counts) ||
     !isRecord(value.integrity)
   )
     return incompatible("Recording manifest is incompatible");
-  const counts = value.counts;
+  const counts = value.counts as unknown as RecordingCounts;
   if (
-    !["records", "gaps", "droppedRecords", "droppedAttributes", "redactions"].every((key) =>
-      nonNegativeInteger(counts[key]),
-    )
+    !(["records", "gaps", "droppedRecords", "droppedAttributes", "redactions"] as const).every(
+      (key) => nonNegativeInteger(counts[key]),
+    ) ||
+    counts.records > limits.maxRecords ||
+    counts.gaps > limits.maxRecords ||
+    counts.droppedRecords > limits.maxRecords ||
+    counts.droppedAttributes > limits.maxRecords * limits.maxObjectProperties ||
+    counts.redactions > limits.maxRecords * limits.maxObjectProperties
   )
     return invalid("Recording manifest counts are invalid");
   const integrity = value.integrity;
@@ -505,9 +562,22 @@ function validateManifest(value: unknown): Result<RecordingManifest> {
     integrity.authenticated !== false ||
     typeof integrity.contentDigest !== "string" ||
     !Array.isArray(integrity.frameDigests) ||
+    integrity.frameDigests.length > limits.maxRecords + 1 ||
+    integrity.warning !==
+      "Integrity digests detect accidental or modifying changes; they do not authenticate the producer." ||
     !integrity.frameDigests.every(isFrameDigest)
   )
     return invalid("Recording manifest integrity is invalid");
+  const expected = expectedProvenance(context);
+  if (
+    value.exportedAt !== header.exportedAt ||
+    !sameJson(value.adapters, header.adapters) ||
+    !sameJson(value.policies, header.policies) ||
+    !sameJson(value.adapters, expected.adapters) ||
+    !sameJson(value.policies, expected.policies)
+  ) {
+    return incompatible("Recording manifest provenance is incompatible");
+  }
   return { ok: true, value: value as unknown as RecordingManifest };
 }
 
@@ -561,8 +631,8 @@ async function verifyIntegrity(
   let terminalDigest: string;
   let manifestDigest: string;
   try {
-    prefixDigest = await sha256Hex(state.bytes.slice(0, manifestFrame.start));
-    terminalDigest = await sha256Hex(state.bytes.slice(0, terminalFrame.start));
+    prefixDigest = await sha256Hex(state.bytes.subarray(0, manifestFrame.start));
+    terminalDigest = await sha256Hex(state.bytes.subarray(0, terminalFrame.start));
     manifestDigest = await sha256Hex(manifestFrame.payload);
   } catch {
     return invalid("Recording integrity could not be computed");
@@ -576,33 +646,54 @@ async function verifyIntegrity(
   return { ok: true, value: undefined };
 }
 
+function recomputeCounts(state: ImportState, records: readonly NoxscopeRecord[]): RecordingCounts {
+  return {
+    records: records.length,
+    gaps: records.filter(
+      (record) => record.kind === "diagnostic-event" && record.event.type === "stream-gap",
+    ).length,
+    droppedRecords: 0,
+    droppedAttributes: state.droppedAttributes,
+    redactions: state.redactions,
+  };
+}
+
 function verifyProvenance(
   header: ImportHeader,
   context: RecordingSanitizationContext,
 ): Result<void> {
-  const adapter = context.manifest.adapter;
-  const expectedAdapter: RecordingAdapterReference = {
-    id: adapter.id,
-    version: adapter.version,
-    sourceVersions: [...adapter.sourceVersions],
-    ...(context.manifest.raw === undefined
-      ? {}
-      : {
-          raw: {
-            namespace: context.manifest.raw.namespace,
-            schemaVersion: context.manifest.raw.schemaVersion,
-          },
-        }),
-  };
-  const expectedPolicy: RecordingPolicyReference = { ...context.manifest.policy };
+  const expected = expectedProvenance(context);
   if (
-    header.adapters.length !== 1 ||
-    !sameJson(header.adapters[0], expectedAdapter) ||
-    header.policies.length !== 1 ||
-    !sameJson(header.policies[0], expectedPolicy)
+    !sameJson(header.adapters, expected.adapters) ||
+    !sameJson(header.policies, expected.policies)
   )
     return incompatible("Recording provenance policy is incompatible");
   return { ok: true, value: undefined };
+}
+
+function expectedProvenance(context: RecordingSanitizationContext): {
+  readonly adapters: readonly RecordingAdapterReference[];
+  readonly policies: readonly RecordingPolicyReference[];
+} {
+  const adapter = context.manifest.adapter;
+  return {
+    adapters: [
+      {
+        id: adapter.id,
+        version: adapter.version,
+        sourceVersions: [...adapter.sourceVersions],
+        ...(context.manifest.raw === undefined
+          ? {}
+          : {
+              raw: {
+                namespace: context.manifest.raw.namespace,
+                schemaVersion: context.manifest.raw.schemaVersion,
+              },
+            }),
+      },
+    ],
+    policies: [{ ...context.manifest.policy }],
+  };
 }
 
 function accountUnknownRaw(state: ImportState, record: NoxscopeRecord): void {
@@ -622,11 +713,29 @@ function accountUnknownRaw(state: ImportState, record: NoxscopeRecord): void {
       detail.namespace !== allowed.namespace ||
       detail.schemaVersion !== allowed.schemaVersion
     ) {
-      state.droppedRawDetails += 1;
-      if (state.warnings.length < MAX_WARNING_COUNT)
-        state.warnings.push("Unknown raw detail namespace or schema was dropped during import");
+      recordRawDrop(state, "Unknown raw detail namespace or schema was dropped during import");
+    } else if (
+      detail.sanitization.policy !== state.context.manifest.policy.id ||
+      detail.sanitization.policyVersion !== state.context.manifest.policy.version ||
+      !detail.sanitization.redactions.every(
+        (redaction) =>
+          typeof redaction.path === "string" &&
+          redaction.path.length > 0 &&
+          redaction.path.length <= 256 &&
+          ["secret", "key-material", "private-payload", "policy"].includes(redaction.reason),
+      )
+    ) {
+      recordRawDrop(
+        state,
+        "Raw detail sanitization provenance was incompatible and was dropped during import",
+      );
     }
   }
+}
+
+function recordRawDrop(state: ImportState, warning: string): void {
+  state.droppedRawDetails += 1;
+  if (state.warnings.length < MAX_WARNING_COUNT) state.warnings.push(warning);
 }
 
 function isExactControl(value: unknown): value is FrameControl {
@@ -790,6 +899,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function nonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function validTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value)) {
+    return false;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return false;
+  try {
+    return new Date(parsed).toISOString() === value;
+  } catch {
+    return false;
+  }
 }
 
 function invalid(message: string): Result<never> {

@@ -49,6 +49,8 @@ export interface SanitizedProjection {
 
 export interface SanitizationOptions {
   readonly pseudonymKey?: Uint8Array;
+  /** Internal import-mode behavior: preserve only canonical recording pseudonyms. */
+  readonly preserveRecordingPseudonyms?: boolean;
 }
 
 export interface Sanitizer {
@@ -202,7 +204,10 @@ function prepareOptions(
     }
     return {
       state: "valid",
-      value: { pseudonymKey: Uint8Array.prototype.slice.call(key) as Uint8Array },
+      value: {
+        pseudonymKey: Uint8Array.prototype.slice.call(key) as Uint8Array,
+        preserveRecordingPseudonyms: options.preserveRecordingPseudonyms === true,
+      },
     };
   } catch {
     return { state: "invalid" };
@@ -225,7 +230,12 @@ async function sanitizePrepared(
   for (const projection of projections) {
     const value = readPath(input, projection.source);
     if (value === undefined) continue;
-    const projected = await transformValue(value, projection, options.pseudonymKey);
+    const projected = await transformValue(
+      value,
+      projection,
+      options.pseudonymKey,
+      options.preserveRecordingPseudonyms === true,
+    );
     if (projected.state === "invalid") return invalid();
     if (projected.state === "removed") {
       detected.set(normalizePath(projection.source), projected.reason);
@@ -302,6 +312,7 @@ async function transformValue(
   value: unknown,
   projection: FieldProjection,
   pseudonymKey: Uint8Array | undefined,
+  preserveRecordingPseudonyms: boolean,
 ): Promise<TransformedValue> {
   if (projection.classification === "S0") return { state: "invalid" };
   if (projection.classification === "S1") {
@@ -331,6 +342,9 @@ async function transformValue(
   if (projection.transform === "pseudonym") {
     if (projection.classification !== "S2" || typeof value !== "string" || !pseudonymKey) {
       return { state: "invalid" };
+    }
+    if (/^hmac-sha256:[0-9a-f]{64}$/u.test(value) && preserveRecordingPseudonyms) {
+      return { state: "value", value, admittedPaths: [""] };
     }
     const detected = detectValue(value);
     if (detected !== undefined) return { state: "removed", reason: detected };

@@ -1,13 +1,14 @@
 import {
   NOXSCOPE_RECORDING_MAGIC,
   createRecorder,
+  sanitizeRecordingRecord,
   type RecordingExport,
   type RecordingRecord,
 } from "./recording.js";
 import type { NoxscopeRecord } from "@noxscope/protocol";
 import { importRecording, type RecordingImportOptions } from "./recording-import.js";
 import type { AdapterSanitizationManifest } from "./sanitizer.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 const record: RecordingRecord = {
   kind: "diagnostic-event",
@@ -46,10 +47,11 @@ const options: RecordingImportOptions = { sanitization: { manifest, pseudonymKey
 
 async function makeExport(
   records: readonly RecordingRecord[] = [record],
+  recordingManifest: AdapterSanitizationManifest = manifest,
 ): Promise<RecordingExport> {
   const recorder = createRecorder({
     now: () => "2026-08-18T12:00:02.000Z",
-    sanitization: { manifest, pseudonymKey: key },
+    sanitization: { manifest: recordingManifest, pseudonymKey: key },
   });
   for (const item of records) await recorder.append(item);
   const result = await recorder.finalize();
@@ -132,6 +134,75 @@ describe("Recording v1 hostile import and offline replay", () => {
     const aborted: NoxscopeRecord[] = [];
     for await (const item of imported.value.replay({ signal: abort.signal })) aborted.push(item);
     expect(aborted).toEqual([]);
+  });
+
+  it("keeps canonical recording pseudonyms stable across import and re-export", async () => {
+    const first = await makeExport([
+      {
+        ...record,
+        meta: {
+          ...record.meta,
+          correlation: {
+            requestId: "request-1",
+            operationId: "operation-1",
+            traceId: "trace-1",
+          },
+        },
+      },
+    ]);
+    const imported = await importRecording(first.bytes, options);
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const recorder = createRecorder({
+      now: () => "2026-08-18T12:00:02.000Z",
+      sanitization: { manifest, pseudonymKey: key },
+    });
+    await recorder.append(imported.value.records[0]);
+    const second = await recorder.finalize();
+    expect(second).toEqual({ ok: true, value: expect.objectContaining({ bytes: first.bytes }) });
+  });
+
+  it("bounds lower file limits and copies the source buffer only once", async () => {
+    const exported = await makeExport([record, secondRecord]);
+    const sourceSize = exported.bytes.byteLength;
+    const originalSlice = Uint8Array.prototype.slice;
+    let fullCopies = 0;
+    const sliceSpy = vi.spyOn(Uint8Array.prototype, "slice").mockImplementation(function (
+      this: Uint8Array,
+      start?: number,
+      end?: number,
+    ) {
+      if (this.byteLength === sourceSize && start === undefined && end === undefined) {
+        fullCopies += 1;
+      }
+      return originalSlice.call(this, start, end);
+    });
+    try {
+      const imported = await importRecording(exported.bytes, options);
+      expect(imported.ok).toBe(true);
+      expect(fullCopies).toBe(1);
+      const overflowed = await importRecording(exported.bytes, {
+        ...options,
+        limits: { maxFileBytes: sourceSize - 1 },
+      });
+      expect(overflowed).toMatchObject({ ok: false, error: { code: "overflow" } });
+    } finally {
+      sliceSpy.mockRestore();
+    }
+  });
+
+  it("imports more than 4,095 accepted records while bounding the configured count", async () => {
+    const records = Array.from({ length: 4_096 }, (_, index) => ({
+      ...record,
+      meta: { ...record.meta, sequence: String(index + 1) },
+    }));
+    const exported = await makeExport(records);
+    const imported = await importRecording(exported.bytes, {
+      ...options,
+      limits: { maxRecords: records.length },
+    });
+    expect(imported.ok).toBe(true);
+    if (imported.ok) expect(imported.value.records).toHaveLength(records.length);
   });
 
   it("rejects tamper, truncation, trailing data, reorder, and control digest changes", async () => {
@@ -237,7 +308,184 @@ describe("Recording v1 hostile import and offline replay", () => {
     );
     expect(JSON.stringify(imported.value.records)).not.toContain("unknown.raw");
   });
+
+  it("drops raw details with mismatched embedded sanitization provenance", async () => {
+    const rawManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      raw: {
+        namespace: "test.raw",
+        schemaVersion: "1",
+        projections: [
+          {
+            source: "message",
+            target: "message",
+            classification: "S3",
+            transform: "copy",
+          },
+        ],
+      },
+    };
+    const rawRecord = {
+      ...record,
+      event: {
+        ...record.event,
+        raw: [
+          {
+            namespace: "test.raw",
+            schemaVersion: "1",
+            value: { message: "safe raw message" },
+            sanitization: {
+              policy: manifest.policy.id,
+              policyVersion: manifest.policy.version,
+              redactions: [],
+            },
+          },
+        ],
+      },
+    } as unknown as RecordingRecord;
+    const exported = await makeExport([rawRecord], rawManifest);
+    const tampered = await replaceRawProvenance(exported.bytes, "wrong-policy", "0");
+    const imported = await importRecording(tampered, {
+      sanitization: { manifest: rawManifest, pseudonymKey: key },
+    });
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    expect(imported.value.audit.droppedRawDetails).toBe(1);
+    expect(imported.value.audit.warnings).toContain(
+      "Raw detail sanitization provenance was incompatible and was dropped during import",
+    );
+    expect(JSON.stringify(imported.value.records)).not.toContain("safe raw message");
+  });
+
+  it("rejects inconsistent accepted counts and does not trust dropped/redaction claims", async () => {
+    const exported = await makeExport();
+    const inconsistent = await mutateManifestAndReframe(exported.bytes, (value) => {
+      const counts = value.counts as Record<string, unknown>;
+      counts.records = 99;
+      counts.droppedRecords = 98;
+      counts.droppedAttributes = 97;
+      counts.redactions = 96;
+    });
+    const rejected = await importRecording(inconsistent, options);
+    expect(rejected).toMatchObject({ ok: false, error: { code: "invalid" } });
+
+    const claims = await mutateManifestAndReframe(exported.bytes, (value) => {
+      const counts = value.counts as Record<string, unknown>;
+      counts.droppedRecords = 98;
+      counts.droppedAttributes = 97;
+      counts.redactions = 96;
+    });
+    const accepted = await importRecording(claims, options);
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) {
+      expect(accepted.value.manifest.counts).toMatchObject({
+        records: 1,
+        gaps: 0,
+        droppedRecords: 0,
+        droppedAttributes: 0,
+        redactions: 0,
+      });
+      expect(accepted.value.audit.sourceCounts).toMatchObject({
+        droppedRecords: 98,
+        droppedAttributes: 97,
+        redactions: 96,
+      });
+    }
+
+    const mismatchedManifest = await mutateManifestAndReframe(exported.bytes, (value) => {
+      value.exportedAt = "2026-08-18T12:00:03.000Z";
+    });
+    await expectRejected(mismatchedManifest, "incompatible");
+  });
+
+  it("contains hostile direct canonicalization inputs without invoking getters or cycles", async () => {
+    const getter = structuredClone(record) as unknown as Record<string, unknown>;
+    let invoked = false;
+    Object.defineProperty(getter.meta, "sessionId", {
+      enumerable: true,
+      get() {
+        invoked = true;
+        return "must-not-read";
+      },
+    });
+    const cycle = structuredClone(record) as unknown as Record<string, unknown>;
+    (cycle.event as Record<string, unknown>).loop = cycle;
+    await expect(
+      sanitizeRecordingRecord(getter as unknown as RecordingRecord, {
+        manifest,
+        pseudonymKey: key,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalid" } });
+    await expect(
+      sanitizeRecordingRecord(cycle as unknown as RecordingRecord, { manifest, pseudonymKey: key }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalid" } });
+    expect(invoked).toBe(false);
+  });
 });
+
+async function mutateManifestAndReframe(
+  bytes: Uint8Array,
+  mutate: (manifest: Record<string, unknown>) => void,
+): Promise<Uint8Array> {
+  const ranges = frameRanges(bytes);
+  const manifestRange = ranges.find((range) => range.type === "manifest")!;
+  const text = new TextDecoder().decode(bytes);
+  const value = JSON.parse(
+    text.slice(manifestRange.payloadStart, manifestRange.payloadEnd),
+  ) as Record<string, unknown>;
+  mutate(value);
+  return reframeManifest(bytes, new TextEncoder().encode(JSON.stringify(sortJson(value))));
+}
+
+async function reframeManifest(
+  bytes: Uint8Array,
+  manifestPayload: Uint8Array,
+): Promise<Uint8Array> {
+  const ranges = frameRanges(bytes);
+  const text = new TextDecoder().decode(bytes);
+  const parts: { type: string; payload: Uint8Array }[] = [];
+  for (const range of ranges) {
+    const controlEnd = bytes.indexOf(0x0a, range.start);
+    const control = JSON.parse(text.slice(range.start, controlEnd)) as { type: string };
+    parts.push({
+      type: control.type,
+      payload:
+        control.type === "manifest"
+          ? manifestPayload
+          : bytes.slice(range.payloadStart, range.payloadEnd),
+    });
+  }
+  const frameBytes = async (part: { type: string; payload: Uint8Array }): Promise<Uint8Array> => {
+    const digest = await sha256(part.payload);
+    const control = new TextEncoder().encode(
+      JSON.stringify(
+        sortJson({ type: part.type, bytes: part.payload.byteLength, sha256: digest }),
+      ) + "\n",
+    );
+    return new Uint8Array([...control, ...part.payload, 0x0a]);
+  };
+  const prefixParts: Uint8Array[] = [new TextEncoder().encode(`${NOXSCOPE_RECORDING_MAGIC}\n`)];
+  for (const part of parts.slice(0, -2)) prefixParts.push(await frameBytes(part));
+  const prefix = new Uint8Array(prefixParts.reduce((sum, part) => sum + part.byteLength, 0));
+  let offset = 0;
+  for (const part of prefixParts) {
+    prefix.set(part, offset);
+    offset += part.byteLength;
+  }
+  const manifestFrame = await frameBytes({ type: "manifest", payload: manifestPayload });
+  const beforeTerminal = new Uint8Array([...prefix, ...manifestFrame]);
+  const terminalPayload = new TextEncoder().encode(
+    JSON.stringify(
+      sortJson({
+        type: "integrity",
+        contentDigest: await sha256Hex(beforeTerminal),
+        manifestFrameDigest: await sha256(manifestPayload),
+      }),
+    ),
+  );
+  const terminalFrame = await frameBytes({ type: "integrity", payload: terminalPayload });
+  return new Uint8Array([...beforeTerminal, ...terminalFrame]);
+}
 
 async function addUnknownRawAndReframe(bytes: Uint8Array): Promise<Uint8Array> {
   const ranges = frameRanges(bytes);
@@ -255,6 +503,29 @@ async function addUnknownRawAndReframe(bytes: Uint8Array): Promise<Uint8Array> {
       sanitization: { policy: "x", policyVersion: "1", redactions: [] },
     },
   ];
+  return reframe(
+    bytes,
+    recordRange,
+    new TextEncoder().encode(JSON.stringify(sortJson(recordPayload))),
+  );
+}
+
+async function replaceRawProvenance(
+  bytes: Uint8Array,
+  policy: string,
+  policyVersion: string,
+): Promise<Uint8Array> {
+  const ranges = frameRanges(bytes);
+  const recordRange = ranges.find((range) => range.type === "record")!;
+  const text = new TextDecoder().decode(bytes);
+  const recordPayload = JSON.parse(
+    text.slice(recordRange.payloadStart, recordRange.payloadEnd),
+  ) as Record<string, unknown>;
+  const event = recordPayload.event as Record<string, unknown>;
+  const raw = event.raw as Array<Record<string, unknown>>;
+  const sanitization = raw[0]!.sanitization as Record<string, unknown>;
+  sanitization.policy = policy;
+  sanitization.policyVersion = policyVersion;
   return reframe(
     bytes,
     recordRange,

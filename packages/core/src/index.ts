@@ -13,7 +13,27 @@ import {
 } from "@noxscope/protocol";
 
 export * from "./sanitizer.js";
-export * from "./recording.js";
+export {
+  NOXSCOPE_RECORDING_FORMAT,
+  NOXSCOPE_RECORDING_MAGIC,
+  NOXSCOPE_RECORDING_SCHEMA_VERSION,
+  RECORDING_LIMITS,
+  createRecorder,
+} from "./recording.js";
+export type {
+  Recorder,
+  RecordingAdapterReference,
+  RecordingCounts,
+  RecordingExport,
+  RecordingFrameDigest,
+  RecordingIntegrity,
+  RecordingLimits,
+  RecordingManifest,
+  RecordingOptions,
+  RecordingPolicyReference,
+  RecordingRecord,
+  RecordingSanitizationContext,
+} from "./recording.js";
 export * from "./recording-import.js";
 
 export interface CoreOptions {
