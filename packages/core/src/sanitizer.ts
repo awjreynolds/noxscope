@@ -135,12 +135,18 @@ class CentralSanitizer implements Sanitizer {
     if (prepared.state !== "valid") {
       return prepared.state === "invalid" ? invalid() : overflow();
     }
-    return sanitizePrepared(
-      prepared.input,
-      prepared.manifest,
-      prepared.manifest.projections,
-      options,
-    );
+    const preparedOptions = prepareOptions(options);
+    if (preparedOptions.state === "invalid") return invalid();
+    try {
+      return await sanitizePrepared(
+        prepared.input,
+        prepared.manifest,
+        prepared.manifest.projections,
+        preparedOptions.value,
+      );
+    } catch {
+      return invalid();
+    }
   }
 
   async sanitizeRawDetail(
@@ -154,12 +160,19 @@ class CentralSanitizer implements Sanitizer {
     }
     const raw = prepared.manifest.raw;
     if (raw === undefined) return invalid();
-    const sanitized = await sanitizePrepared(
-      prepared.input,
-      prepared.manifest,
-      raw.projections,
-      options,
-    );
+    const preparedOptions = prepareOptions(options);
+    if (preparedOptions.state === "invalid") return invalid();
+    let sanitized: Result<SanitizedProjection>;
+    try {
+      sanitized = await sanitizePrepared(
+        prepared.input,
+        prepared.manifest,
+        raw.projections,
+        preparedOptions.value,
+      );
+    } catch {
+      return invalid();
+    }
     if (!sanitized.ok) return sanitized;
     const detail: SanitizedRawDetail = {
       namespace: raw.namespace,
@@ -173,6 +186,25 @@ class CentralSanitizer implements Sanitizer {
     };
     if (encodedSize(detail) > SANITIZER_LIMITS.maxRawDetailBytes) return overflow();
     return { ok: true, value: detail };
+  }
+}
+
+function prepareOptions(
+  options: SanitizationOptions,
+):
+  { readonly state: "invalid" } | { readonly state: "valid"; readonly value: SanitizationOptions } {
+  try {
+    const key = options.pseudonymKey;
+    if (key === undefined) return { state: "valid", value: {} };
+    if (!(key instanceof Uint8Array) || key.byteLength < 32 || key.byteLength > 64) {
+      return { state: "invalid" };
+    }
+    return {
+      state: "valid",
+      value: { pseudonymKey: Uint8Array.prototype.slice.call(key) as Uint8Array },
+    };
+  } catch {
+    return { state: "invalid" };
   }
 }
 

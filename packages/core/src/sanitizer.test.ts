@@ -743,4 +743,179 @@ describe("Sanitizer", () => {
       removed: 0,
     });
   });
+
+  it("keeps recording pseudonyms stable, domain-separated, isolated, and mutation-safe", async () => {
+    const sanitizer = createSanitizer();
+    const input = {
+      wallet: { first: "addr_test1_private_canary", second: "addr_test1_private_canary" },
+    };
+    const pseudonymManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: [
+        {
+          source: "wallet.first",
+          target: "snapshot.primary",
+          classification: "S2",
+          transform: "pseudonym",
+        },
+        {
+          source: "wallet.second",
+          target: "snapshot.secondary",
+          classification: "S2",
+          transform: "pseudonym",
+        },
+      ],
+    };
+    const recordingKey = new Uint8Array(32).fill(7);
+    const originalKey = recordingKey.slice();
+    const pending = sanitizer.sanitize(input, pseudonymManifest, { pseudonymKey: recordingKey });
+    recordingKey.fill(9);
+    const result = await pending;
+    const repeated = await sanitizer.sanitize(input, pseudonymManifest, {
+      pseudonymKey: originalKey,
+    });
+    const otherRecording = await sanitizer.sanitize(input, pseudonymManifest, {
+      pseudonymKey: new Uint8Array(32).fill(8),
+    });
+
+    expect(result).toEqual(repeated);
+    expect(result.ok && result.value.value).not.toEqual(
+      otherRecording.ok && otherRecording.value.value,
+    );
+    if (!result.ok) throw new Error("expected successful pseudonym projection");
+    const projected = result.value.value as { snapshot: { primary: string; secondary: string } };
+    expect(projected.snapshot.primary).not.toBe(projected.snapshot.secondary);
+    expect(JSON.stringify(result)).not.toContain("addr_test1_private_canary");
+    expect(JSON.stringify(result)).not.toContain(JSON.stringify([...originalKey]));
+  });
+
+  it("rejects malformed pseudonym keys with a bounded non-echoing error", async () => {
+    const sanitizer = createSanitizer();
+    const pseudonymManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: [
+        {
+          source: "wallet.address",
+          target: "snapshot.address",
+          classification: "S2",
+          transform: "pseudonym",
+        },
+      ],
+    };
+    const invalidKeys: unknown[] = [
+      new Uint8Array(0),
+      new Uint8Array(31),
+      new Uint8Array(65),
+      "non-byte-key-canary",
+    ];
+    const expected = {
+      ok: false,
+      error: {
+        code: "invalid",
+        message: "Sanitization input or manifest is invalid",
+        retryable: false,
+      },
+    };
+
+    for (const key of invalidKeys) {
+      const result = await sanitizer.sanitize(
+        { wallet: { address: "pseudonym-input-canary" } },
+        pseudonymManifest,
+        { pseudonymKey: key as Uint8Array },
+      );
+      expect(result).toEqual(expected);
+      expect(JSON.stringify(result)).not.toMatch(/canary/);
+    }
+  });
+
+  it("reports exact nested audit decisions from detached inert input and manifest snapshots", async () => {
+    const sanitizer = createSanitizer();
+    const auditManifest: AdapterSanitizationManifest = {
+      adapter: { id: "audit.adapter", version: "1.0.0", sourceVersions: ["fixture/1"] },
+      policy: { id: "audit.policy", version: "1", digest: "audit-digest" },
+      projections: [
+        {
+          source: "state.ready",
+          target: "snapshot.ready",
+          classification: "S3",
+          transform: "copy",
+        },
+        {
+          source: "wallet.address",
+          target: "snapshot.wallet",
+          classification: "S2",
+          transform: "pseudonym",
+        },
+        {
+          source: "request.headers",
+          target: "request.headers",
+          classification: "S3",
+          transform: "headers",
+          allowedHeaders: ["content-type", "x-protocol-version", "authorization"],
+        },
+        {
+          source: "failure",
+          target: "failure",
+          classification: "S3",
+          transform: "error",
+        },
+        {
+          source: "diagnostic.secretValue",
+          target: "diagnostic.value",
+          classification: "S3",
+          transform: "copy",
+        },
+      ],
+    };
+    const input = {
+      state: { ready: true },
+      wallet: { address: "wallet-address-canary" },
+      request: {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Protocol-Version": "4.0.1",
+          Authorization: "Bearer authorization-canary",
+        },
+      },
+      failure: {
+        code: "NODE_UNAVAILABLE",
+        message: "Node unavailable",
+        retryable: true,
+        stack: "stack-canary",
+        rawTransaction: "transaction-canary",
+      },
+      diagnostic: { secretValue: "Bearer detector-canary" },
+      unreviewed: { note: "policy-canary" },
+    };
+    const pending = sanitizer.sanitize(input, auditManifest, {
+      pseudonymKey: new Uint8Array(32).fill(4),
+    });
+    (auditManifest.policy as { id: string }).id = "mutated-policy-canary";
+    input.failure.stack = "mutated-stack-canary";
+    const result = await pending;
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected successful audited projection");
+    expect(result.value.audit.policy).toEqual({
+      id: "audit.policy",
+      version: "1",
+      digest: "audit-digest",
+    });
+    expect(result.value.audit.policy).not.toBe(auditManifest.policy);
+    expect(result.value.audit.decisions).toEqual({
+      copied: 1,
+      pseudonymised: 1,
+      transformed: 2,
+      removed: 5,
+    });
+    expect(result.value.audit.redactions).toEqual([
+      { path: "diagnostic.secretvalue", reason: "secret" },
+      { path: "failure.rawtransaction", reason: "private-payload" },
+      { path: "failure.stack", reason: "policy" },
+      { path: "request.headers.authorization", reason: "secret" },
+      { path: "unreviewed.note", reason: "policy" },
+    ]);
+    expect(new Set(result.value.audit.redactions.map(({ path }) => path)).size).toBe(5);
+    expect(JSON.stringify(result)).not.toMatch(/(?:canary|mutated)/);
+  });
 });
