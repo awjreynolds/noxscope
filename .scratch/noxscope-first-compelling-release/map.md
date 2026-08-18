@@ -23,6 +23,8 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - [Map Moth supported integration surfaces](./issues/02-map-moth-supported-integration-surfaces.md) — Poll Moth daemon `version`/`getState` as a separate read-only runtime, expose its real capability gaps and freshness, and keep extension connector conformance distinct from daemon health.
 - [Which additional Midnight wallets should Noxscope validate?](./issues/03-identify-additional-wallet-validation-targets.md) — Prioritise the official Wallet SDK and Lace, qualify 1AM and Gero, keep inaccessible or announced wallets in later/watch tiers, and treat Ctrl as historical only.
 - [Define the canonical protocol and capability contract](./issues/04-define-canonical-protocol-and-capability-contract.md) — Use one versioned Runtime Session with typed core Capabilities, ordered Records, explicit support/availability/freshness, correlation, typed errors, and sanitised namespaced raw detail.
+- [Choose the first-release host and runtime topology](./issues/05-choose-host-and-runtime-topology.md) — Keep Core/UI platform-neutral in a browser-first workbench, with privileged Moth access behind a loopback Node HostBridge that transports canonical records only.
+- [Choose source provenance and migration strategy](./issues/08-choose-source-provenance-and-migration-strategy.md) — Selectively extract characterised GSD slices into the fresh monorepo with exact provenance, preserve MIT/Apache boundaries, and integrate Moth through public contracts rather than copied internals.
 
 ## Not yet specified
 
