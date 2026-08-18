@@ -74,6 +74,51 @@ describe("recording session", () => {
     session.dispose();
   });
 
+  it("records deterministic provenance for every distinct runtime adapter", async () => {
+    const sourceRecord = view.timeline[0]!.record;
+    if (sourceRecord.kind !== "diagnostic-event") throw new Error("fixture is not diagnostic");
+    const secondRecord = {
+      ...sourceRecord,
+      meta: {
+        ...sourceRecord.meta,
+        sessionId: "session-b",
+        runtimeId: "runtime-b",
+      },
+    };
+    const multiRuntime: CoreView = {
+      ...view,
+      runtimes: [
+        runtimeView("session-a", "runtime-a", "adapter.alpha", "1.0.0"),
+        runtimeView("session-b", "runtime-b", "adapter.beta", "2.0.0"),
+      ],
+      timeline: [
+        view.timeline[0]!,
+        {
+          runtimeId: "runtime-b",
+          record: secondRecord,
+        },
+      ],
+    };
+    const store = createMemoryRecordingStore({ now: () => "2026-08-19T12:00:00.000Z" });
+    const session = createRecordingSession(fakeCore(multiRuntime), {
+      store,
+      now: () => "2026-08-19T12:00:02.000Z",
+      randomValues: (bytes) => bytes.fill(3),
+    });
+    expect(await session.start("multi")).toMatchObject({ ok: true });
+    const stopped = await session.stop();
+    expect(stopped.ok).toBe(true);
+    if (!stopped.ok) throw new Error(stopped.error.message);
+    const loaded = await store.load(stopped.value.id);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) throw new Error(loaded.error.message);
+    const text = new TextDecoder().decode(loaded.value.bytes);
+    expect(text.indexOf('"id":"adapter.alpha"')).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf('"id":"adapter.beta"')).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf('"id":"adapter.alpha"')).toBeLessThan(text.indexOf('"id":"adapter.beta"'));
+    session.dispose();
+  });
+
   it("imports hostile input through the bounded parser and enters explicit offline replay", async () => {
     const store = createMemoryRecordingStore({ now: () => "2026-08-19T12:00:00.000Z" });
     const source = createRecordingSession(fakeCore(), {
@@ -135,6 +180,53 @@ describe("recording session", () => {
     });
     expect((await session.stop()).ok).toBe(true);
     expect(await session.stop()).toMatchObject({ ok: false, error: { code: "rejected" } });
+    session.dispose();
+  });
+
+  it("supersedes deferred imports safely when a new live recording starts and stops", async () => {
+    const gate = deferred<ArrayBuffer>();
+    const file = { size: 1, arrayBuffer: () => gate.promise } as unknown as Blob;
+    const session = createRecordingSession(fakeCore(), {
+      store: createMemoryRecordingStore(),
+      randomValues: (bytes) => bytes.fill(9),
+    });
+    const pending = session.importFile(file);
+    await Promise.resolve();
+    expect(await session.start("live-after-import")).toMatchObject({ ok: true });
+    expect((await session.stop()).ok).toBe(true);
+    gate.resolve(new ArrayBuffer(1));
+    await expect(pending).resolves.toMatchObject({ ok: false, error: { code: "cancelled" } });
+    expect((await session.start("restart")).ok).toBe(true);
+    expect((await session.stop()).ok).toBe(true);
+    const closeGate = deferred<ArrayBuffer>();
+    const closePending = session.importFile({
+      size: 1,
+      arrayBuffer: () => closeGate.promise,
+    } as Blob);
+    session.closeOffline();
+    closeGate.resolve(new ArrayBuffer(1));
+    await expect(closePending).resolves.toMatchObject({ ok: false, error: { code: "cancelled" } });
+    session.dispose();
+  });
+
+  it("supersedes deferred loads safely when a new live recording starts", async () => {
+    const gate =
+      deferred<Awaited<ReturnType<ReturnType<typeof createMemoryRecordingStore>["load"]>>>();
+    const base = createMemoryRecordingStore();
+    const store = { ...base, load: () => gate.promise };
+    const session = createRecordingSession(fakeCore(), {
+      store,
+      randomValues: (bytes) => bytes.fill(10),
+    });
+    const pending = session.load("deferred");
+    await Promise.resolve();
+    expect(await session.start("live-after-load")).toMatchObject({ ok: true });
+    expect((await session.stop()).ok).toBe(true);
+    gate.resolve({
+      ok: false,
+      error: { code: "unavailable", message: "late load", retryable: false },
+    });
+    await expect(pending).resolves.toMatchObject({ ok: false, error: { code: "cancelled" } });
     session.dispose();
   });
 
@@ -225,5 +317,57 @@ describe("recording session", () => {
       },
     });
     await expect(readRecordingFile(hostile)).resolves.toMatchObject({ ok: false });
+
+    const deceptive = {
+      size: 1,
+      arrayBuffer: async () => ({ byteLength: 1, length: 1, 0: 7 }),
+    } as unknown as Blob;
+    await expect(readRecordingFile(deceptive)).resolves.toMatchObject({ ok: false });
+
+    const hostileThenable = {
+      size: 1,
+      arrayBuffer: () => ({
+        then() {
+          throw new Error("hostile thenable");
+        },
+      }),
+    } as unknown as Blob;
+    await expect(readRecordingFile(hostileThenable)).resolves.toMatchObject({ ok: false });
   });
 });
+
+function runtimeView(
+  sessionId: string,
+  runtimeId: string,
+  adapterId: string,
+  adapterVersion: string,
+) {
+  return {
+    descriptor: {
+      protocol: "noxscope/adapter/1" as const,
+      sessionId,
+      runtimeId,
+      adapter: { id: adapterId, version: adapterVersion },
+      runtime: {
+        surface: "sdk" as const,
+        identifiers: [],
+        versions: [],
+      },
+      capabilities: [],
+    },
+    status: "observing" as const,
+    capabilities: [],
+    records: [],
+    failures: [],
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}

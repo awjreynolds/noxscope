@@ -5,6 +5,7 @@ import {
   type Result,
 } from "@noxscope/protocol";
 import {
+  adapterReferences,
   NOXSCOPE_RECORDING_FORMAT,
   NOXSCOPE_RECORDING_MAGIC,
   NOXSCOPE_RECORDING_SCHEMA_VERSION,
@@ -113,8 +114,12 @@ export async function importRecording(
     ) {
       return invalid("Recording import sanitization context is invalid");
     }
+    if (candidate.adapters !== undefined && !Array.isArray(candidate.adapters)) {
+      return invalid("Recording import sanitization context is invalid");
+    }
     sanitization = {
       manifest: candidate.manifest,
+      ...(candidate.adapters === undefined ? {} : { adapters: [...candidate.adapters] }),
       pseudonymKey: Uint8Array.prototype.slice.call(candidate.pseudonymKey) as Uint8Array,
       preserveRecordingPseudonyms: true,
     };
@@ -715,23 +720,8 @@ function expectedProvenance(context: RecordingSanitizationContext): {
   readonly adapters: readonly RecordingAdapterReference[];
   readonly policies: readonly RecordingPolicyReference[];
 } {
-  const adapter = context.manifest.adapter;
   return {
-    adapters: [
-      {
-        id: adapter.id,
-        version: adapter.version,
-        sourceVersions: [...adapter.sourceVersions],
-        ...(context.manifest.raw === undefined
-          ? {}
-          : {
-              raw: {
-                namespace: context.manifest.raw.namespace,
-                schemaVersion: context.manifest.raw.schemaVersion,
-              },
-            }),
-      },
-    ],
+    adapters: adapterReferences(context),
     policies: [{ ...context.manifest.policy }],
   };
 }

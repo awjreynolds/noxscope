@@ -56,6 +56,8 @@ export const RECORDING_LIMITS: RecordingLimits = Object.freeze({
 
 export interface RecordingSanitizationContext {
   readonly manifest: AdapterSanitizationManifest;
+  /** Every Adapter manifest represented by the captured Runtime Sessions. */
+  readonly adapters?: readonly AdapterSanitizationManifest[];
   /** A per-recording HMAC context; it is never serialized. */
   readonly pseudonymKey: Uint8Array;
   /** @internal Import-only preservation of already canonical recording pseudonyms. */
@@ -287,7 +289,7 @@ class RecordingBuilder implements Recorder {
       protocol: NOXSCOPE_PROTOCOL,
       schemaVersion: NOXSCOPE_RECORDING_SCHEMA_VERSION,
       exportedAt,
-      adapters: [adapterReference(this.#options.sanitization.manifest)],
+      adapters: adapterReferences(this.#options.sanitization),
       policies: [policyReference(this.#options.sanitization.manifest)],
     };
     const encodedHeader = encodeJson(header);
@@ -339,7 +341,7 @@ class RecordingBuilder implements Recorder {
       protocol: NOXSCOPE_PROTOCOL,
       schemaVersion: NOXSCOPE_RECORDING_SCHEMA_VERSION,
       exportedAt,
-      adapters: [adapterReference(this.#options.sanitization.manifest)],
+      adapters: adapterReferences(this.#options.sanitization),
       policies: [policyReference(this.#options.sanitization.manifest)],
       counts: { ...this.#counts },
       integrity: {
@@ -1358,6 +1360,22 @@ function adapterReference(manifest: AdapterSanitizationManifest): RecordingAdapt
   };
 }
 
+export function adapterReferences(
+  context: RecordingSanitizationContext,
+): readonly RecordingAdapterReference[] {
+  const manifests = [context.manifest, ...(context.adapters ?? [])];
+  const unique = new Map<string, RecordingAdapterReference>();
+  for (const manifest of manifests) {
+    const reference = adapterReference(manifest);
+    unique.set(JSON.stringify(reference), reference);
+  }
+  return [...unique.values()].sort((left, right) => {
+    const leftKey = JSON.stringify(left);
+    const rightKey = JSON.stringify(right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+}
+
 function policyReference(manifest: AdapterSanitizationManifest): RecordingPolicyReference {
   return {
     id: manifest.policy.id,
@@ -1378,15 +1396,27 @@ function resolveOptions(options: RecordingOptions): ResolvedRecordingOptions {
   ) {
     throw new Error("Recording sanitization context is invalid");
   }
+  if (sanitization.adapters !== undefined && !Array.isArray(sanitization.adapters)) {
+    throw new Error("Recording sanitization context is invalid");
+  }
   const manifestSnapshot = snapshotInert(sanitization.manifest, RECORDING_LIMITS);
   if (manifestSnapshot.state !== "valid" || !isRecord(manifestSnapshot.value)) {
     throw new Error("Recording sanitization context is invalid");
+  }
+  const adapterManifests: AdapterSanitizationManifest[] = [];
+  for (const adapter of sanitization.adapters ?? []) {
+    const snapshot = snapshotInert(adapter, RECORDING_LIMITS);
+    if (snapshot.state !== "valid" || !isRecord(snapshot.value)) {
+      throw new Error("Recording sanitization context is invalid");
+    }
+    adapterManifests.push(snapshot.value as unknown as AdapterSanitizationManifest);
   }
   return {
     now: options.now ?? (() => new Date().toISOString()),
     limits: resolveLimits(options.limits),
     sanitization: {
       manifest: manifestSnapshot.value as unknown as AdapterSanitizationManifest,
+      ...(adapterManifests.length === 0 ? {} : { adapters: adapterManifests }),
       pseudonymKey: sanitization.pseudonymKey.slice(),
     },
   };

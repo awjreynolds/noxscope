@@ -56,12 +56,22 @@ export interface DownloadEnvironment {
   readonly revokeObjectURL: (url: string) => void;
 }
 
+interface TransitionToken {
+  readonly kind: "import" | "load";
+  readonly epoch: number;
+}
+
 const POLICY = Object.freeze({ id: "noxscope.redaction", version: "1.0.0", digest: "core-v1" });
 const DEFAULT_ADAPTER = Object.freeze({
   id: "noxscope.browser",
   version: "0.1.0",
   sourceVersions: ["noxscope/adapter/1"],
 });
+const DEFAULT_ADAPTER_MANIFEST: AdapterSanitizationManifest = {
+  adapter: DEFAULT_ADAPTER,
+  policy: POLICY,
+  projections: [],
+};
 
 export function createRecordingSession(
   core: Core,
@@ -83,6 +93,8 @@ export function createRecordingSession(
   let appendTail: Promise<void> = Promise.resolve();
   let appendFailure: NoxscopeError | undefined;
   let disposed = false;
+  let transitionEpoch = 0;
+  let activeTransition: TransitionToken | undefined;
   let unsubscribeCore: () => void = () => undefined;
 
   const publish = (next: RecordingSessionState): void => {
@@ -139,6 +151,28 @@ export function createRecordingSession(
     return { phase: "error", summaries: current.summaries, error };
   }
 
+  function beginTransition(kind: TransitionToken["kind"]): Result<TransitionToken> {
+    if (activeTransition !== undefined) {
+      return fail("rejected", "Another Recording transition is in progress", false);
+    }
+    const token = { kind, epoch: transitionEpoch } as const;
+    activeTransition = token;
+    return { ok: true, value: token };
+  }
+
+  function isCurrentTransition(token: TransitionToken): boolean {
+    return activeTransition === token && transitionEpoch === token.epoch && !disposed;
+  }
+
+  function finishTransition(token: TransitionToken): void {
+    if (activeTransition === token) activeTransition = undefined;
+  }
+
+  function supersedeTransitions(): void {
+    transitionEpoch += 1;
+    activeTransition = undefined;
+  }
+
   const session: RecordingSession = {
     subscribe(listener) {
       listeners.add(listener);
@@ -154,13 +188,19 @@ export function createRecordingSession(
         return fail("rejected", "Close offline inspection before recording", false);
       }
       if (!validName(name)) return fail("invalid", "Recording name is invalid", false);
+      supersedeTransitions();
       const key = createPseudonymKey(randomValues);
       if (!key.ok) {
         publish({ ...current, phase: "error", error: key.error });
         return key;
       }
       recordingName = name;
-      recordingContext = { manifest: manifestFor(currentView), pseudonymKey: key.value };
+      const manifests = manifestsFor(currentView);
+      recordingContext = {
+        manifest: manifests[0]!,
+        adapters: manifests,
+        pseudonymKey: key.value,
+      };
       recorder = createRecorder({ now, sanitization: recordingContext });
       acceptedKeys = new Set();
       pendingKeys = new Set();
@@ -219,54 +259,94 @@ export function createRecordingSession(
       if (current.phase === "recording" || current.phase === "finalizing") {
         return fail("rejected", "Stop the active Recording before importing", false);
       }
-      const read = await readRecordingFile(file);
-      if (!read.ok) {
-        publish(failedState(read.error));
-        return read;
-      }
-      const imported = await importBytes(read.value);
-      if (!imported.ok) {
-        publish(failedState(imported.error));
-        return imported;
-      }
-      const importedName = fileName(file);
-      const saved = await store.save({
-        name: validName(importedName ?? "") ? importedName! : "imported-recording",
-        bytes: read.value,
-        recordCount: imported.value.imported.records.length,
-      });
-      if (!saved.ok) {
-        publish(failedState(saved.error));
+      const begun = beginTransition("import");
+      if (!begun.ok) return begun;
+      const token = begun.value;
+      try {
+        const read = await readRecordingFile(file);
+        if (!isCurrentTransition(token)) return staleTransition();
+        if (!read.ok) {
+          publish(failedState(read.error));
+          return read;
+        }
+        const imported = await importBytes(read.value);
+        if (!isCurrentTransition(token)) return staleTransition();
+        if (!imported.ok) {
+          publish(failedState(imported.error));
+          return imported;
+        }
+        const importedName = fileName(file);
+        if (!isCurrentTransition(token)) return staleTransition();
+        const saved = await store.save({
+          name: validName(importedName ?? "") ? importedName! : "imported-recording",
+          bytes: read.value,
+          recordCount: imported.value.imported.records.length,
+        });
+        if (!isCurrentTransition(token)) {
+          if (saved.ok) {
+            try {
+              await store.delete(saved.value.id);
+            } catch {
+              // A superseded import must never overwrite live state; cleanup is best effort.
+            }
+          }
+          return staleTransition();
+        }
+        if (!saved.ok) {
+          publish(failedState(saved.error));
+          return saved;
+        }
+        const summaries = await summariesOrCurrent();
+        if (!isCurrentTransition(token)) {
+          try {
+            await store.delete(saved.value.id);
+          } catch {
+            // A superseded import must never overwrite live state; cleanup is best effort.
+          }
+          return staleTransition();
+        }
+        publish({
+          phase: "offline",
+          summaries,
+          offline: { name: saved.value.name, imported: imported.value.imported },
+        });
         return saved;
+      } finally {
+        finishTransition(token);
       }
-      publish({
-        phase: "offline",
-        summaries: await summariesOrCurrent(),
-        offline: { name: saved.value.name, imported: imported.value.imported },
-      });
-      return saved;
     },
     async load(id) {
       if (disposed) return fail("cancelled", "Recording session is disposed", false);
       if (current.phase === "recording" || current.phase === "finalizing") {
         return fail("rejected", "Stop the active Recording before loading", false);
       }
-      const loaded = await store.load(id);
-      if (!loaded.ok) {
-        publish(failedState(loaded.error));
-        return loaded;
+      const begun = beginTransition("load");
+      if (!begun.ok) return begun;
+      const token = begun.value;
+      try {
+        const loaded = await store.load(id);
+        if (!isCurrentTransition(token)) return staleTransition();
+        if (!loaded.ok) {
+          publish(failedState(loaded.error));
+          return loaded;
+        }
+        const imported = await importBytes(loaded.value.bytes);
+        if (!isCurrentTransition(token)) return staleTransition();
+        if (!imported.ok) {
+          publish(failedState(imported.error));
+          return imported;
+        }
+        const summaries = await summariesOrCurrent();
+        if (!isCurrentTransition(token)) return staleTransition();
+        publish({
+          phase: "offline",
+          summaries,
+          offline: { name: loaded.value.name, imported: imported.value.imported },
+        });
+        return { ok: true, value: undefined };
+      } finally {
+        finishTransition(token);
       }
-      const imported = await importBytes(loaded.value.bytes);
-      if (!imported.ok) {
-        publish(failedState(imported.error));
-        return imported;
-      }
-      publish({
-        phase: "offline",
-        summaries: await summariesOrCurrent(),
-        offline: { name: loaded.value.name, imported: imported.value.imported },
-      });
-      return { ok: true, value: undefined };
     },
     async delete(id) {
       if (current.phase === "recording" || current.phase === "finalizing") {
@@ -301,6 +381,7 @@ export function createRecordingSession(
       );
     },
     closeOffline() {
+      supersedeTransitions();
       if (current.phase !== "offline") return;
       publish({ phase: "idle", summaries: current.summaries });
     },
@@ -308,6 +389,7 @@ export function createRecordingSession(
     dispose() {
       if (disposed) return;
       disposed = true;
+      supersedeTransitions();
       unsubscribeCore();
       recorder = undefined;
       recordingContext = undefined;
@@ -320,8 +402,10 @@ export function createRecordingSession(
   async function importBytes(
     bytes: Uint8Array,
   ): Promise<Result<{ readonly imported: ImportedRecording }>> {
+    const manifests = manifestsFor(currentView);
     const context = {
-      manifest: manifestFor(currentView),
+      manifest: manifests[0]!,
+      adapters: manifests,
       pseudonymKey: createEphemeralKey(randomValues),
     };
     if (!context.pseudonymKey.ok) return context.pseudonymKey;
@@ -346,6 +430,9 @@ export async function readRecordingFile(
       return fail("overflow", "Recording file exceeds the import limit", false);
     }
     const buffer = await file.arrayBuffer();
+    if (!(buffer instanceof ArrayBuffer)) {
+      return fail("invalid", "Recording file did not return binary data", false);
+    }
     if (buffer.byteLength > maxBytes)
       return fail("overflow", "Recording file exceeds the import limit", false);
     return { ok: true, value: new Uint8Array(buffer).slice() };
@@ -397,21 +484,18 @@ export function downloadRecording(
   }
 }
 
-function manifestFor(view: CoreView): AdapterSanitizationManifest {
-  const runtime = view.runtimes[0];
-  return {
-    adapter:
-      runtime === undefined
-        ? DEFAULT_ADAPTER
-        : {
-            ...runtime.descriptor.adapter,
-            sourceVersions: runtime.descriptor.runtime.versions.map(
-              (version) => `${version.subject}@${version.version}`,
-            ),
-          },
+function manifestsFor(view: CoreView): readonly AdapterSanitizationManifest[] {
+  const manifests = view.runtimes.map((runtime) => ({
+    adapter: {
+      ...runtime.descriptor.adapter,
+      sourceVersions: runtime.descriptor.runtime.versions
+        .map((version) => `${version.subject}@${version.version}`)
+        .sort(),
+    },
     policy: POLICY,
     projections: [],
-  };
+  }));
+  return manifests.length === 0 ? [DEFAULT_ADAPTER_MANIFEST] : manifests;
 }
 
 function recordKey(
@@ -500,6 +584,10 @@ function withoutError(state: RecordingSessionState): RecordingSessionState {
 
 function offlineDenied(): Result<never> {
   return fail("unsupported", "Offline replay cannot invoke runtime operations", false);
+}
+
+function staleTransition(): Result<never> {
+  return fail("cancelled", "Recording transition was superseded", false);
 }
 
 function fail<T>(code: NoxscopeError["code"], message: string, retryable: boolean): Result<T> {
