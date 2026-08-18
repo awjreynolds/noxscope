@@ -718,23 +718,96 @@ function detectValue(
     return "secret";
   }
   if (/^(?:basic|bearer)\s+[A-Za-z0-9._~+/=-]+$/i.test(normalized)) return "secret";
-  if (
-    /(?:^|[?&;,\s{])(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential)\s*[:=]\s*\S+/i.test(
-      normalized,
-    )
-  ) {
-    return "secret";
-  }
-  const words = normalized.toLocaleLowerCase("en-US").split(/\s+/u);
+  const uriReason = detectUriCredentials(normalized);
+  if (uriReason !== undefined) return uriReason;
+  const assignmentReason = detectForbiddenAssignment(normalized);
+  if (assignmentReason !== undefined) return assignmentReason;
+  const structuredReason = detectStructuredSecretText(normalized);
+  if (structuredReason !== undefined) return structuredReason;
+  const words = normalized.split(/\s+/u);
   if (
     [12, 15, 18, 21, 24].includes(words.length) &&
-    words.every((word) => /^[a-z]+$/u.test(word) && word.length >= 2 && word.length <= 10)
+    words.every((word) => {
+      const length = Array.from(word).length;
+      return /^[\p{L}\p{M}]+$/u.test(word) && length >= 1 && length <= 16;
+    })
   ) {
     return "secret";
   }
   const compact = normalized.replace(/\s+/g, "");
-  if (/^(?:[0-9a-f]{64,}|[A-Za-z0-9+/]{64,}={0,2})$/i.test(compact)) {
+  if (
+    /^[0-9a-f]{128,}$/i.test(compact) ||
+    (/^[A-Za-z0-9+/]{64,}={0,2}$/.test(compact) && /[g-z+/]/i.test(compact))
+  ) {
     return "private-payload";
+  }
+  return undefined;
+}
+
+function detectUriCredentials(
+  value: string,
+): SanitizationAudit["redactions"][number]["reason"] | undefined {
+  try {
+    const url = new URL(value);
+    if (
+      ["http:", "https:", "ws:", "wss:"].includes(url.protocol) &&
+      (url.username.length > 0 || url.password.length > 0)
+    ) {
+      return "secret";
+    }
+  } catch {
+    // A non-URL may still match another detector.
+  }
+  return undefined;
+}
+
+function detectForbiddenAssignment(
+  value: string,
+): SanitizationAudit["redactions"][number]["reason"] | undefined {
+  for (const segment of value.split(/[?&;,{}]/u)) {
+    const match = /^\s*([\p{L}\p{N}_.\-\s]{1,64}?)\s*[:=]\s*\S+/u.exec(segment);
+    if (!match) continue;
+    const reason = forbiddenReasons.get(normalizeKey(match[1]!));
+    if (reason !== undefined) return reason;
+  }
+  return undefined;
+}
+
+function detectStructuredSecretText(
+  value: string,
+): SanitizationAudit["redactions"][number]["reason"] | undefined {
+  if (!(value.startsWith("{") || value.startsWith("["))) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+  const pending: unknown[] = [parsed];
+  let visited = 0;
+  while (pending.length > 0 && visited < SANITIZER_LIMITS.maxObjectProperties * 4) {
+    visited += 1;
+    const current = pending.pop();
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (!isPlainObject(current)) continue;
+    const keys = Object.keys(current);
+    const normalizedKeys = new Set(keys.map(normalizeKey));
+    if (
+      normalizedKeys.has("crypto") &&
+      ["cipher", "ciphertext", "kdf", "mac"].filter((key) =>
+        JSON.stringify(current.crypto).toLocaleLowerCase("en-US").includes(key),
+      ).length >= 3
+    ) {
+      return "key-material";
+    }
+    for (const key of keys) {
+      const reason = forbiddenReasons.get(normalizeKey(key));
+      if (reason !== undefined) return reason;
+      pending.push(current[key]);
+    }
   }
   return undefined;
 }

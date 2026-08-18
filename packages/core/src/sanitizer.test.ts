@@ -656,4 +656,91 @@ describe("Sanitizer", () => {
       },
     });
   });
+
+  it("removes Unicode secret phrases, credential URLs, normalized assignments, and key stores", async () => {
+    const sanitizer = createSanitizer();
+    const secrets = [
+      "ábaco abdomen abeja abierto abogado abono aborto abrazo abrir abuelo abuso acabar",
+
+      "あいこくしん あいさつ あいだ あおぞら あかちゃん あきる あけがた あける あこがれる あさい あさひ あしあと あじわう あずかる あそぶ",
+      "的 一 是 在 不 了 有 和 人 这 中 大 为 上 个 国 我 以",
+
+      "абажур абзац абонент абрикос автобус август автор адрес азбука айва акула алмаз алтарь альбом ангел антенна аптека арбуз арена артист архив",
+
+      "أبجد إبرة أثاث أجمل أحمر أخبار إدارة إذن أرنب أزرق أسد أشجار أطفال إعصار أغنية أفكار أقلام أكبر ألماس أمطار أنوار أهل أوتار أيام",
+      "https://wallet-user:wallet-password@node.example.test/private",
+      "private_key=private-key-canary",
+      "spending-key: spending-key-canary",
+      "viewing key = viewing-key-canary",
+      "signing.key=signing-key-canary",
+      "proving key: proving-key-canary",
+      "access-token=access-token-canary",
+      "refresh token: refresh-token-canary",
+      "session_token=session-token-canary",
+      "cookie=session-cookie-canary",
+      "client secret=client-secret-canary",
+      "raw tx=raw-transaction-canary",
+      "proof=proof-canary",
+      "witness: witness-canary",
+      "redeemer=redeemer-canary",
+      "checkpoint: checkpoint-canary",
+      "vault=vault-canary",
+
+      '{"version":3,"crypto":{"cipher":"aes-128-ctr","ciphertext":"keystore-canary","kdf":"scrypt","mac":"001122"}}',
+      '{"account":{"privateKey":"json-private-key-canary"}}',
+    ] as const;
+    const secretFields = Object.fromEntries(
+      secrets.map((secret, index) => [`case${index}`, secret]),
+    );
+    const detectorManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: secrets.map((_, index) => ({
+        source: `diagnostic.case${index}`,
+        target: `event.case${index}`,
+        classification: "S3" as const,
+        transform: "copy" as const,
+      })),
+    };
+
+    const result = await sanitizer.sanitize({ diagnostic: secretFields }, detectorManifest);
+
+    expect(result.ok && result.value.value).toEqual({});
+    expect(result.ok && result.value.audit.decisions.removed).toBe(secrets.length);
+    const serialized = JSON.stringify(result);
+    for (const secret of secrets) expect(serialized).not.toContain(secret);
+  });
+
+  it("retains ordinary prose and public identifiers that resemble secret encodings", async () => {
+    const sanitizer = createSanitizer();
+    const benign = {
+      prose:
+        "Sync completed normally, and the wallet is now ready for another requested operation.",
+      uuid: "123e4567-e89b-12d3-a456-426614174000",
+      transactionHash: "a3".repeat(32),
+      publicAddress: "addr_test1vqpz3u8m7y5w4x2c9publicaddress",
+      publicKey:
+        "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA111111111111111111111111111111111111111=\n-----END PUBLIC KEY-----",
+      shortDiagnostic: "Node connected",
+      benignUrl: "https://node.example.test:9944/status?network=preview",
+    };
+    const benignManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: Object.keys(benign).map((source) => ({
+        source: `diagnostic.${source}`,
+        target: `event.${source}`,
+        classification: "S3" as const,
+        transform: "copy" as const,
+      })),
+    };
+
+    const result = await sanitizer.sanitize({ diagnostic: benign }, benignManifest);
+
+    expect(result.ok && result.value.value).toEqual({ event: benign });
+    expect(result.ok && result.value.audit.decisions).toEqual({
+      copied: Object.keys(benign).length,
+      pseudonymised: 0,
+      transformed: 0,
+      removed: 0,
+    });
+  });
 });
