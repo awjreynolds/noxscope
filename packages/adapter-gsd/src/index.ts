@@ -787,7 +787,12 @@ class MessagePortConnection implements GsdTransportConnection {
       pending.resolve(value.payload);
       return;
     }
-    this.#messages.push(value, () => value);
+    this.#messages.push(value, () => ({
+      version: GSD_TRANSPORT_VERSION,
+      type: "overflow",
+      stream: "events",
+      payload: { source: "message-port-queue" },
+    }));
   }
 }
 
