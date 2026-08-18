@@ -78,7 +78,10 @@ export function createRecordingSession(
   let recorder: Recorder | undefined;
   let recordingContext: RecordingSanitizationContext | undefined;
   let recordingName = "noxscope-recording";
-  let seen = new Set<string>();
+  let acceptedKeys = new Set<string>();
+  let pendingKeys = new Set<string>();
+  let appendTail: Promise<void> = Promise.resolve();
+  let appendFailure: NoxscopeError | undefined;
   let disposed = false;
   let unsubscribeCore: () => void = () => undefined;
 
@@ -89,12 +92,34 @@ export function createRecordingSession(
 
   const receiveView = (next: CoreView): void => {
     currentView = next;
-    if (current.phase !== "recording" || recorder === undefined) return;
+    const activeRecorder = recorder;
+    if (
+      current.phase !== "recording" ||
+      activeRecorder === undefined ||
+      appendFailure !== undefined
+    )
+      return;
     for (const item of next.timeline) {
       const key = recordKey(item.runtimeId, item.record);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      void recorder.append(item.record);
+      if (acceptedKeys.has(key) || pendingKeys.has(key)) continue;
+      pendingKeys.add(key);
+      appendTail = appendTail
+        .then(async () => {
+          let result: Result<void>;
+          try {
+            result = await activeRecorder.append(item.record);
+          } catch {
+            result = fail("internal", "Recording append failed", true);
+          }
+          pendingKeys.delete(key);
+          if (result.ok) {
+            acceptedKeys.add(key);
+            return;
+          }
+          appendFailure ??= result.error;
+          publish({ ...current, error: appendFailure });
+        })
+        .catch(() => undefined);
     }
   };
   unsubscribeCore = core.subscribe(receiveView);
@@ -109,6 +134,10 @@ export function createRecordingSession(
     return result;
   };
   void refresh();
+
+  function failedState(error: NoxscopeError): RecordingSessionState {
+    return { phase: "error", summaries: current.summaries, error };
+  }
 
   const session: RecordingSession = {
     subscribe(listener) {
@@ -133,7 +162,10 @@ export function createRecordingSession(
       recordingName = name;
       recordingContext = { manifest: manifestFor(currentView), pseudonymKey: key.value };
       recorder = createRecorder({ now, sanitization: recordingContext });
-      seen = new Set();
+      acceptedKeys = new Set();
+      pendingKeys = new Set();
+      appendTail = Promise.resolve();
+      appendFailure = undefined;
       publish(withoutError({ ...current, phase: "recording" }));
       receiveView(currentView);
       return { ok: true, value: undefined };
@@ -150,12 +182,20 @@ export function createRecordingSession(
       publish(withoutError({ ...current, phase: "finalizing" }));
       const activeRecorder = recorder;
       recorder = undefined;
-      const context = recordingContext;
       recordingContext = undefined;
+      await appendTail;
       const exported = await activeRecorder.finalize();
       if (!exported.ok) {
-        publish({ ...current, phase: "error", error: exported.error });
+        publish(failedState(exported.error));
         return exported;
+      }
+      if (appendFailure !== undefined) {
+        const failure = appendFailure;
+        appendFailure = undefined;
+        acceptedKeys = new Set();
+        pendingKeys = new Set();
+        publish({ phase: "error", summaries: current.summaries, error: failure });
+        return { ok: false, error: failure };
       }
       const saved = await store.save({
         name: recordingName,
@@ -166,7 +206,6 @@ export function createRecordingSession(
         publish({ ...current, phase: "error", error: saved.error });
         return saved;
       }
-      void context;
       const listed = await store.list();
       if (listed.ok) {
         publish({ phase: "idle", summaries: listed.value });
@@ -182,21 +221,22 @@ export function createRecordingSession(
       }
       const read = await readRecordingFile(file);
       if (!read.ok) {
-        publish({ ...current, phase: "error", error: read.error });
+        publish(failedState(read.error));
         return read;
       }
       const imported = await importBytes(read.value);
       if (!imported.ok) {
-        publish({ ...current, phase: "error", error: imported.error });
+        publish(failedState(imported.error));
         return imported;
       }
+      const importedName = fileName(file);
       const saved = await store.save({
-        name: validName(fileName(file) ?? "") ? (fileName(file) as string) : "imported-recording",
+        name: validName(importedName ?? "") ? importedName! : "imported-recording",
         bytes: read.value,
         recordCount: imported.value.imported.records.length,
       });
       if (!saved.ok) {
-        publish({ ...current, phase: "error", error: saved.error });
+        publish(failedState(saved.error));
         return saved;
       }
       publish({
@@ -208,14 +248,17 @@ export function createRecordingSession(
     },
     async load(id) {
       if (disposed) return fail("cancelled", "Recording session is disposed", false);
+      if (current.phase === "recording" || current.phase === "finalizing") {
+        return fail("rejected", "Stop the active Recording before loading", false);
+      }
       const loaded = await store.load(id);
       if (!loaded.ok) {
-        publish({ ...current, phase: "error", error: loaded.error });
+        publish(failedState(loaded.error));
         return loaded;
       }
       const imported = await importBytes(loaded.value.bytes);
       if (!imported.ok) {
-        publish({ ...current, phase: "error", error: imported.error });
+        publish(failedState(imported.error));
         return imported;
       }
       publish({
@@ -322,21 +365,36 @@ export function downloadRecording(
   const env: Result<DownloadEnvironment> =
     environment === undefined ? browserDownloadEnvironment() : { ok: true, value: environment };
   if (!env.ok) return env;
-  const url = env.value.createObjectURL(
-    new Blob([bytes.slice().buffer as ArrayBuffer], { type: "application/octet-stream" }),
-  );
-  const anchor = env.value.document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  anchor.hidden = true;
-  env.value.document.body.append(anchor);
+  let url: string | undefined;
+  let anchor: HTMLAnchorElement | undefined;
   try {
+    url = env.value.createObjectURL(
+      new Blob([bytes.slice().buffer as ArrayBuffer], { type: "application/octet-stream" }),
+    );
+    anchor = env.value.document.createElement("a");
+    anchor.href = url;
+    anchor.download = name;
+    anchor.hidden = true;
+    if (env.value.document.body === null) throw new Error("document body is unavailable");
+    env.value.document.body.append(anchor);
     anchor.click();
+    return { ok: true, value: undefined };
+  } catch {
+    return fail("internal", "Recording download failed", true);
   } finally {
-    anchor.remove();
-    env.value.revokeObjectURL(url);
+    try {
+      anchor?.remove();
+    } catch {
+      // Hostile DOM implementations cannot prevent URL cleanup from being attempted.
+    }
+    if (url !== undefined) {
+      try {
+        env.value.revokeObjectURL(url);
+      } catch {
+        // URL cleanup is best-effort after the browser has accepted the download.
+      }
+    }
   }
-  return { ok: true, value: undefined };
 }
 
 function manifestFor(view: CoreView): AdapterSanitizationManifest {
@@ -425,9 +483,13 @@ function validName(name: string): boolean {
 }
 
 function fileName(file: Blob): string | undefined {
-  if (typeof File !== "undefined" && file instanceof File) return file.name;
-  const named = file as Blob & { readonly name?: unknown };
-  return typeof named.name === "string" ? named.name : undefined;
+  try {
+    if (typeof File !== "undefined" && file instanceof File) return file.name;
+    const named = file as Blob & { readonly name?: unknown };
+    return typeof named.name === "string" ? named.name : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function withoutError(state: RecordingSessionState): RecordingSessionState {

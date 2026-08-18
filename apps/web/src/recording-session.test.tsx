@@ -109,9 +109,64 @@ describe("recording session", () => {
     const bounded = await readRecordingFile(tooLarge);
     expect(bounded).toMatchObject({ ok: false, error: { code: "overflow" } });
     expect((tooLarge.arrayBuffer as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    const failedImport = await session.importFile(tooLarge);
+    expect(failedImport).toMatchObject({ ok: false, error: { code: "overflow" } });
+    const restarted = await session.start("restarted");
+    expect(restarted).toMatchObject({ ok: true });
+    expect((await session.stop()).ok).toBe(true);
     expect((await session.requestOperation({ kind: "invoke" })).ok).toBe(false);
-    session.closeOffline();
     source.dispose();
+    session.dispose();
+  });
+
+  it("rejects load and import transitions while recording and leaves no active capture behind", async () => {
+    const session = createRecordingSession(fakeCore(), {
+      store: createMemoryRecordingStore(),
+      randomValues: (bytes) => bytes.fill(6),
+    });
+    expect(await session.start()).toMatchObject({ ok: true });
+    expect(await session.load("recording-unknown")).toMatchObject({
+      ok: false,
+      error: { code: "rejected" },
+    });
+    expect(await session.importFile(new Blob([new Uint8Array([1])]))).toMatchObject({
+      ok: false,
+      error: { code: "rejected" },
+    });
+    expect((await session.stop()).ok).toBe(true);
+    expect(await session.stop()).toMatchObject({ ok: false, error: { code: "rejected" } });
+    session.dispose();
+  });
+
+  it("observes append overflow, reports it, and does not save an empty Recording", async () => {
+    const sourceRecord = view.timeline[0]!.record;
+    if (sourceRecord.kind !== "diagnostic-event" || sourceRecord.event.type !== "diagnostic") {
+      throw new Error("fixture is not diagnostic");
+    }
+    const oversizedView: CoreView = {
+      ...view,
+      timeline: [
+        {
+          ...view.timeline[0]!,
+          record: {
+            ...sourceRecord,
+            event: {
+              ...sourceRecord.event,
+              message: "x".repeat(300_000),
+            },
+          },
+        },
+      ],
+    };
+    const store = createMemoryRecordingStore();
+    const session = createRecordingSession(fakeCore(oversizedView), {
+      store,
+      randomValues: (bytes) => bytes.fill(8),
+    });
+    expect(await session.start("overflow")).toMatchObject({ ok: true });
+    const stopped = await session.stop();
+    expect(stopped).toMatchObject({ ok: false, error: { code: "overflow" } });
+    expect(await store.list()).toMatchObject({ ok: true, value: [] });
     session.dispose();
   });
 
@@ -142,5 +197,33 @@ describe("recording session", () => {
     expect(click).toHaveBeenCalledOnce();
     expect(remove).toHaveBeenCalledOnce();
     expect(revoked).toEqual(["blob:test"]);
+  });
+
+  it("contains hostile download DOM and File traps", async () => {
+    expect(() =>
+      downloadRecording(new Uint8Array([1]), "capture.noxscope", {
+        document: {
+          body: {
+            append() {
+              throw new Error("hostile append");
+            },
+          } as unknown as HTMLElement,
+          createElement: () => {
+            throw new Error("hostile create");
+          },
+        } as unknown as Document,
+        createObjectURL: () => "blob:hostile",
+        revokeObjectURL: () => undefined,
+      }),
+    ).not.toThrow();
+
+    const hostile = new Blob([new Uint8Array([1])]);
+    Object.defineProperty(hostile, "size", {
+      configurable: true,
+      get() {
+        throw new Error("hostile size");
+      },
+    });
+    await expect(readRecordingFile(hostile)).resolves.toMatchObject({ ok: false });
   });
 });

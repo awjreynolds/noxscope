@@ -1,12 +1,37 @@
 // @vitest-environment jsdom
 
 import { createMockAdapter, type MockScenario } from "@noxscope/adapter-mock";
-import { createCore } from "@noxscope/core";
+import { createCore, type Core } from "@noxscope/core";
 import { render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./App.js";
 
 describe("Overview", () => {
+  it("balances Core subscriptions when StrictMode mounts and unmounts the default recording session", async () => {
+    let activeSubscriptions = 0;
+    const core = {
+      async connect() {
+        return { ok: true, value: "runtime-1" } as const;
+      },
+      subscribe(listener: (view: never) => void) {
+        activeSubscriptions += 1;
+        void listener;
+        return () => {
+          activeSubscriptions -= 1;
+        };
+      },
+    } as unknown as Core;
+    const rendered = render(
+      <StrictMode>
+        <App core={core} />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(activeSubscriptions).toBe(2));
+    rendered.unmount();
+    expect(activeSubscriptions).toBe(0);
+  });
+
   it("renders runtime, capability, three-domain sync, balances, and ordered events from Core", async () => {
     const core = createCore({ signal: new AbortController().signal });
     render(<App core={core} />);

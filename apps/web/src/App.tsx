@@ -1,6 +1,6 @@
 import type { Core, CoreView, RuntimeView } from "@noxscope/core";
 import type { NoxscopeRecord } from "@noxscope/protocol";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   createRecordingSession,
   type RecordingSession,
@@ -21,11 +21,8 @@ export interface AppProps {
 
 export function App({ core, recordingSession: providedRecordingSession }: AppProps) {
   const [view, setView] = useState<CoreView>(emptyView);
-  const recordingSession = useMemo(
-    () =>
-      providedRecordingSession ??
-      createRecordingSession(core, { store: createMemoryRecordingStore() }),
-    [core, providedRecordingSession],
+  const [recordingSession, setRecordingSession] = useState<RecordingSession | undefined>(
+    providedRecordingSession,
   );
   const [recording, setRecording] = useState<RecordingSessionState>({
     phase: "idle",
@@ -33,13 +30,22 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
   });
   const fileInput = useRef<HTMLInputElement>(null);
   useEffect(() => core.subscribe(setView), [core]);
-  useEffect(() => recordingSession.subscribe(setRecording), [recordingSession]);
-  useEffect(
-    () => () => {
-      if (providedRecordingSession === undefined) recordingSession.dispose();
-    },
-    [providedRecordingSession, recordingSession],
-  );
+  useEffect(() => {
+    if (providedRecordingSession !== undefined) {
+      setRecordingSession(providedRecordingSession);
+      return;
+    }
+    const owned = createRecordingSession(core, { store: createMemoryRecordingStore() });
+    setRecordingSession(owned);
+    return () => {
+      owned.dispose();
+      setRecordingSession((current) => (current === owned ? undefined : current));
+    };
+  }, [core, providedRecordingSession]);
+  useEffect(() => {
+    if (recordingSession === undefined) return;
+    return recordingSession.subscribe(setRecording);
+  }, [recordingSession]);
 
   const offline = recording.offline;
 
@@ -56,10 +62,11 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
         </div>
         <RecordingControls
           state={recording}
-          onStart={() => void recordingSession.start()}
-          onStop={() => void recordingSession.stop()}
+          disabled={recordingSession === undefined}
+          onStart={() => void recordingSession?.start()}
+          onStop={() => void recordingSession?.stop()}
           onImport={() => fileInput.current?.click()}
-          onCloseOffline={() => recordingSession.closeOffline()}
+          onCloseOffline={() => recordingSession?.closeOffline()}
         />
       </header>
 
@@ -71,7 +78,7 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
         onChange={(event) => {
           const file = event.currentTarget.files?.[0];
           event.currentTarget.value = "";
-          if (file !== undefined) void recordingSession.importFile(file);
+          if (file !== undefined) void recordingSession?.importFile(file);
         }}
       />
 
@@ -84,7 +91,7 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
             <strong>{offline.name}</strong>
             <span>Replay-only view · no wallet, network, or runtime operations</span>
           </div>
-          <button type="button" onClick={() => recordingSession.closeOffline()}>
+          <button type="button" onClick={() => recordingSession?.closeOffline()}>
             Return to live view
           </button>
         </section>
@@ -128,9 +135,10 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
 
       <RecordingLibrary
         state={recording}
-        onLoad={(id) => void recordingSession.load(id)}
-        onDelete={(id) => void recordingSession.delete(id)}
-        onExport={(id) => void recordingSession.export(id)}
+        disabled={recordingSession === undefined}
+        onLoad={(id) => void recordingSession?.load(id)}
+        onDelete={(id) => void recordingSession?.delete(id)}
+        onExport={(id) => void recordingSession?.export(id)}
       />
     </main>
   );
@@ -138,12 +146,14 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
 
 function RecordingControls({
   state,
+  disabled,
   onStart,
   onStop,
   onImport,
   onCloseOffline,
 }: {
   readonly state: RecordingSessionState;
+  readonly disabled: boolean;
   readonly onStart: () => void;
   readonly onStop: () => void;
   readonly onImport: () => void;
@@ -153,15 +163,15 @@ function RecordingControls({
   return (
     <div className="recording-controls" aria-label="Recording controls">
       {recording ? (
-        <button type="button" onClick={onStop} disabled={state.phase === "finalizing"}>
+        <button type="button" onClick={onStop} disabled={state.phase === "finalizing" || disabled}>
           {state.phase === "finalizing" ? "Finalizing…" : "Stop Recording"}
         </button>
       ) : (
-        <button type="button" onClick={onStart} disabled={state.phase === "offline"}>
+        <button type="button" onClick={onStart} disabled={state.phase === "offline" || disabled}>
           Start Recording
         </button>
       )}
-      <button type="button" onClick={onImport} disabled={recording}>
+      <button type="button" onClick={onImport} disabled={recording || disabled}>
         Import Recording
       </button>
       {state.phase === "offline" ? (
@@ -195,11 +205,13 @@ function RecordingStatus({ state }: { readonly state: RecordingSessionState }) {
 
 function RecordingLibrary({
   state,
+  disabled,
   onLoad,
   onDelete,
   onExport,
 }: {
   readonly state: RecordingSessionState;
+  readonly disabled: boolean;
   readonly onLoad: (id: string) => void;
   readonly onDelete: (id: string) => void;
   readonly onExport: (id: string) => void;
@@ -229,21 +241,21 @@ function RecordingLibrary({
                 <button
                   type="button"
                   onClick={() => onLoad(summary.id)}
-                  disabled={state.phase === "recording"}
+                  disabled={state.phase === "recording" || disabled}
                 >
                   Inspect
                 </button>
                 <button
                   type="button"
                   onClick={() => onExport(summary.id)}
-                  disabled={state.phase === "offline"}
+                  disabled={state.phase === "offline" || disabled}
                 >
                   Export
                 </button>
                 <button
                   type="button"
                   onClick={() => onDelete(summary.id)}
-                  disabled={state.phase === "recording"}
+                  disabled={state.phase === "recording" || disabled}
                 >
                   Delete
                 </button>
