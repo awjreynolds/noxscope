@@ -819,10 +819,24 @@ function detectUriCredentials(
 function detectForbiddenAssignment(
   value: string,
 ): SanitizationAudit["redactions"][number]["reason"] | undefined {
-  for (const segment of value.split(/[?&;,{}]/u)) {
-    const match = /^\s*([\s\S]{1,64}?)\s*[:=]\s*\S+/u.exec(segment);
-    if (!match) continue;
-    const reason = forbiddenNameReason(match[1]!);
+  const normalized = value.normalize("NFKC").replace(/\p{Default_Ignorable_Code_Point}/gu, "");
+  const boundedLength = Math.min(normalized.length, SANITIZER_LIMITS.maxStringBytes);
+  for (let start = 0; start < boundedLength; start += 1) {
+    let separator = -1;
+    for (let index = start; index < boundedLength && index - start <= 64; index += 1) {
+      const character = normalized[index];
+      if (character === ":" || character === "=") {
+        separator = index;
+        break;
+      }
+    }
+    if (separator < 0) continue;
+    const key = normalized.slice(start, separator).trim();
+    if (key.length === 0 || key.length > 64) continue;
+    let valueStart = separator + 1;
+    while (valueStart < boundedLength && /\s/u.test(normalized[valueStart]!)) valueStart += 1;
+    if (valueStart >= boundedLength) continue;
+    const reason = forbiddenNameReason(key);
     if (reason !== undefined) return reason;
   }
   return undefined;

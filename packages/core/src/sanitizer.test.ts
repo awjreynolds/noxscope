@@ -1239,4 +1239,31 @@ describe("Sanitizer", () => {
       /(?:newline|carriage|line-separator|paragraph-separator)-secret-canary/,
     );
   });
+
+  it("finds credential assignments inside prose without consuming later matches", async () => {
+    const sanitizer = createSanitizer();
+    const values = {
+      prose: "error: api_key=prose-secret-canary; retry_count=3",
+      multiple: "first=ok, x-api-key=second-secret-canary, access\u200b_token=third-secret-canary",
+      benign: "error: retry_count=3; ordinary colon text: remains public",
+    };
+    const assignmentManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: Object.keys(values).map((source) => ({
+        source: `diagnostic.${source}`,
+        target: `event.${source}`,
+        classification: "S3" as const,
+        transform: "copy" as const,
+      })),
+    };
+
+    const result = await sanitizer.sanitize({ diagnostic: values }, assignmentManifest);
+
+    expect(result.ok && result.value.value).toEqual({ event: { benign: values.benign } });
+    expect(result.ok && result.value.audit.redactions).toEqual([
+      { path: "diagnostic.multiple", reason: "secret" },
+      { path: "diagnostic.prose", reason: "secret" },
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(/(?:prose|second|third)-secret-canary/);
+  });
 });

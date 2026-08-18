@@ -1406,11 +1406,16 @@ function deepFreeze<T>(value: T): T {
 }
 
 function validTimestamp(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value) &&
-    !Number.isNaN(Date.parse(value))
-  );
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value)) {
+    return false;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return false;
+  try {
+    return new Date(parsed).toISOString() === value;
+  } catch {
+    return false;
+  }
 }
 
 function lifecycleError(): Result<never> {

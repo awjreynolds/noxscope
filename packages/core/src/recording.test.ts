@@ -308,6 +308,18 @@ describe("Recording v1 codec", () => {
       ok: false,
       error: { code: "invalid", message: "Recording export time is invalid", retryable: false },
     });
+
+    for (const invalidTime of [
+      "2026-02-30T12:00:00.000Z",
+      "2024-02-29T25:00:00.000Z",
+      "2023-02-29T12:00:00.000Z",
+      "2026-04-31T12:00:00.000Z",
+    ]) {
+      await expect(makeRecorder({ now: () => invalidTime }).finalize()).resolves.toEqual({
+        ok: false,
+        error: { code: "invalid", message: "Recording export time is invalid", retryable: false },
+      });
+    }
   });
 
   it("snapshots candidates synchronously before queued asynchronous work", async () => {
