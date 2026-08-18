@@ -1,7 +1,7 @@
 # Build central sanitizer and portable Recordings
 
 Type: task
-Status: open
+Status: claimed
 Blocked by: 06, 10
 
 ## Question

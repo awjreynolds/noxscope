@@ -27,6 +27,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - [Choose source provenance and migration strategy](./issues/08-choose-source-provenance-and-migration-strategy.md) — Selectively extract characterised GSD slices into the fresh monorepo with exact provenance, preserve MIT/Apache boundaries, and integrate Moth through public contracts rather than copied internals.
 - [Define the redaction and recording trust boundary](./issues/06-define-redaction-and-recording-trust-boundary.md) — Project allowlisted canonical fields and sanitise at every trust transition; forbid secret/private execution material even in developer mode, bound hostile imports, and use integrity-checked framed JSON Recordings.
 - [Define wallet qualification and conformance matrix](./issues/07-define-wallet-qualification-and-conformance-matrix.md) — Separate deep Adapter conformance from connector compatibility, scope every claim to exact evidence, require capability-specific suites, and quarantine false/security-unsafe claims.
+- [Build protocol, Core, and deterministic mock](./issues/10-build-protocol-core-and-deterministic-mock.md) — Established the reviewed dependency-free protocol, multi-session Core, deterministic Adapter scenarios, and runnable React/Vite Overview with validated ordering, lifecycle, and failure invariants.
 
 ## Not yet specified
 

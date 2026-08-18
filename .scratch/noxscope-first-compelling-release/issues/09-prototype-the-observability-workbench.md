@@ -1,7 +1,7 @@
 # Prototype the observability workbench
 
 Type: prototype
-Status: open
+Status: claimed
 Blocked by: 04, 05
 
 ## Question
