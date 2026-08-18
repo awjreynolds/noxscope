@@ -41,7 +41,7 @@ describe("Sanitizer", () => {
           manifest: { id: "test.adapter", version: "1.0.0" },
           decisions: { copied: 2, pseudonymised: 0, transformed: 0, removed: 3 },
           redactions: [
-            { path: "diagnostic.rawTransaction", reason: "private-payload" },
+            { path: "diagnostic.rawtransaction", reason: "private-payload" },
             { path: "state.seed", reason: "secret" },
             { path: "unreviewed", reason: "policy" },
           ],
@@ -280,7 +280,7 @@ describe("Sanitizer", () => {
           policyVersion: "1.0.0",
           redactions: [
             { path: "failure.stack", reason: "policy" },
-            { path: "rawTransaction", reason: "private-payload" },
+            { path: "rawtransaction", reason: "private-payload" },
           ],
         },
       },
@@ -515,5 +515,61 @@ describe("Sanitizer", () => {
       });
       expect(JSON.stringify(result)).not.toContain("authority-canary");
     }
+  });
+
+  it("rejects an S3 projection that falsely classifies a seed source path", async () => {
+    const sanitizer = createSanitizer();
+    const result = await sanitizer.sanitize(
+      { seed: "seed-authority-canary" },
+      {
+        ...manifest,
+        projections: [
+          {
+            source: "seed",
+            target: "event.message",
+            classification: "S3",
+            transform: "copy",
+          },
+        ],
+      },
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: "invalid",
+        message: "Sanitization input or manifest is invalid",
+        retryable: false,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("seed-authority-canary");
+  });
+
+  it("rejects an S4 projection that falsely classifies a raw-transaction source path", async () => {
+    const sanitizer = createSanitizer();
+    const result = await sanitizer.sanitize(
+      { rawTransaction: "private-transaction-canary" },
+      {
+        ...manifest,
+        projections: [
+          {
+            source: "rawTransaction",
+            target: "product.metadata",
+            classification: "S4",
+            transform: "copy",
+          },
+        ],
+      },
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: "invalid",
+        message: "Sanitization input or manifest is invalid",
+        retryable: false,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("private-transaction-canary");
   });
 });

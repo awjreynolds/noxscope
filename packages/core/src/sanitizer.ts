@@ -161,14 +161,17 @@ class CentralSanitizer implements Sanitizer {
 
     const redactions = collectLeaves(input)
       .filter(({ path }) => !admitted.has(normalizePath(path)))
-      .map(({ path, value }) => ({
-        path,
-        reason:
-          forbiddenReason(path) ??
-          detected.get(normalizePath(path)) ??
-          detectValue(value) ??
-          ("policy" as const),
-      }))
+      .map(({ path, value }) => {
+        const normalizedPath = normalizePath(path);
+        return {
+          path: normalizedPath,
+          reason:
+            forbiddenReason(normalizedPath) ??
+            detected.get(normalizedPath) ??
+            detectValue(value) ??
+            ("policy" as const),
+        };
+      })
       .sort((left, right) => left.path.localeCompare(right.path));
 
     const sanitized: SanitizedProjection = {
@@ -473,6 +476,15 @@ function validManifest(manifest: AdapterSanitizationManifest): boolean {
 
 function validProjection(projection: FieldProjection): boolean {
   if (!validManifestPath(projection.source) || !validManifestPath(projection.target)) return false;
+  const derivedPrivateMetadata =
+    projection.classification === "S1" &&
+    ["byte-length", "item-count"].includes(projection.transform);
+  if (
+    (forbiddenReason(projection.source) !== undefined && !derivedPrivateMetadata) ||
+    forbiddenReason(projection.target) !== undefined
+  ) {
+    return false;
+  }
   if (projection.classification === "S0") return false;
   if (projection.classification === "S1") {
     return ["byte-length", "item-count"].includes(projection.transform);
