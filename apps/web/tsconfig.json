@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "jsx": "react-jsx",
+    "noEmit": true
+  },
+  "references": [
+    { "path": "../../packages/protocol" },
+    { "path": "../../packages/core" },
+    { "path": "../../packages/adapter-mock" }
+  ],
+  "include": ["src", "vite.config.ts"]
+}
