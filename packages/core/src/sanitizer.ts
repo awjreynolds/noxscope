@@ -726,7 +726,7 @@ function collectLeaves(
   const leaves: { path: string; value: unknown }[] = [];
   for (const [key, nested] of Object.entries(value)) {
     const path = parent.length === 0 ? key : `${parent}.${key}`;
-    if (forbiddenReasons.has(normalizeKey(key)) || !isPlainObject(nested)) {
+    if (forbiddenNameReason(key) !== undefined || !isPlainObject(nested)) {
       leaves.push({ path, value: nested });
     } else {
       leaves.push(...collectLeaves(nested, path));
@@ -771,12 +771,15 @@ function detectValue(
     return "secret";
   }
   const compact = normalized.replace(/\s+/g, "");
+  if (/^(?:xpub|tpub|ypub|Ypub|zpub|Zpub|upub|Upub|vpub|Vpub)/.test(compact)) {
+    return /^[1-9A-HJ-NP-Za-km-z]{100,112}$/.test(compact.slice(4)) ? undefined : "key-material";
+  }
+  if (/^(?:xprv|tprv|yprv|Yprv|zprv|Zprv|uprv|Uprv|vprv|Vprv)/.test(compact)) {
+    return "key-material";
+  }
   if (
     /^[5KL][1-9A-HJ-NP-Za-km-z]{50,51}$/.test(compact) ||
-    /^(?:xprv|tprv)[1-9A-HJ-NP-Za-km-z]{80,}$/i.test(compact) ||
-    (!/^(?:xpub|tpub)/i.test(compact) &&
-      /^[1-9A-HJ-NP-Za-km-z]{100,}$/.test(compact) &&
-      new Set(compact).size >= 24)
+    (/^[1-9A-HJ-NP-Za-km-z]{100,}$/.test(compact) && new Set(compact).size >= 24)
   ) {
     return "key-material";
   }
@@ -798,11 +801,9 @@ function detectUriCredentials(
       ["http:", "https:", "ws:", "wss:"].includes(url.protocol) &&
       (url.username.length > 0 ||
         url.password.length > 0 ||
-        [...url.searchParams.keys()].some(
-          (name) => forbiddenReasons.get(normalizeKey(name)) !== undefined,
-        ) ||
+        [...url.searchParams.keys()].some((name) => forbiddenNameReason(name) !== undefined) ||
         [...new URLSearchParams(url.hash.slice(1)).keys()].some(
-          (name) => forbiddenReasons.get(normalizeKey(name)) !== undefined,
+          (name) => forbiddenNameReason(name) !== undefined,
         ))
     ) {
       return "secret";
@@ -817,9 +818,9 @@ function detectForbiddenAssignment(
   value: string,
 ): SanitizationAudit["redactions"][number]["reason"] | undefined {
   for (const segment of value.split(/[?&;,{}]/u)) {
-    const match = /^\s*([\p{L}\p{N}_.\-\s]{1,64}?)\s*[:=]\s*\S+/u.exec(segment);
+    const match = /^\s*(.{1,64}?)\s*[:=]\s*\S+/u.exec(segment);
     if (!match) continue;
-    const reason = forbiddenReasons.get(normalizeKey(match[1]!));
+    const reason = forbiddenNameReason(match[1]!);
     if (reason !== undefined) return reason;
   }
   return undefined;
@@ -861,22 +862,32 @@ function detectStructuredSecretText(
       return "key-material";
     }
     for (const key of keys) {
-      const reason = forbiddenReasons.get(normalizeKey(key));
+      const reason = forbiddenNameReason(key);
       if (reason !== undefined) return reason;
       pending.push(current[key]);
     }
   }
-  return undefined;
+  return pending.length > 0 ? "policy" : undefined;
 }
 
 function forbiddenReason(
   path: string,
 ): SanitizationAudit["redactions"][number]["reason"] | undefined {
   for (const segment of path.split(".")) {
-    const reason = forbiddenReasons.get(normalizeKey(segment));
+    const reason = forbiddenNameReason(segment);
     if (reason !== undefined) return reason;
   }
   return undefined;
+}
+
+function forbiddenNameReason(
+  value: string,
+): SanitizationAudit["redactions"][number]["reason"] | undefined {
+  const normalized = normalizeKey(value);
+  return (
+    forbiddenReasons.get(normalized) ??
+    (normalized.startsWith("x") ? forbiddenReasons.get(normalized.slice(1)) : undefined)
+  );
 }
 
 function normalizePath(path: string): string {
@@ -886,6 +897,7 @@ function normalizePath(path: string): string {
 function normalizeKey(value: string): string {
   return value
     .normalize("NFKC")
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
     .toLocaleLowerCase("en-US")
     .replace(/[^a-z0-9]/g, "");
 }

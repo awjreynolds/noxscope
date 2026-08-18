@@ -723,6 +723,7 @@ describe("Sanitizer", () => {
       base58PublicKey: "7YWHMfk9JZe0LM0g1qW9VY9xPZ6kP4nE2uH8aBcDeFgH",
       shortDiagnostic: "Node connected",
       benignUrl: "https://node.example.test:9944/status?network=preview",
+      benignXUrl: "https://node.example.test/status?x-request-id=public#x-view=compact",
     };
     const benignManifest: AdapterSanitizationManifest = {
       ...manifest,
@@ -936,6 +937,7 @@ describe("Sanitizer", () => {
             "proxy-authorization",
             "cookie",
             "set-cookie",
+            "x-api-key",
           ],
         },
       ],
@@ -949,6 +951,7 @@ describe("Sanitizer", () => {
             "Proxy-Authorization": "ordinary-value",
             Cookie: "theme=dark",
             "Set-Cookie": "theme=dark",
+            "X-Api-Key": "ordinary-value",
           },
         },
       },
@@ -963,6 +966,7 @@ describe("Sanitizer", () => {
       { path: "request.headers.cookie", reason: "secret" },
       { path: "request.headers.proxyauthorization", reason: "secret" },
       { path: "request.headers.setcookie", reason: "secret" },
+      { path: "request.headers.xapikey", reason: "secret" },
     ]);
   });
 
@@ -1065,5 +1069,100 @@ describe("Sanitizer", () => {
       { path: "diagnostic.wif", reason: "key-material" },
     ]);
     expect(JSON.stringify(result)).not.toMatch(/(?:query-token|fragment-secret)-canary/);
+  });
+
+  it("fails closed when structured JSON scanning exhausts its traversal budget", async () => {
+    const sanitizer = createSanitizer();
+    const values = Array.from({ length: 2_050 }, () => "ok");
+    const cases = [
+      ["secret-early", { rows: ["Bearer early-secret-canary", ...values] }],
+      ["secret-late", { rows: [...values, "Bearer late-secret-canary"] }],
+      ["nested-cardinality", { envelope: { rows: values } }],
+    ] as const;
+
+    for (const [name, structured] of cases) {
+      const result = await sanitizer.sanitize(
+        { diagnostic: { payload: JSON.stringify(structured) } },
+        {
+          ...manifest,
+          projections: [
+            {
+              source: "diagnostic.payload",
+              target: "event.payload",
+              classification: "S3",
+              transform: "copy",
+            },
+          ],
+        },
+      );
+      expect(result.ok && result.value.value, name).toEqual({});
+      expect(result.ok && result.value.audit.decisions.removed, name).toBe(1);
+      expect(JSON.stringify(result), name).not.toMatch(/(?:early|late)-secret-canary/);
+    }
+  });
+
+  it("retains valid public extended keys while denying private and malformed variants", async () => {
+    const sanitizer = createSanitizer();
+    const payload = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+      .repeat(2)
+      .slice(0, 107);
+    const values = {
+      xpub: `xpub${payload}`,
+      tpub: `tpub${payload}`,
+      ypub: `ypub${payload}`,
+      xprv: `xprv${payload}`,
+      tprv: `tprv${payload}`,
+      malformedShort: "xpubshort",
+      malformedAlphabet: `xpub${"0".repeat(107)}`,
+    };
+    const keyManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: Object.keys(values).map((source) => ({
+        source: `diagnostic.${source}`,
+        target: `event.${source}`,
+        classification: "S3" as const,
+        transform: "copy" as const,
+      })),
+    };
+
+    const result = await sanitizer.sanitize({ diagnostic: values }, keyManifest);
+
+    expect(result.ok && result.value.value).toEqual({
+      event: { xpub: values.xpub, tpub: values.tpub, ypub: values.ypub },
+    });
+    expect(result.ok && result.value.audit.redactions).toEqual([
+      { path: "diagnostic.malformedalphabet", reason: "key-material" },
+      { path: "diagnostic.malformedshort", reason: "key-material" },
+      { path: "diagnostic.tprv", reason: "key-material" },
+      { path: "diagnostic.xprv", reason: "key-material" },
+    ]);
+  });
+
+  it("denies zero-width and x-prefixed aliases in assignments, queries, and fragments", async () => {
+    const sanitizer = createSanitizer();
+    const values = {
+      assignment: "api\u200bkey=zero-width-canary",
+      query: "https://node.example.test/status?x-api-key=query-alias-canary",
+      fragment: "https://node.example.test/status#x-access-token=fragment-alias-canary",
+    };
+    const aliasManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: Object.keys(values).map((source) => ({
+        source: `diagnostic.${source}`,
+        target: `event.${source}`,
+        classification: "S3" as const,
+        transform: "copy" as const,
+      })),
+    };
+
+    const result = await sanitizer.sanitize({ diagnostic: values }, aliasManifest);
+
+    expect(result.ok && result.value.value).toEqual({});
+    expect(result.ok && result.value.audit.redactions).toEqual([
+      { path: "diagnostic.assignment", reason: "secret" },
+      { path: "diagnostic.fragment", reason: "secret" },
+      { path: "diagnostic.query", reason: "secret" },
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(/(?:zero-width|query-alias|fragment-alias)-canary/);
   });
 });
