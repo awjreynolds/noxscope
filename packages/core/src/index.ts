@@ -12,6 +12,8 @@ import {
   type Snapshot,
 } from "@noxscope/protocol";
 
+export * from "./sanitizer.js";
+
 export interface CoreOptions {
   readonly signal: AbortSignal;
 }
