@@ -2,8 +2,8 @@
 
 import { createMockAdapter, type MockScenario } from "@noxscope/adapter-mock";
 import { createCore } from "@noxscope/core";
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import { App } from "./App.js";
 
 describe("Overview", () => {
@@ -30,5 +30,26 @@ describe("Overview", () => {
 
     expect(await screen.findByText("Unknown progress")).toBeTruthy();
     expect(screen.queryByText("0%")).toBeNull();
+  });
+
+  it("renders reused stream identities from reconnect sessions without duplicate keys", async () => {
+    const core = createCore({ signal: new AbortController().signal });
+    const adapter = createMockAdapter("reconnection" as MockScenario);
+    const consoleErrors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      render(<App core={core} />);
+      await core.connect(adapter);
+      await core.connect(adapter);
+
+      await waitFor(() => {
+        expect(screen.getAllByText("Deterministic Midnight Runtime — reconnection")).toHaveLength(
+          2,
+        );
+      });
+      expect(consoleErrors.mock.calls.flat().join(" ")).not.toContain("same key");
+    } finally {
+      consoleErrors.mockRestore();
+    }
   });
 });

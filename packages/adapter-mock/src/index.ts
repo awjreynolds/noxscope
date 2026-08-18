@@ -577,6 +577,17 @@ function recordsFor(scenario: MockScenario, descriptor: RuntimeDescriptor): Noxs
       receivedAt: mockTimestampAtSecond(3),
     });
   }
+  if (scenario === "reconnection") {
+    const firstConnection = descriptor.sessionId.endsWith("-1");
+    for (const [index, record] of records.entries()) {
+      const time = mockTimestampAtSecond(index + (firstConnection ? 5 : 1));
+      records[index] = updateRecordMeta(record, {
+        streamId: "runtime-reconnection-shared-stream",
+        observedAt: time,
+        receivedAt: time,
+      });
+    }
+  }
   if (scenario === "stream-gap") {
     for (let index = 1; index < records.length; index += 1) {
       records[index] = updateRecordMeta(records[index]!, { sequence: String(index + 2) });

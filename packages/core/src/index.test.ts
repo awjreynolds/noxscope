@@ -121,6 +121,36 @@ describe("Core", () => {
     ]);
   });
 
+  it("keeps reconnect sessions separate when they reuse a stream identity", async () => {
+    const core = createCore({ signal: new AbortController().signal });
+    const adapter = createMockAdapter("reconnection" as MockScenario);
+    const observed = new Promise<CoreView>((resolve) => {
+      core.subscribe((view) => {
+        if (
+          view.runtimes.length === 2 &&
+          view.runtimes.every((runtime) => runtime.records.length >= 4)
+        ) {
+          resolve(view);
+        }
+      });
+    });
+
+    await core.connect(adapter);
+    await core.connect(adapter);
+    const timeline = (await observed).timeline;
+
+    expect(timeline.map(({ record }) => [record.meta.sessionId, record.meta.sequence])).toEqual([
+      ["session-reconnection-2", "1"],
+      ["session-reconnection-2", "2"],
+      ["session-reconnection-2", "3"],
+      ["session-reconnection-2", "4"],
+      ["session-reconnection-1", "1"],
+      ["session-reconnection-1", "2"],
+      ["session-reconnection-1", "3"],
+      ["session-reconnection-1", "4"],
+    ]);
+  });
+
   it("turns a missing source sequence range into canonical stream-gap evidence", async () => {
     const core = createCore({ signal: new AbortController().signal });
     const observed = new Promise<CoreView>((resolve) => {

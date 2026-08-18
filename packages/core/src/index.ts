@@ -267,7 +267,7 @@ function mergeTimeline(runtimes: readonly RuntimeView[]): TimelineEntry[] {
   let streamOrder = 0;
   for (const runtime of runtimes) {
     for (const record of runtime.records) {
-      const key = `${runtime.descriptor.runtimeId}\u0000${record.meta.streamId}`;
+      const key = `${runtime.descriptor.sessionId}\u0000${runtime.descriptor.runtimeId}\u0000${record.meta.streamId}`;
       let stream = streams.get(key);
       if (stream === undefined) {
         stream = { order: streamOrder++, index: 0, entries: [] };

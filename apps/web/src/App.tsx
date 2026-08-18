@@ -48,7 +48,10 @@ export function App({ core }: AppProps) {
           <span>Observation</span>
         </div>
         {view.timeline.map(({ runtimeId, record }) => (
-          <div className="timeline-row" key={`${record.meta.streamId}-${record.meta.sequence}`}>
+          <div
+            className="timeline-row"
+            key={`${record.meta.sessionId}-${record.meta.streamId}-${record.meta.sequence}`}
+          >
             <code>#{record.meta.sequence}</code>
             <span className="muted">{runtimeId}</span>
             <RecordKind record={record} />
