@@ -25,6 +25,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - [Define the canonical protocol and capability contract](./issues/04-define-canonical-protocol-and-capability-contract.md) — Use one versioned Runtime Session with typed core Capabilities, ordered Records, explicit support/availability/freshness, correlation, typed errors, and sanitised namespaced raw detail.
 - [Choose the first-release host and runtime topology](./issues/05-choose-host-and-runtime-topology.md) — Keep Core/UI platform-neutral in a browser-first workbench, with privileged Moth access behind a loopback Node HostBridge that transports canonical records only.
 - [Choose source provenance and migration strategy](./issues/08-choose-source-provenance-and-migration-strategy.md) — Selectively extract characterised GSD slices into the fresh monorepo with exact provenance, preserve MIT/Apache boundaries, and integrate Moth through public contracts rather than copied internals.
+- [Define the redaction and recording trust boundary](./issues/06-define-redaction-and-recording-trust-boundary.md) — Project allowlisted canonical fields and sanitise at every trust transition; forbid secret/private execution material even in developer mode, bound hostile imports, and use integrity-checked framed JSON Recordings.
 
 ## Not yet specified
 
