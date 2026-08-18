@@ -13,6 +13,7 @@ import {
 } from "@noxscope/protocol";
 
 export * from "./sanitizer.js";
+export * from "./recording.js";
 
 export interface CoreOptions {
   readonly signal: AbortSignal;
