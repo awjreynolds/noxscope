@@ -1,10 +1,17 @@
 import {
   NOXSCOPE_PROTOCOL,
   validateRecord,
+  type JsonValue,
+  type SanitizedRawDetail,
   type NoxscopeRecord,
   type Result,
 } from "@noxscope/protocol";
-import type { AdapterSanitizationManifest } from "./sanitizer.js";
+import {
+  createSanitizer,
+  type AdapterSanitizationManifest,
+  type DataClassification,
+  type FieldTransform,
+} from "./sanitizer.js";
 
 /** The first bytes of every portable Noxscope Recording. */
 export const NOXSCOPE_RECORDING_MAGIC = "NOXSCOPE-RECORDING/1" as const;
@@ -27,13 +34,29 @@ export interface RecordingLimits {
   readonly maxFileBytes: number;
   readonly maxRecords: number;
   readonly maxRecordBytes: number;
+  readonly maxInputBytes: number;
+  readonly maxDepth: number;
+  readonly maxObjectProperties: number;
+  readonly maxArrayElements: number;
+  readonly maxStringBytes: number;
 }
 
 export const RECORDING_LIMITS: RecordingLimits = Object.freeze({
   maxFileBytes: 512 * 1024 * 1024,
   maxRecords: 1_000_000,
   maxRecordBytes: 256 * 1024,
+  maxInputBytes: 16 * 1024 * 1024,
+  maxDepth: 32,
+  maxObjectProperties: 512,
+  maxArrayElements: 4_096,
+  maxStringBytes: 16 * 1024,
 });
+
+export interface RecordingSanitizationContext {
+  readonly manifest: AdapterSanitizationManifest;
+  /** A per-recording HMAC context; it is never serialized. */
+  readonly pseudonymKey: Uint8Array;
+}
 
 export interface RecordingOptions {
   /** A clock is injectable so test fixtures can remain deterministic. */
@@ -42,6 +65,7 @@ export interface RecordingOptions {
   readonly policies?: readonly RecordingPolicyReference[];
   /** Convenience for callers that already have the reviewed adapter manifest. */
   readonly manifest?: AdapterSanitizationManifest;
+  readonly sanitization?: RecordingSanitizationContext;
   readonly limits?: Partial<RecordingLimits>;
 }
 
@@ -57,7 +81,7 @@ export interface RecordingCounts {
 
 export interface RecordingFrameDigest {
   readonly index: number;
-  readonly type: "header" | "record";
+  readonly type: "header" | "record" | "manifest";
   readonly bytes: number;
   readonly sha256: string;
 }
@@ -89,7 +113,7 @@ export interface RecordingExport {
 }
 
 export interface Recorder {
-  append(record: unknown): Result<void>;
+  append(record: unknown): Promise<Result<void>>;
   finalize(): Promise<Result<RecordingExport>>;
 }
 
@@ -98,6 +122,7 @@ interface ResolvedRecordingOptions {
   readonly adapters: readonly RecordingAdapterReference[];
   readonly policies: readonly RecordingPolicyReference[];
   readonly limits: RecordingLimits;
+  readonly sanitization: RecordingSanitizationContext;
 }
 
 interface FrameDigestInput {
@@ -114,7 +139,7 @@ interface MutableRecordingCounts {
 }
 
 interface FrameControl {
-  readonly type: "header" | "record" | "manifest";
+  readonly type: "header" | "record" | "manifest" | "integrity";
   readonly bytes: number;
   readonly sha256: string;
 }
@@ -129,6 +154,22 @@ interface RecordingHeader {
   readonly policies: readonly RecordingPolicyReference[];
 }
 
+type SanitizedRecordResult = Result<{
+  readonly record: NoxscopeRecord;
+  readonly droppedAttributes: number;
+  readonly redactions: number;
+}>;
+
+type FieldResult =
+  | { readonly state: "kept"; readonly value: JsonValue; readonly redactions: number }
+  | { readonly state: "dropped"; readonly redactions: number }
+  | { readonly state: "invalid" };
+
+interface SanitizationAccumulator {
+  droppedAttributes: number;
+  redactions: number;
+}
+
 const INTEGRITY_WARNING =
   "Integrity digests detect accidental or modifying changes; they do not authenticate the producer." as const;
 
@@ -139,6 +180,7 @@ export function createRecorder(options: RecordingOptions = {}): Recorder {
 class RecordingBuilder implements Recorder {
   readonly #options: ResolvedRecordingOptions;
   readonly #frames: FrameDigestInput[] = [];
+  readonly #sanitizer = createSanitizer();
   readonly #counts: MutableRecordingCounts = {
     records: 0,
     gaps: 0,
@@ -146,37 +188,39 @@ class RecordingBuilder implements Recorder {
     droppedAttributes: 0,
     redactions: 0,
   };
+  #appendTail: Promise<void> = Promise.resolve();
+  #finalizing = false;
   #finalized = false;
 
   constructor(options: ResolvedRecordingOptions) {
     this.#options = options;
   }
 
-  append(candidate: unknown): Result<void> {
-    if (this.#finalized) return lifecycleError();
-    const checked = validateRecord(candidate);
-    if (!checked.ok) return checked;
-    const encoded = encodeJson(checked.value);
-    if (!encoded.ok) return encoded;
-    if (encoded.value.byteLength > this.#options.limits.maxRecordBytes) {
-      return overflow("Recording record exceeds a resource limit");
-    }
-    if (this.#counts.records >= this.#options.limits.maxRecords) {
-      return overflow("Recording record count exceeds a resource limit");
-    }
-
-    this.#frames.push({ type: "record", payload: encoded.value });
-    this.#counts.records += 1;
-    if (checked.value.kind === "diagnostic-event" && checked.value.event.type === "stream-gap") {
-      this.#counts.gaps += 1;
-    }
-    return { ok: true, value: undefined };
+  append(candidate: unknown): Promise<Result<void>> {
+    if (this.#finalized || this.#finalizing) return Promise.resolve(lifecycleError());
+    const next = this.#appendTail.then(async () => {
+      const result = await this.#appendInternal(candidate);
+      if (!result.ok) this.#counts.droppedRecords += 1;
+      return result;
+    });
+    this.#appendTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
   async finalize(): Promise<Result<RecordingExport>> {
-    if (this.#finalized) return lifecycleError();
+    if (this.#finalized || this.#finalizing) return lifecycleError();
+    this.#finalizing = true;
+    await this.#appendTail;
     this.#finalized = true;
-    const exportedAt = this.#options.now();
+    let exportedAt: string;
+    try {
+      exportedAt = this.#options.now();
+    } catch {
+      return invalid("Recording export time is invalid");
+    }
     if (!validTimestamp(exportedAt)) return invalid("Recording export time is invalid");
 
     const header: RecordingHeader = {
@@ -199,12 +243,13 @@ class RecordingBuilder implements Recorder {
     ];
     const digests: RecordingFrameDigest[] = [];
     for (const [index, frame] of frames.entries()) {
-      digests.push({
-        index,
-        type: frame.type,
-        bytes: frame.payload.byteLength,
-        sha256: await sha256Hex(frame.payload),
-      });
+      let digest: string;
+      try {
+        digest = await sha256Hex(frame.payload);
+      } catch {
+        return invalid("Recording integrity could not be computed");
+      }
+      digests.push({ index, type: frame.type, bytes: frame.payload.byteLength, sha256: digest });
     }
 
     const prefixParts: Uint8Array[] = [utf8(`${NOXSCOPE_RECORDING_MAGIC}\n`)];
@@ -243,27 +288,965 @@ class RecordingBuilder implements Recorder {
     });
     const encodedManifest = encodeJson(manifest);
     if (!encodedManifest.ok) return encodedManifest;
-    const manifestDigest = await sha256Hex(encodedManifest.value);
+    let manifestDigest: string;
+    try {
+      manifestDigest = await sha256Hex(encodedManifest.value);
+    } catch {
+      return invalid("Recording integrity could not be computed");
+    }
     const manifestFrame = encodeFrame(
       { type: "manifest", bytes: encodedManifest.value.byteLength, sha256: manifestDigest },
       encodedManifest.value,
     );
     if (!manifestFrame.ok) return manifestFrame;
-    const finalBytes = concat(
+    const contentBeforeTerminal = concat(
       [prefix, manifestFrame.value],
       prefix.byteLength + manifestFrame.value.byteLength,
+    );
+    let terminalContentDigest: string;
+    try {
+      terminalContentDigest = await sha256Hex(contentBeforeTerminal);
+    } catch {
+      return invalid("Recording integrity could not be computed");
+    }
+    const terminalPayload = encodeJson({
+      type: "integrity",
+      contentDigest: terminalContentDigest,
+      manifestFrameDigest: manifestDigest,
+    });
+    if (!terminalPayload.ok) return terminalPayload;
+    let terminalDigest: string;
+    try {
+      terminalDigest = await sha256Hex(terminalPayload.value);
+    } catch {
+      return invalid("Recording integrity could not be computed");
+    }
+    const terminalFrame = encodeFrame(
+      { type: "integrity", bytes: terminalPayload.value.byteLength, sha256: terminalDigest },
+      terminalPayload.value,
+    );
+    if (!terminalFrame.ok) return terminalFrame;
+    const finalBytes = concat(
+      [contentBeforeTerminal, terminalFrame.value],
+      contentBeforeTerminal.byteLength + terminalFrame.value.byteLength,
     );
     if (finalBytes.byteLength > this.#options.limits.maxFileBytes) {
       return overflow("Recording file exceeds a resource limit");
     }
     return {
       ok: true,
-      value: Object.freeze({ bytes: finalBytes, manifest }),
+      value: Object.freeze({ bytes: finalBytes.slice(), manifest }),
     };
+  }
+
+  async #appendInternal(candidate: unknown): Promise<Result<void>> {
+    if (this.#finalized || this.#finalizing) return lifecycleError();
+    if (this.#counts.records >= this.#options.limits.maxRecords) {
+      return overflow("Recording record count exceeds a resource limit");
+    }
+    const snapshot = snapshotInert(candidate, this.#options.limits);
+    if (snapshot.state !== "valid") {
+      return snapshot.state === "overflow"
+        ? overflow("Recording record exceeds a resource limit")
+        : invalid("Recording record is invalid");
+    }
+    const checked = validateRecord(snapshot.value);
+    if (!checked.ok) return checked;
+    let sanitized: SanitizedRecordResult;
+    try {
+      sanitized = await sanitizeCanonicalRecord(
+        checked.value,
+        this.#sanitizer,
+        this.#options.sanitization,
+      );
+    } catch {
+      return invalid("Recording record could not be sanitized");
+    }
+    if (!sanitized.ok) return sanitized;
+    const encoded = encodeJson(sanitized.value.record);
+    if (!encoded.ok) return encoded;
+    if (encoded.value.byteLength > this.#options.limits.maxRecordBytes) {
+      return overflow("Recording record exceeds a resource limit");
+    }
+    this.#frames.push({ type: "record", payload: encoded.value });
+    this.#counts.records += 1;
+    this.#counts.droppedAttributes += sanitized.value.droppedAttributes;
+    this.#counts.redactions += sanitized.value.redactions;
+    if (
+      sanitized.value.record.kind === "diagnostic-event" &&
+      sanitized.value.record.event.type === "stream-gap"
+    ) {
+      this.#counts.gaps += 1;
+    }
+    return { ok: true, value: undefined };
   }
 }
 
+async function sanitizeCanonicalRecord(
+  record: NoxscopeRecord,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+): Promise<SanitizedRecordResult> {
+  const accumulator: SanitizationAccumulator = { droppedAttributes: 0, redactions: 0 };
+  const kind = await project(record.kind, "S4", "copy", sanitizer, context);
+  if (kind.state !== "kept") return invalid("Recording record could not be sanitized");
+  const metaSource = record.meta as unknown as Record<string, unknown>;
+  const meta: Record<string, unknown> = {};
+  if (!(await required(meta, "protocol", metaSource.protocol, "S4", "copy", sanitizer, context))) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (
+    !(await required(
+      meta,
+      "sessionId",
+      metaSource.sessionId,
+      "S2",
+      "pseudonym",
+      sanitizer,
+      context,
+    ))
+  ) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (
+    !(await required(
+      meta,
+      "runtimeId",
+      metaSource.runtimeId,
+      "S2",
+      "pseudonym",
+      sanitizer,
+      context,
+    ))
+  ) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (
+    !(await required(meta, "streamId", metaSource.streamId, "S2", "pseudonym", sanitizer, context))
+  ) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (!(await required(meta, "sequence", metaSource.sequence, "S3", "copy", sanitizer, context))) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (
+    !(await required(meta, "observedAt", metaSource.observedAt, "S3", "copy", sanitizer, context))
+  ) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (
+    !(await required(meta, "receivedAt", metaSource.receivedAt, "S3", "copy", sanitizer, context))
+  ) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (metaSource.correlation !== undefined) {
+    const correlation = await sanitizeCorrelation(metaSource.correlation, sanitizer, context);
+    if (!correlation.ok) return correlation;
+    meta.correlation = correlation.value;
+  }
+
+  let payload: Record<string, unknown>;
+  if (record.kind === "snapshot") {
+    const result = await sanitizeSnapshot(
+      record.snapshot as unknown as Record<string, unknown>,
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!result.ok) return result;
+    payload = { snapshot: result.value };
+  } else if (record.kind === "diagnostic-event") {
+    const result = await sanitizeEvent(
+      record.event as unknown as Record<string, unknown>,
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!result.ok) return result;
+    payload = { event: result.value };
+  } else {
+    const result = await sanitizeOperation(
+      record.operation as unknown as Record<string, unknown>,
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!result.ok) return result;
+    payload = { operation: result.value };
+  }
+  const candidate: Record<string, unknown> = { kind: kind.value, meta, ...payload };
+  accumulator.droppedAttributes += countMissingFields(record as unknown, candidate);
+  const checked = validateRecord(candidate);
+  if (!checked.ok) return checked;
+  return { ok: true, value: { record: checked.value, ...accumulator } };
+}
+
+async function sanitizeCorrelation(
+  source: unknown,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+): Promise<Result<Record<string, JsonValue>>> {
+  if (!isRecord(source)) return invalid("Recording record could not be sanitized");
+  const output: Record<string, JsonValue> = {};
+  for (const key of ["requestId", "operationId", "parentOperationId", "traceId"] as const) {
+    if (source[key] === undefined) continue;
+    const field = await project(source[key], "S2", "pseudonym", sanitizer, context);
+    if (field.state !== "kept") return invalid("Recording record could not be sanitized");
+    output[key] = field.value;
+  }
+  if (source.causedBySequence !== undefined) {
+    const field = await project(source.causedBySequence, "S3", "copy", sanitizer, context);
+    if (field.state !== "kept") return invalid("Recording record could not be sanitized");
+    output.causedBySequence = field.value;
+  }
+  return { ok: true, value: output };
+}
+
+async function sanitizeSnapshot(
+  source: Record<string, unknown>,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<Record<string, unknown>>> {
+  const output: Record<string, unknown> = {};
+  if (!(await required(output, "revision", source.revision, "S3", "copy", sanitizer, context))) {
+    return invalid("Recording record could not be sanitized");
+  }
+  const freshnessSource = source.freshness;
+  if (!isRecord(freshnessSource)) return invalid("Recording record could not be sanitized");
+  const freshness: Record<string, unknown> = {};
+  for (const [key, value, classification, transform, requiredField] of [
+    ["state", freshnessSource.state, "S3", "copy", true],
+    ["observedAt", freshnessSource.observedAt, "S3", "copy", true],
+    ["receivedAt", freshnessSource.receivedAt, "S3", "copy", true],
+    ["source", freshnessSource.source, "S3", "copy", true],
+    ["consecutiveFailures", freshnessSource.consecutiveFailures, "S3", "copy", true],
+    ["pollingIntervalMs", freshnessSource.pollingIntervalMs, "S3", "copy", false],
+    ["lastSuccessAt", freshnessSource.lastSuccessAt, "S3", "copy", false],
+  ] as const) {
+    if (value === undefined && !requiredField) continue;
+    if (
+      !(await assignField(
+        freshness,
+        key,
+        value,
+        classification,
+        transform,
+        requiredField,
+        sanitizer,
+        context,
+        accumulator,
+      ))
+    ) {
+      return invalid("Recording record could not be sanitized");
+    }
+  }
+  output.freshness = freshness;
+  if (source.lifecycle !== undefined) {
+    const lifecycle = await simpleObject(
+      source.lifecycle,
+      [["state", "S3", "copy", true]],
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!lifecycle.ok) return lifecycle;
+    output.lifecycle = lifecycle.value;
+  }
+  if (source.identity !== undefined) {
+    if (!isRecord(source.identity)) return invalid("Recording record could not be sanitized");
+    const identity: Record<string, unknown> = {};
+    for (const key of ["account", "walletName"] as const) {
+      if (
+        !(await assignField(
+          identity,
+          key,
+          source.identity[key],
+          "S2",
+          "pseudonym",
+          false,
+          sanitizer,
+          context,
+          accumulator,
+        ))
+      ) {
+        return invalid("Recording record could not be sanitized");
+      }
+    }
+    output.identity = identity;
+  }
+  if (source.network !== undefined) {
+    const network = await simpleObject(
+      source.network,
+      [["id", "S3", "copy", true]],
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!network.ok) return network;
+    output.network = network.value;
+  }
+  if (source.sync !== undefined) {
+    const sync = await sanitizeSync(source.sync, sanitizer, context, accumulator);
+    if (!sync.ok) return sync;
+    output.sync = sync.value;
+  }
+  if (source.balances !== undefined) {
+    const balances = await sanitizeBalances(source.balances, sanitizer, context, accumulator);
+    if (!balances.ok) return balances;
+    output.balances = balances.value;
+  }
+  if (source.addresses !== undefined) {
+    const addresses = await sanitizeAddresses(source.addresses, sanitizer, context, accumulator);
+    if (!addresses.ok) return addresses;
+    output.addresses = addresses.value;
+  }
+  if (source.dust !== undefined) {
+    const dust = await simpleObject(
+      source.dust,
+      [
+        ["state", "S3", "copy", true],
+        ["progress", "S3", "copy", false],
+      ],
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!dust.ok) return dust;
+    output.dust = dust.value;
+  }
+  if (source.transactions !== undefined) {
+    const transactions = await sanitizeList(
+      source.transactions,
+      [
+        ["id", "S2", "pseudonym", true],
+        ["state", "S3", "copy", true],
+      ],
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!transactions.ok) return transactions;
+    output.transactions = transactions.value;
+  }
+  if (source.dependencies !== undefined) {
+    const dependencies = await sanitizeList(
+      source.dependencies,
+      [
+        ["role", "S3", "copy", true],
+        ["state", "S3", "copy", true],
+        ["endpoint", "S2", "url", false],
+      ],
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!dependencies.ok) return dependencies;
+    output.dependencies = dependencies.value;
+  }
+  if (source.raw !== undefined) {
+    const raw = await sanitizeRawList(source.raw, sanitizer, context, accumulator);
+    if (raw.length > 0) output.raw = raw;
+  }
+  return { ok: true, value: output };
+}
+
+async function sanitizeEvent(
+  source: Record<string, unknown>,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<Record<string, unknown>>> {
+  const type = await project(source.type, "S4", "copy", sanitizer, context);
+  if (type.state !== "kept") return invalid("Recording record could not be sanitized");
+  const output: Record<string, unknown> = { type: type.value };
+  if (type.value === "diagnostic") {
+    for (const [key, classification, transform, requiredField] of [
+      ["name", "S3", "copy", true],
+      ["category", "S3", "copy", true],
+      ["level", "S3", "copy", true],
+      ["source", "S3", "copy", true],
+      ["message", "S3", "copy", false],
+    ] as const) {
+      if (
+        !(await assignField(
+          output,
+          key,
+          source[key],
+          classification,
+          transform,
+          requiredField,
+          sanitizer,
+          context,
+          accumulator,
+        ))
+      ) {
+        return invalid("Recording record could not be sanitized");
+      }
+    }
+    if (source.attributes !== undefined) {
+      accumulator.droppedAttributes += 1;
+      accumulator.redactions += 1;
+    }
+    if (source.raw !== undefined) {
+      const raw = await sanitizeRawList(source.raw, sanitizer, context, accumulator);
+      if (raw.length > 0) output.raw = raw;
+    }
+  } else if (type.value === "capability-availability") {
+    if (
+      !(await assignField(
+        output,
+        "capabilityId",
+        source.capabilityId,
+        "S3",
+        "copy",
+        true,
+        sanitizer,
+        context,
+        accumulator,
+      ))
+    ) {
+      return invalid("Recording record could not be sanitized");
+    }
+    const availability = await sanitizeAvailability(
+      source.availability,
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!availability.ok) return availability;
+    output.availability = availability.value;
+  } else if (type.value === "stream-gap") {
+    for (const key of [
+      "sourceStreamId",
+      "firstLostSequence",
+      "lastLostSequence",
+      "reason",
+    ] as const) {
+      if (
+        !(await assignField(
+          output,
+          key,
+          source[key],
+          "S3",
+          "copy",
+          true,
+          sanitizer,
+          context,
+          accumulator,
+        ))
+      ) {
+        return invalid("Recording record could not be sanitized");
+      }
+    }
+  } else {
+    return invalid("Recording record could not be sanitized");
+  }
+  return { ok: true, value: output };
+}
+
+async function sanitizeOperation(
+  source: Record<string, unknown>,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<Record<string, unknown>>> {
+  const output: Record<string, unknown> = {};
+  for (const key of ["kind", "phase", "state"] as const) {
+    if (
+      !(await assignField(
+        output,
+        key,
+        source[key],
+        "S3",
+        "copy",
+        true,
+        sanitizer,
+        context,
+        accumulator,
+      ))
+    ) {
+      return invalid("Recording record could not be sanitized");
+    }
+  }
+  if (
+    source.progress !== undefined &&
+    !(await assignField(
+      output,
+      "progress",
+      source.progress,
+      "S3",
+      "copy",
+      false,
+      sanitizer,
+      context,
+      accumulator,
+    ))
+  ) {
+    return invalid("Recording record could not be sanitized");
+  }
+  if (source.result !== undefined) {
+    accumulator.droppedAttributes += 1;
+    accumulator.redactions += 1;
+  }
+  if (source.error !== undefined) {
+    const error = await sanitizeError(source.error, sanitizer, context, accumulator);
+    if (!error.ok) return error;
+    output.error = error.value;
+  }
+  if (source.raw !== undefined) {
+    const raw = await sanitizeRawList(source.raw, sanitizer, context, accumulator);
+    if (raw.length > 0) output.raw = raw;
+  }
+  return { ok: true, value: output };
+}
+
+async function sanitizeSync(
+  source: unknown,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<Record<string, unknown>>> {
+  if (!isRecord(source)) return invalid("Recording record could not be sanitized");
+  const output: Record<string, unknown> = {};
+  const fields = [
+    ["state", "S3", "copy", true],
+    ["percentage", "S3", "copy", false],
+    ["etaSeconds", "S3", "copy", false],
+  ] as const;
+  for (const [key, classification, transform, requiredField] of fields) {
+    if (
+      !(await assignField(
+        output,
+        key,
+        source[key],
+        classification,
+        transform,
+        requiredField,
+        sanitizer,
+        context,
+        accumulator,
+      ))
+    ) {
+      return invalid("Recording record could not be sanitized");
+    }
+  }
+  if (source.domains !== undefined) {
+    const domains = await sanitizeList(
+      source.domains,
+      [
+        ["domain", "S3", "copy", true],
+        ["state", "S3", "copy", true],
+        ["percentage", "S3", "copy", false],
+      ],
+      sanitizer,
+      context,
+      accumulator,
+    );
+    if (!domains.ok) return domains;
+    output.domains = domains.value;
+  }
+  return { ok: true, value: output };
+}
+
+async function sanitizeBalances(
+  source: unknown,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<readonly Record<string, unknown>[]>> {
+  return sanitizeList(
+    source,
+    [
+      ["assetId", "S2", "pseudonym", true],
+      ["domain", "S3", "copy", true],
+      ["amount", "S3", "copy", true],
+    ],
+    sanitizer,
+    context,
+    accumulator,
+  );
+}
+
+async function sanitizeAddresses(
+  source: unknown,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<readonly Record<string, unknown>[]>> {
+  return sanitizeList(
+    source,
+    [
+      ["domain", "S3", "copy", true],
+      ["value", "S2", "pseudonym", true],
+      ["account", "S2", "pseudonym", false],
+    ],
+    sanitizer,
+    context,
+    accumulator,
+  );
+}
+
+async function sanitizeAvailability(
+  source: unknown,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<Record<string, unknown>>> {
+  return simpleObject(
+    source,
+    [
+      ["state", "S3", "copy", true],
+      ["reason", "S3", "copy", false],
+      ["retryable", "S3", "copy", false],
+      ["retryAfterMs", "S3", "copy", false],
+    ],
+    sanitizer,
+    context,
+    accumulator,
+  );
+}
+
+async function sanitizeError(
+  source: unknown,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<Record<string, unknown>>> {
+  return simpleObject(
+    source,
+    [
+      ["code", "S3", "copy", true],
+      ["message", "S3", "copy", true],
+      ["retryable", "S3", "copy", true],
+      ["retryAfterMs", "S3", "copy", false],
+      ["capability", "S2", "pseudonym", false],
+    ],
+    sanitizer,
+    context,
+    accumulator,
+  );
+}
+
+async function simpleObject(
+  source: unknown,
+  fields: readonly (readonly [string, DataClassification, FieldTransform, boolean])[],
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<Record<string, unknown>>> {
+  if (!isRecord(source)) return invalid("Recording record could not be sanitized");
+  const output: Record<string, unknown> = {};
+  for (const [key, classification, transform, requiredField] of fields) {
+    if (
+      !(await assignField(
+        output,
+        key,
+        source[key],
+        classification,
+        transform,
+        requiredField,
+        sanitizer,
+        context,
+        accumulator,
+      ))
+    ) {
+      return invalid("Recording record could not be sanitized");
+    }
+  }
+  return { ok: true, value: output };
+}
+
+async function sanitizeList(
+  source: unknown,
+  fields: readonly (readonly [string, DataClassification, FieldTransform, boolean])[],
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<Result<readonly Record<string, unknown>[]>> {
+  if (!Array.isArray(source)) return invalid("Recording record could not be sanitized");
+  const output: Record<string, unknown>[] = [];
+  for (const item of source) {
+    const result = await simpleObject(item, fields, sanitizer, context, accumulator);
+    if (!result.ok) return result;
+    output.push(result.value);
+  }
+  return { ok: true, value: output };
+}
+
+async function sanitizeRawList(
+  source: unknown,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<readonly SanitizedRawDetail[]> {
+  if (!Array.isArray(source)) {
+    accumulator.droppedAttributes += 1;
+    return [];
+  }
+  const output: SanitizedRawDetail[] = [];
+  const rawManifest = context.manifest.raw;
+  for (const detail of source) {
+    if (
+      !isRecord(detail) ||
+      rawManifest === undefined ||
+      detail.namespace !== rawManifest.namespace ||
+      detail.schemaVersion !== rawManifest.schemaVersion
+    ) {
+      accumulator.droppedAttributes += 1;
+      accumulator.redactions += 1;
+      continue;
+    }
+    const result = await sanitizer.sanitizeRawDetail(detail.value, context.manifest, {
+      pseudonymKey: context.pseudonymKey,
+    });
+    if (!result.ok) {
+      accumulator.droppedAttributes += 1;
+      if (result.error.code === "overflow") accumulator.redactions += 1;
+      continue;
+    }
+    output.push(result.value);
+    accumulator.redactions += result.value.sanitization.redactions.length;
+  }
+  return output;
+}
+
+async function assignField(
+  output: Record<string, unknown>,
+  key: string,
+  value: unknown,
+  classification: DataClassification,
+  transform: FieldTransform,
+  requiredField: boolean,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+  accumulator: SanitizationAccumulator,
+): Promise<boolean> {
+  if (value === undefined) {
+    if (requiredField) return false;
+    return true;
+  }
+  const field = await project(value, classification, transform, sanitizer, context);
+  if (field.state === "kept") {
+    output[key] = field.value;
+    accumulator.redactions += field.redactions;
+    return true;
+  }
+  if (!requiredField && field.state === "dropped") {
+    accumulator.droppedAttributes += 1;
+    accumulator.redactions += field.redactions;
+    return true;
+  }
+  return false;
+}
+
+async function required(
+  output: Record<string, unknown>,
+  key: string,
+  value: unknown,
+  classification: DataClassification,
+  transform: FieldTransform,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+): Promise<boolean> {
+  const field = await project(value, classification, transform, sanitizer, context);
+  if (field.state !== "kept") return false;
+  output[key] = field.value;
+  return true;
+}
+
+async function project(
+  value: unknown,
+  classification: DataClassification,
+  transform: FieldTransform,
+  sanitizer: ReturnType<typeof createSanitizer>,
+  context: RecordingSanitizationContext,
+): Promise<FieldResult> {
+  const manifest: AdapterSanitizationManifest = {
+    ...context.manifest,
+    projections: [{ source: "value", target: "value", classification, transform }],
+  };
+  const result = await sanitizer.sanitize({ value }, manifest, {
+    pseudonymKey: context.pseudonymKey,
+  });
+  if (!result.ok) return { state: "invalid" };
+  if (!Object.prototype.hasOwnProperty.call(result.value.value, "value")) {
+    return { state: "dropped", redactions: result.value.audit.redactions.length };
+  }
+  const projected = (result.value.value as Record<string, unknown>).value;
+  if (!isJsonValue(projected)) return { state: "invalid" };
+  return { state: "kept", value: projected, redactions: result.value.audit.redactions.length };
+}
+
+type SnapshotResult =
+  { readonly state: "invalid" | "overflow" } | { readonly state: "valid"; readonly value: unknown };
+
+function snapshotInert(root: unknown, limits: RecordingLimits): SnapshotResult {
+  const seen = new WeakSet<object>();
+  let bytes = 0;
+  const visit = (value: unknown, depth: number): SnapshotResult => {
+    if (depth > limits.maxDepth) return { state: "overflow" };
+    if (value === null || typeof value === "boolean") return { state: "valid", value };
+    if (typeof value === "number")
+      return Number.isFinite(value) ? { state: "valid", value } : { state: "invalid" };
+    if (typeof value === "string") {
+      const size = utf8(value).byteLength;
+      bytes += size;
+      if (
+        size > limits.maxStringBytes ||
+        bytes > limits.maxInputBytes ||
+        hasUnpairedSurrogate(value)
+      ) {
+        return { state: hasUnpairedSurrogate(value) ? "invalid" : "overflow" };
+      }
+      return { state: "valid", value };
+    }
+    if (typeof value !== "object" || value === undefined) return { state: "invalid" };
+    if (seen.has(value)) return { state: "invalid" };
+    seen.add(value);
+    try {
+      if (value instanceof Uint8Array) {
+        const copy = Uint8Array.prototype.slice.call(value) as Uint8Array;
+        bytes += copy.byteLength;
+        return bytes > limits.maxInputBytes
+          ? { state: "overflow" }
+          : { state: "valid", value: copy };
+      }
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null && !Array.isArray(value))
+        return { state: "invalid" };
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      const keys = Reflect.ownKeys(descriptors);
+      if (Array.isArray(value)) {
+        const lengthDescriptor = descriptors.length;
+        if (
+          !lengthDescriptor ||
+          lengthDescriptor.get !== undefined ||
+          lengthDescriptor.set !== undefined ||
+          !Number.isSafeInteger(lengthDescriptor.value)
+        )
+          return { state: "invalid" };
+        const length = Number(lengthDescriptor.value);
+        if (length > limits.maxArrayElements) return { state: "overflow" };
+        if (
+          keys.some(
+            (key) =>
+              typeof key !== "string" || (key !== "length" && !/^(?:0|[1-9][0-9]*)$/u.test(key)),
+          )
+        )
+          return { state: "invalid" };
+        const output: unknown[] = [];
+        for (let index = 0; index < length; index += 1) {
+          const descriptor = descriptors[String(index)];
+          if (
+            !descriptor ||
+            !descriptor.enumerable ||
+            descriptor.get !== undefined ||
+            descriptor.set !== undefined
+          )
+            return { state: "invalid" };
+          const nested = visit(descriptor.value, depth + 1);
+          if (nested.state !== "valid") return nested;
+          output.push(nested.value);
+        }
+        return { state: "valid", value: output };
+      }
+      if (keys.length > limits.maxObjectProperties) return { state: "overflow" };
+      const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+      for (const key of keys) {
+        if (typeof key !== "string") return { state: "invalid" };
+        const keyBytes = utf8(key).byteLength;
+        bytes += keyBytes;
+        if (
+          keyBytes > 256 ||
+          bytes > limits.maxInputBytes ||
+          ["__proto__", "prototype", "constructor"].includes(key.normalize("NFKC").toLowerCase())
+        )
+          return { state: keyBytes > 256 || bytes > limits.maxInputBytes ? "overflow" : "invalid" };
+        const descriptor = descriptors[key];
+        if (
+          !descriptor ||
+          !descriptor.enumerable ||
+          descriptor.get !== undefined ||
+          descriptor.set !== undefined
+        )
+          return { state: "invalid" };
+        const nested = visit(descriptor.value, depth + 1);
+        if (nested.state !== "valid") return nested;
+        output[key] = nested.value;
+      }
+      return { state: "valid", value: output };
+    } catch {
+      return { state: "invalid" };
+    }
+  };
+  try {
+    return visit(root, 0);
+  } catch {
+    return { state: "invalid" };
+  }
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
+function countMissingFields(source: unknown, output: unknown): number {
+  if (isRecord(source) && isRecord(output)) {
+    let count = 0;
+    for (const key of Object.keys(source)) {
+      if (!Object.prototype.hasOwnProperty.call(output, key)) count += 1;
+      else count += countMissingFields(source[key], output[key]);
+    }
+    return count;
+  }
+  if (Array.isArray(source) && Array.isArray(output)) {
+    return source.reduce(
+      (count, value, index) => count + countMissingFields(value, output[index]),
+      0,
+    );
+  }
+  return 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (isRecord(value)) return Object.values(value).every(isJsonValue);
+  return false;
+}
+
 function resolveOptions(options: RecordingOptions): ResolvedRecordingOptions {
+  const sanitization = options.sanitization;
+  if (sanitization === undefined) {
+    throw new Error("Recording sanitization context is required");
+  }
+  if (
+    !(sanitization.pseudonymKey instanceof Uint8Array) ||
+    sanitization.pseudonymKey.byteLength < 32 ||
+    sanitization.pseudonymKey.byteLength > 64
+  ) {
+    throw new Error("Recording sanitization context is invalid");
+  }
+  const manifestSnapshot = snapshotInert(sanitization.manifest, RECORDING_LIMITS);
+  if (manifestSnapshot.state !== "valid" || !isRecord(manifestSnapshot.value)) {
+    throw new Error("Recording sanitization context is invalid");
+  }
   const adapters = [...(options.adapters ?? [])];
   const policies = [...(options.policies ?? [])];
   if (options.manifest !== undefined) {
@@ -285,6 +1268,10 @@ function resolveOptions(options: RecordingOptions): ResolvedRecordingOptions {
     ),
     policies: deepFreeze(policies.map((policy) => ({ ...policy }))),
     limits: resolveLimits(options.limits),
+    sanitization: {
+      manifest: manifestSnapshot.value as unknown as AdapterSanitizationManifest,
+      pseudonymKey: sanitization.pseudonymKey.slice(),
+    },
   };
 }
 
@@ -293,14 +1280,29 @@ function resolveLimits(overrides: Partial<RecordingLimits> | undefined): Recordi
     maxFileBytes: overrides?.maxFileBytes ?? RECORDING_LIMITS.maxFileBytes,
     maxRecords: overrides?.maxRecords ?? RECORDING_LIMITS.maxRecords,
     maxRecordBytes: overrides?.maxRecordBytes ?? RECORDING_LIMITS.maxRecordBytes,
+    maxInputBytes: overrides?.maxInputBytes ?? RECORDING_LIMITS.maxInputBytes,
+    maxDepth: overrides?.maxDepth ?? RECORDING_LIMITS.maxDepth,
+    maxObjectProperties: overrides?.maxObjectProperties ?? RECORDING_LIMITS.maxObjectProperties,
+    maxArrayElements: overrides?.maxArrayElements ?? RECORDING_LIMITS.maxArrayElements,
+    maxStringBytes: overrides?.maxStringBytes ?? RECORDING_LIMITS.maxStringBytes,
   };
   if (
     !Number.isSafeInteger(values.maxFileBytes) ||
     !Number.isSafeInteger(values.maxRecords) ||
     !Number.isSafeInteger(values.maxRecordBytes) ||
+    !Number.isSafeInteger(values.maxInputBytes) ||
+    !Number.isSafeInteger(values.maxDepth) ||
+    !Number.isSafeInteger(values.maxObjectProperties) ||
+    !Number.isSafeInteger(values.maxArrayElements) ||
+    !Number.isSafeInteger(values.maxStringBytes) ||
     values.maxFileBytes <= 0 ||
     values.maxRecords <= 0 ||
-    values.maxRecordBytes <= 0
+    values.maxRecordBytes <= 0 ||
+    values.maxInputBytes <= 0 ||
+    values.maxDepth <= 0 ||
+    values.maxObjectProperties <= 0 ||
+    values.maxArrayElements <= 0 ||
+    values.maxStringBytes <= 0
   ) {
     throw new Error("Recording limits are invalid");
   }
@@ -309,12 +1311,22 @@ function resolveLimits(overrides: Partial<RecordingLimits> | undefined): Recordi
 
 function encodeJson(value: unknown): Result<Uint8Array> {
   try {
-    const text = JSON.stringify(value);
+    const text = JSON.stringify(canonicalJson(value));
     if (text === undefined) return invalid("Recording value is not JSON");
     return { ok: true, value: utf8(text) };
   } catch {
     return invalid("Recording value is not JSON");
   }
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (isRecord(value)) {
+    const output: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) output[key] = canonicalJson(value[key]);
+    return output;
+  }
+  return value;
 }
 
 function encodeFrame(control: FrameControl, payload: Uint8Array): Result<Uint8Array> {
