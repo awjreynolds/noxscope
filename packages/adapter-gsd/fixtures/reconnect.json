@@ -1,0 +1,7 @@
+{
+  "version": "gsd/1",
+  "type": "RECONNECT",
+  "stream": "events",
+  "sequence": "1",
+  "observedAt": "2026-08-19T10:00:03.000Z"
+}

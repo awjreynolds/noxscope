@@ -1,0 +1,16 @@
+{
+  "version": "gsd/1",
+  "type": "STATE_UPDATE",
+  "stream": "state",
+  "sequence": "2",
+  "observedAt": "2026-08-19T10:00:01.000Z",
+  "payload": {
+    "lifecycle": "ready",
+    "network": "preprod",
+    "sync": {
+      "shielded": { "state": "synced", "percentage": 100 },
+      "unshielded": { "state": "syncing", "percentage": 61 },
+      "dust": { "state": "stalled", "percentage": 42 }
+    }
+  }
+}

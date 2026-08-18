@@ -13,12 +13,15 @@ These repositories inform interoperability and architecture but have not yet bee
 
 ## Copied or transformed source
 
-No source has been copied yet.
+The GSD Adapter is an independent codec and allowlist projection. It copies no
+GSD implementation source; its checked-in manifest and fixtures are derived
+from the audited wire seams below.
 
 When code is imported, add one row per file or coherent directory:
 
 | Destination | Upstream repository | Source commit | Original path | License | Copyright | Treatment | Import date | Importing commit |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `packages/adapter-gsd` | `https://github.com/awjreynolds/gsd-wallet` | `3ec1b1ffd21c371cf769fe1c49e38f837a0f9255` | `src/shared/messages.ts`, `src/background/offscreenClient.ts`, `src/offscreen/offscreen.ts`, `src/offscreen/worker.ts`, `packages/gsd-socket/src/{client,server}.ts` (wire reference only) | Apache-2.0; `packages/gsd-socket` reference is MIT | Adam Reynolds | Independent typed transport/record projection; no upstream source copied | 2026-08-19 | pending |
 
 ## Import rules
 
@@ -28,4 +31,3 @@ When code is imported, add one row per file or coherent directory:
 - Preserve an imported MIT notice and license; do not relabel MIT source as Apache-2.0.
 - Keep the original GSD repository independently runnable during extraction.
 - Prefer public wire contracts and dependencies over copying implementation code.
-

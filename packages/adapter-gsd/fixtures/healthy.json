@@ -1,0 +1,22 @@
+{
+  "version": "gsd/1",
+  "type": "state",
+  "stream": "state",
+  "sequence": "1",
+  "observedAt": "2026-08-19T10:00:00.000Z",
+  "payload": {
+    "lifecycle": "ready",
+    "network": "preprod",
+    "sync": {
+      "shielded": { "state": "synced", "percentage": 100 },
+      "unshielded": { "state": "syncing", "percentage": 61 },
+      "dust": { "state": "syncing", "percentage": 42 }
+    },
+    "balances": {
+      "shielded": { "assetId": "NIGHT", "amount": "42000000" },
+      "unshielded": { "assetId": "NIGHT", "amount": "12000000" },
+      "dust": { "assetId": "DUST", "amount": "730000" }
+    },
+    "dependencies": { "node": "connected", "indexer": "connected", "prover": "connected" }
+  }
+}

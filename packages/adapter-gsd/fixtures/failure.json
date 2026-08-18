@@ -1,0 +1,25 @@
+{
+  "version": "gsd/1",
+  "type": "DIAGNOSTIC_EVENT",
+  "stream": "operations",
+  "sequence": "7",
+  "requestId": "request-fixture-1",
+  "operationId": "operation-fixture-1",
+  "observedAt": "2026-08-19T10:00:02.000Z",
+  "payload": {
+    "name": "transaction.failed",
+    "category": "transaction",
+    "level": "error",
+    "kind": "transaction.submit",
+    "phase": "submitting",
+    "state": "failed",
+    "error": { "code": "rejected", "message": "node rejected", "retryable": false },
+    "detail": {
+      "source": "worker",
+      "subsystem": "node",
+      "code": "REJECTED",
+      "phase": "submitting",
+      "state": "failed"
+    }
+  }
+}

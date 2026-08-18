@@ -1,0 +1,16 @@
+{
+  "name": "@noxscope/adapter-gsd",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@noxscope/core": "workspace:*",
+    "@noxscope/protocol": "workspace:*"
+  }
+}
