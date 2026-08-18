@@ -67,6 +67,7 @@ export interface Sanitizer {
 export const SANITIZER_LIMITS = Object.freeze({
   maxInputBytes: 16 * 1024 * 1024,
   maxOutputBytes: 256 * 1024,
+  maxRawDetailBytes: 64 * 1024,
   maxStringBytes: 16 * 1024,
   maxKeyBytes: 256,
   maxObjectProperties: 512,
@@ -128,76 +129,18 @@ class CentralSanitizer implements Sanitizer {
   async sanitize(
     input: unknown,
     manifest: AdapterSanitizationManifest,
-    _options: SanitizationOptions = {},
+    options: SanitizationOptions = {},
   ): Promise<Result<SanitizedProjection>> {
-    if (!isPlainObject(input) || !validManifest(manifest)) return invalid();
-    const shape = validateInputShape(input);
-    if (shape === "invalid") return invalid();
-    if (shape === "overflow") return overflow();
-    const output: Record<string, JsonValue> = {};
-    const admitted = new Set<string>();
-    const detected = new Map<string, SanitizationAudit["redactions"][number]["reason"]>();
-    let copied = 0;
-    let pseudonymised = 0;
-    let transformed = 0;
-
-    for (const projection of manifest.projections) {
-      const value = readPath(input, projection.source);
-      if (value === undefined) continue;
-      const projected = await transformValue(value, projection, _options.pseudonymKey);
-      if (projected.state === "invalid") return invalid();
-      if (projected.state === "removed") {
-        detected.set(normalizePath(projection.source), projected.reason);
-        continue;
-      }
-      writePath(output, projection.target, projected.value);
-      for (const path of projected.admittedPaths) {
-        admitted.add(normalizePath(`${projection.source}${path.length === 0 ? "" : `.${path}`}`));
-      }
-      if (projection.transform === "copy") copied += 1;
-      else if (projection.transform === "pseudonym") pseudonymised += 1;
-      else transformed += 1;
+    const prepared = prepare(input, manifest);
+    if (prepared.state !== "valid") {
+      return prepared.state === "invalid" ? invalid() : overflow();
     }
-
-    const redactions = collectLeaves(input)
-      .filter(({ path }) => !admitted.has(normalizePath(path)))
-      .map(({ path, value }) => {
-        const normalizedPath = normalizePath(path);
-        return {
-          path: normalizedPath,
-          reason:
-            forbiddenReason(normalizedPath) ??
-            detected.get(normalizedPath) ??
-            detectValue(value) ??
-            ("policy" as const),
-        };
-      })
-      .sort((left, right) => left.path.localeCompare(right.path));
-
-    const sanitized: SanitizedProjection = {
-      value: output,
-      audit: {
-        policy: manifest.policy,
-        manifest: { id: manifest.adapter.id, version: manifest.adapter.version },
-        decisions: {
-          copied,
-          pseudonymised,
-          transformed,
-          removed: redactions.length,
-        },
-        redactions,
-      },
-    };
-    if (
-      new TextEncoder().encode(JSON.stringify(sanitized)).byteLength >
-      SANITIZER_LIMITS.maxOutputBytes
-    ) {
-      return overflow();
-    }
-    return {
-      ok: true,
-      value: sanitized,
-    };
+    return sanitizePrepared(
+      prepared.input,
+      prepared.manifest,
+      prepared.manifest.projections,
+      options,
+    );
   }
 
   async sanitizeRawDetail(
@@ -205,33 +148,109 @@ class CentralSanitizer implements Sanitizer {
     manifest: AdapterSanitizationManifest,
     options: SanitizationOptions = {},
   ): Promise<Result<SanitizedRawDetail>> {
-    if (
-      manifest.raw === undefined ||
-      !isNamespaced(manifest.raw.namespace) ||
-      manifest.raw.schemaVersion.length === 0
-    ) {
-      return invalid();
+    const prepared = prepare(input, manifest);
+    if (prepared.state !== "valid") {
+      return prepared.state === "invalid" ? invalid() : overflow();
     }
-    const sanitized = await this.sanitize(
-      input,
-      { ...manifest, projections: manifest.raw.projections },
+    const raw = prepared.manifest.raw;
+    if (raw === undefined) return invalid();
+    const sanitized = await sanitizePrepared(
+      prepared.input,
+      prepared.manifest,
+      raw.projections,
       options,
     );
     if (!sanitized.ok) return sanitized;
-    return {
-      ok: true,
-      value: {
-        namespace: manifest.raw.namespace,
-        schemaVersion: manifest.raw.schemaVersion,
-        value: sanitized.value.value,
-        sanitization: {
-          policy: manifest.policy.id,
-          policyVersion: manifest.policy.version,
-          redactions: sanitized.value.audit.redactions,
-        },
+    const detail: SanitizedRawDetail = {
+      namespace: raw.namespace,
+      schemaVersion: raw.schemaVersion,
+      value: sanitized.value.value,
+      sanitization: {
+        policy: prepared.manifest.policy.id,
+        policyVersion: prepared.manifest.policy.version,
+        redactions: sanitized.value.audit.redactions,
       },
     };
+    if (encodedSize(detail) > SANITIZER_LIMITS.maxRawDetailBytes) return overflow();
+    return { ok: true, value: detail };
   }
+}
+
+async function sanitizePrepared(
+  input: Record<string, unknown>,
+  manifest: AdapterSanitizationManifest,
+  projections: readonly FieldProjection[],
+  options: SanitizationOptions,
+): Promise<Result<SanitizedProjection>> {
+  const output: Record<string, JsonValue> = {};
+  const admitted = new Set<string>();
+  const detected = new Map<string, SanitizationAudit["redactions"][number]["reason"]>();
+  let copied = 0;
+  let pseudonymised = 0;
+  let transformed = 0;
+
+  for (const projection of projections) {
+    const value = readPath(input, projection.source);
+    if (value === undefined) continue;
+    const projected = await transformValue(value, projection, options.pseudonymKey);
+    if (projected.state === "invalid") return invalid();
+    if (projected.state === "removed") {
+      detected.set(normalizePath(projection.source), projected.reason);
+      continue;
+    }
+    writePath(output, projection.target, projected.value);
+    for (const path of projected.admittedPaths) {
+      admitted.add(normalizePath(`${projection.source}${path.length === 0 ? "" : `.${path}`}`));
+    }
+    if (projection.transform === "copy") copied += 1;
+    else if (projection.transform === "pseudonym") pseudonymised += 1;
+    else transformed += 1;
+  }
+
+  const redactions = collectLeaves(input)
+    .filter(({ path }) => !admitted.has(normalizePath(path)))
+    .map(({ path, value }) => {
+      const normalizedPath = normalizePath(path);
+      return {
+        path: normalizedPath,
+        reason:
+          forbiddenReason(normalizedPath) ??
+          detected.get(normalizedPath) ??
+          detectValue(value) ??
+          ("policy" as const),
+      };
+    })
+    .sort((left, right) => left.path.localeCompare(right.path));
+
+  const sanitized: SanitizedProjection = {
+    value: output,
+    audit: {
+      policy: {
+        id: manifest.policy.id,
+        version: manifest.policy.version,
+        digest: manifest.policy.digest,
+      },
+      manifest: { id: manifest.adapter.id, version: manifest.adapter.version },
+      decisions: {
+        copied,
+        pseudonymised,
+        transformed,
+        removed: redactions.length,
+      },
+      redactions,
+    },
+  };
+  if (encodedSize(sanitized) > SANITIZER_LIMITS.maxOutputBytes) {
+    return overflow();
+  }
+  return {
+    ok: true,
+    value: sanitized,
+  };
+}
+
+function encodedSize(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 type TransformedValue =
@@ -391,62 +410,146 @@ function overflow(): Result<never> {
   };
 }
 
-function validateInputShape(root: unknown): "valid" | "invalid" | "overflow" {
+type PreparedSanitization =
+  | { readonly state: "invalid" | "overflow" }
+  | {
+      readonly state: "valid";
+      readonly input: Record<string, unknown>;
+      readonly manifest: AdapterSanitizationManifest;
+    };
+
+function prepare(input: unknown, manifest: unknown): PreparedSanitization {
+  const manifestSnapshot = snapshotInert(manifest);
+  if (manifestSnapshot.state !== "valid") return manifestSnapshot;
+  if (!validManifest(manifestSnapshot.value)) return { state: "invalid" };
+  const inputSnapshot = snapshotInert(input);
+  if (inputSnapshot.state !== "valid") return inputSnapshot;
+  if (!isPlainObject(inputSnapshot.value)) return { state: "invalid" };
+  return {
+    state: "valid",
+    input: inputSnapshot.value,
+    manifest: manifestSnapshot.value,
+  };
+}
+
+type SnapshotResult =
+  { readonly state: "invalid" | "overflow" } | { readonly state: "valid"; readonly value: unknown };
+
+function snapshotInert(root: unknown): SnapshotResult {
   const seen = new WeakSet<object>();
   let bytes = 0;
-  const visit = (value: unknown, depth: number): "valid" | "invalid" | "overflow" => {
-    if (depth > SANITIZER_LIMITS.maxDepth) return "overflow";
-    if (value === null || typeof value === "boolean") return "valid";
-    if (typeof value === "number") return Number.isFinite(value) ? "valid" : "invalid";
+  const visit = (value: unknown, depth: number): SnapshotResult => {
+    if (depth > SANITIZER_LIMITS.maxDepth) return { state: "overflow" };
+    if (value === null || typeof value === "boolean") return { state: "valid", value };
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? { state: "valid", value } : { state: "invalid" };
+    }
     if (typeof value === "string") {
       const length = new TextEncoder().encode(value).byteLength;
       bytes += length;
       if (length > SANITIZER_LIMITS.maxStringBytes || bytes > SANITIZER_LIMITS.maxInputBytes) {
-        return "overflow";
+        return { state: "overflow" };
       }
-      return hasUnpairedSurrogate(value) ? "invalid" : "valid";
+      return hasUnpairedSurrogate(value) ? { state: "invalid" } : { state: "valid", value };
     }
-    if (typeof value !== "object" || value === undefined) return "invalid";
-    if (seen.has(value)) return "invalid";
+    if (typeof value !== "object" || value === undefined) return { state: "invalid" };
+    if (seen.has(value)) return { state: "invalid" };
     seen.add(value);
-    if (Array.isArray(value)) {
-      if (value.length > SANITIZER_LIMITS.maxArrayElements) return "overflow";
-      for (const item of value) {
-        const result = visit(item, depth + 1);
-        if (result !== "valid") return result;
-      }
-      return "valid";
+
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Uint8Array.prototype) {
+      const copy = Uint8Array.prototype.slice.call(value) as Uint8Array;
+      bytes += copy.byteLength;
+      if (bytes > SANITIZER_LIMITS.maxInputBytes) return { state: "overflow" };
+      return { state: "valid", value: copy };
     }
-    if (!isPlainObject(value)) return "invalid";
+
+    if (Array.isArray(value)) {
+      const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<
+        PropertyKey,
+        PropertyDescriptor
+      >;
+      const lengthDescriptor = descriptors.length;
+      if (
+        !lengthDescriptor ||
+        lengthDescriptor.get !== undefined ||
+        lengthDescriptor.set !== undefined ||
+        !Number.isSafeInteger(lengthDescriptor.value)
+      ) {
+        return { state: "invalid" };
+      }
+      const length = Number(lengthDescriptor.value);
+      if (length > SANITIZER_LIMITS.maxArrayElements) return { state: "overflow" };
+      const keys = Reflect.ownKeys(descriptors);
+      if (
+        keys.some(
+          (key) =>
+            typeof key !== "string" || (key !== "length" && !/^(?:0|[1-9][0-9]*)$/.test(key)),
+        )
+      ) {
+        return { state: "invalid" };
+      }
+      const copy: unknown[] = [];
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = descriptors[String(index)];
+        if (
+          !descriptor ||
+          !descriptor.enumerable ||
+          descriptor.get !== undefined ||
+          descriptor.set !== undefined
+        ) {
+          return { state: "invalid" };
+        }
+        const result = visit(descriptor.value, depth + 1);
+        if (result.state !== "valid") return result;
+        copy.push(result.value);
+      }
+      return { state: "valid", value: Object.freeze(copy) };
+    }
+
+    if (prototype !== Object.prototype && prototype !== null) return { state: "invalid" };
     const descriptors = Object.getOwnPropertyDescriptors(value);
     const keys = Reflect.ownKeys(descriptors);
-    if (keys.length > SANITIZER_LIMITS.maxObjectProperties) return "overflow";
+    if (keys.length > SANITIZER_LIMITS.maxObjectProperties) return { state: "overflow" };
     const normalizedKeys = new Set<string>();
+    const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const key of keys) {
-      if (typeof key !== "string") return "invalid";
+      if (typeof key !== "string") return { state: "invalid" };
       const keyLength = new TextEncoder().encode(key).byteLength;
       bytes += keyLength;
       if (keyLength > SANITIZER_LIMITS.maxKeyBytes || bytes > SANITIZER_LIMITS.maxInputBytes) {
-        return "overflow";
+        return { state: "overflow" };
       }
       const normalized = normalizeKey(key);
       if (
+        normalized.length === 0 ||
         normalizedKeys.has(normalized) ||
-        ["__proto__", "prototype", "constructor"].includes(key.toLowerCase())
+        ["proto", "prototype", "constructor"].includes(normalized)
       ) {
-        return "invalid";
+        return { state: "invalid" };
       }
       normalizedKeys.add(normalized);
       const descriptor = descriptors[key];
-      if (!descriptor || descriptor.get !== undefined || descriptor.set !== undefined) {
-        return "invalid";
+      if (
+        !descriptor ||
+        !descriptor.enumerable ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined
+      ) {
+        return { state: "invalid" };
       }
       const result = visit(descriptor.value, depth + 1);
-      if (result !== "valid") return result;
+      if (result.state !== "valid") return result;
+      copy[key] = result.value;
     }
-    return "valid";
+    return { state: "valid", value: Object.freeze(copy) };
   };
-  return visit(root, 0);
+
+  try {
+    return visit(root, 0);
+  } catch {
+    return { state: "invalid" };
+  }
 }
 
 function hasUnpairedSurrogate(value: string): boolean {
@@ -463,18 +566,53 @@ function hasUnpairedSurrogate(value: string): boolean {
   return false;
 }
 
-function validManifest(manifest: AdapterSanitizationManifest): boolean {
+function validManifest(value: unknown): value is AdapterSanitizationManifest {
+  if (!isPlainObject(value)) return false;
+  const adapter = value.adapter;
+  const policy = value.policy;
+  const projections = value.projections;
+  const raw = value.raw;
   return (
-    manifest.adapter.id.length > 0 &&
-    manifest.adapter.version.length > 0 &&
-    manifest.policy.id.length > 0 &&
-    manifest.policy.version.length > 0 &&
-    manifest.policy.digest.length > 0 &&
-    manifest.projections.every(validProjection)
+    isPlainObject(adapter) &&
+    nonEmptyString(adapter.id) &&
+    nonEmptyString(adapter.version) &&
+    Array.isArray(adapter.sourceVersions) &&
+    adapter.sourceVersions.every(nonEmptyString) &&
+    isPlainObject(policy) &&
+    nonEmptyString(policy.id) &&
+    nonEmptyString(policy.version) &&
+    nonEmptyString(policy.digest) &&
+    Array.isArray(projections) &&
+    projections.every(validProjection) &&
+    (raw === undefined || validRawManifest(raw))
   );
 }
 
-function validProjection(projection: FieldProjection): boolean {
+function validRawManifest(value: unknown): boolean {
+  return (
+    isPlainObject(value) &&
+    typeof value.namespace === "string" &&
+    isNamespaced(value.namespace) &&
+    nonEmptyString(value.schemaVersion) &&
+    Array.isArray(value.projections) &&
+    value.projections.every(validProjection)
+  );
+}
+
+function validProjection(value: unknown): value is FieldProjection {
+  if (!isPlainObject(value)) return false;
+  const projection = value;
+  if (
+    typeof projection.source !== "string" ||
+    typeof projection.target !== "string" ||
+    typeof projection.classification !== "string" ||
+    typeof projection.transform !== "string" ||
+    (projection.allowedHeaders !== undefined &&
+      (!Array.isArray(projection.allowedHeaders) ||
+        !projection.allowedHeaders.every((header) => typeof header === "string")))
+  ) {
+    return false;
+  }
   if (!validManifestPath(projection.source) || !validManifestPath(projection.target)) return false;
   const derivedPrivateMetadata =
     projection.classification === "S1" &&
@@ -496,6 +634,10 @@ function validProjection(projection: FieldProjection): boolean {
     return ["copy", "url", "headers", "error"].includes(projection.transform);
   }
   return projection.classification === "S4" && projection.transform === "copy";
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 function validManifestPath(path: string): boolean {

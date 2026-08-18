@@ -572,4 +572,88 @@ describe("Sanitizer", () => {
     });
     expect(JSON.stringify(result)).not.toContain("private-transaction-canary");
   });
+
+  it("rejects malformed hostile manifests without invoking accessors or echoing their values", async () => {
+    const sanitizer = createSanitizer();
+    const expectedInvalid = {
+      ok: false,
+      error: {
+        code: "invalid",
+        message: "Sanitization input or manifest is invalid",
+        retryable: false,
+      },
+    };
+    let getterInvoked = false;
+    const accessorManifest = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessorManifest, "adapter", {
+      enumerable: true,
+      get() {
+        getterInvoked = true;
+        return "manifest-accessor-canary";
+      },
+    });
+    const cyclicManifest: Record<string, unknown> = { ...manifest };
+    cyclicManifest.self = cyclicManifest;
+    const duplicateNormalizedManifest = {
+      ...manifest,
+      policy: {
+        ...manifest.policy,
+        ｄｉｇｅｓｔ: "duplicate-normalized-canary",
+      },
+    };
+
+    for (const hostileManifest of [
+      null,
+      { adapter: "manifest-shape-canary" },
+      accessorManifest,
+      cyclicManifest,
+      duplicateNormalizedManifest,
+    ]) {
+      const result = await sanitizer.sanitize(
+        { state: { ready: true } },
+        hostileManifest as AdapterSanitizationManifest,
+      );
+      expect(result).toEqual(expectedInvalid);
+      expect(JSON.stringify(result)).not.toMatch(/canary/);
+    }
+    expect(getterInvoked).toBe(false);
+  });
+
+  it("limits complete raw detail to 64 KiB while retaining the 256 KiB record ceiling", async () => {
+    const sanitizer = createSanitizer();
+    const largeFields = Object.fromEntries(
+      Array.from({ length: 5 }, (_, index) => [
+        `field${index}`,
+        `safe diagnostic ${index}: ${"x".repeat(13_980)}`,
+      ]),
+    );
+    const projections = Array.from({ length: 5 }, (_, index) => ({
+      source: `field${index}`,
+      target: `field${index}`,
+      classification: "S3" as const,
+      transform: "copy" as const,
+    }));
+    const rawManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections,
+      raw: {
+        namespace: "mock.large-detail",
+        schemaVersion: "1",
+        projections: projections.map((projection) => ({ ...projection })),
+      },
+    };
+
+    const ordinary = await sanitizer.sanitize(largeFields, rawManifest);
+    const raw = await sanitizer.sanitizeRawDetail(largeFields, rawManifest);
+
+    expect(ordinary.ok).toBe(true);
+    expect(raw).toEqual({
+      ok: false,
+      error: {
+        code: "overflow",
+        message: "Sanitization input exceeds a resource limit",
+        retryable: false,
+      },
+    });
+  });
 });
