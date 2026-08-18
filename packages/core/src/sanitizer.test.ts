@@ -720,6 +720,7 @@ describe("Sanitizer", () => {
       publicAddress: "addr_test1vqpz3u8m7y5w4x2c9publicaddress",
       publicKey:
         "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA111111111111111111111111111111111111111=\n-----END PUBLIC KEY-----",
+      base58PublicKey: "7YWHMfk9JZe0LM0g1qW9VY9xPZ6kP4nE2uH8aBcDeFgH",
       shortDiagnostic: "Node connected",
       benignUrl: "https://node.example.test:9944/status?network=preview",
     };
@@ -917,5 +918,152 @@ describe("Sanitizer", () => {
     ]);
     expect(new Set(result.value.audit.redactions.map(({ path }) => path)).size).toBe(5);
     expect(JSON.stringify(result)).not.toMatch(/(?:canary|mutated)/);
+  });
+
+  it("denies normalized credential header names even when explicitly allowlisted", async () => {
+    const sanitizer = createSanitizer();
+    const headerManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: [
+        {
+          source: "request.headers",
+          target: "request.headers",
+          classification: "S3",
+          transform: "headers",
+          allowedHeaders: [
+            "content-type",
+            "ａｕｔｈｏｒｉｚａｔｉｏｎ",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+          ],
+        },
+      ],
+    };
+    const result = await sanitizer.sanitize(
+      {
+        request: {
+          headers: {
+            "Content-Type": "application/json",
+            Ａｕｔｈｏｒｉｚａｔｉｏｎ: "ordinary-value",
+            "Proxy-Authorization": "ordinary-value",
+            Cookie: "theme=dark",
+            "Set-Cookie": "theme=dark",
+          },
+        },
+      },
+      headerManifest,
+    );
+
+    expect(result.ok && result.value.value).toEqual({
+      request: { headers: { "content-type": "application/json" } },
+    });
+    expect(result.ok && result.value.audit.redactions).toEqual([
+      { path: "request.headers.authorization", reason: "secret" },
+      { path: "request.headers.cookie", reason: "secret" },
+      { path: "request.headers.proxyauthorization", reason: "secret" },
+      { path: "request.headers.setcookie", reason: "secret" },
+    ]);
+  });
+
+  it("recursively removes secret strings embedded inside structured JSON text", async () => {
+    const sanitizer = createSanitizer();
+    const embedded = JSON.stringify({
+      envelope: {
+        messages: [
+          "Bearer nested-bearer-canary",
+          "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJuZXN0ZWQifQ.c2lnbmF0dXJl",
+          "ábaco abdomen abeja abierto abogado abono aborto abrazo abrir abuelo abuso acabar",
+          "https://wallet-user:wallet-password@node.example.test/private",
+          "viewing key=nested-assignment-canary",
+        ],
+      },
+    });
+    const result = await sanitizer.sanitize(
+      { diagnostic: { payload: embedded } },
+      {
+        ...manifest,
+        projections: [
+          {
+            source: "diagnostic.payload",
+            target: "event.payload",
+            classification: "S3",
+            transform: "copy",
+          },
+        ],
+      },
+    );
+
+    expect(result.ok && result.value.value).toEqual({});
+    expect(result.ok && result.value.audit.redactions).toEqual([
+      { path: "diagnostic.payload", reason: "key-material" },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("nested-bearer-canary");
+    expect(JSON.stringify(result)).not.toContain("nested-assignment-canary");
+  });
+
+  it("rejects derived transforms over globally forbidden S0 source paths", async () => {
+    const sanitizer = createSanitizer();
+    const cases = [
+      { source: "seed", transform: "byte-length" as const },
+      { source: "mnemonic", transform: "item-count" as const },
+      { source: "privateKey", transform: "byte-length" as const },
+    ];
+
+    for (const selected of cases) {
+      const result = await sanitizer.sanitize(
+        { seed: "authority-canary", mnemonic: ["authority-canary"], privateKey: "canary" },
+        {
+          ...manifest,
+          projections: [
+            {
+              source: selected.source,
+              target: "diagnostic.derived",
+              classification: "S1",
+              transform: selected.transform,
+            },
+          ],
+        },
+      );
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          code: "invalid",
+          message: "Sanitization input or manifest is invalid",
+          retryable: false,
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain("canary");
+    }
+  });
+
+  it("removes URL query and fragment credentials plus Base58 private material", async () => {
+    const sanitizer = createSanitizer();
+    const privateValues = {
+      query: "https://node.example.test/status?ｔｏｋｅｎ=query-token-canary",
+      fragment: "wss://node.example.test/socket#client-secret=fragment-secret-canary",
+      wif: `5${"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".slice(0, 50)}`,
+      base58: "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".repeat(2),
+    };
+    const privateManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      projections: Object.keys(privateValues).map((source) => ({
+        source: `diagnostic.${source}`,
+        target: `event.${source}`,
+        classification: "S3" as const,
+        transform: "copy" as const,
+      })),
+    };
+
+    const result = await sanitizer.sanitize({ diagnostic: privateValues }, privateManifest);
+
+    expect(result.ok && result.value.value).toEqual({});
+    expect(result.ok && result.value.audit.redactions).toEqual([
+      { path: "diagnostic.base58", reason: "key-material" },
+      { path: "diagnostic.fragment", reason: "secret" },
+      { path: "diagnostic.query", reason: "secret" },
+      { path: "diagnostic.wif", reason: "key-material" },
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(/(?:query-token|fragment-secret)-canary/);
   });
 });

@@ -98,6 +98,7 @@ const forbiddenReasons = new Map<string, SanitizationAudit["redactions"][number]
   ["accesstoken", "secret"],
   ["refreshtoken", "secret"],
   ["sessiontoken", "secret"],
+  ["token", "secret"],
   ["bearer", "secret"],
   ["cookie", "secret"],
   ["setcookie", "secret"],
@@ -363,6 +364,7 @@ async function transformValue(
     for (const [name, headerValue] of Object.entries(value)) {
       const normalized = name.toLowerCase();
       if (!allowed.has(normalized) || typeof headerValue !== "string") continue;
+      if (forbiddenReason(name) !== undefined) continue;
       if (detectValue(headerValue) !== undefined) continue;
       headers[normalized] = headerValue;
       admittedPaths.push(name);
@@ -649,8 +651,10 @@ function validProjection(value: unknown): value is FieldProjection {
   const derivedPrivateMetadata =
     projection.classification === "S1" &&
     ["byte-length", "item-count"].includes(projection.transform);
+  const sourceReason = forbiddenReason(projection.source);
   if (
-    (forbiddenReason(projection.source) !== undefined && !derivedPrivateMetadata) ||
+    (sourceReason !== undefined &&
+      !(sourceReason === "private-payload" && derivedPrivateMetadata)) ||
     forbiddenReason(projection.target) !== undefined
   ) {
     return false;
@@ -768,6 +772,15 @@ function detectValue(
   }
   const compact = normalized.replace(/\s+/g, "");
   if (
+    /^[5KL][1-9A-HJ-NP-Za-km-z]{50,51}$/.test(compact) ||
+    /^(?:xprv|tprv)[1-9A-HJ-NP-Za-km-z]{80,}$/i.test(compact) ||
+    (!/^(?:xpub|tpub)/i.test(compact) &&
+      /^[1-9A-HJ-NP-Za-km-z]{100,}$/.test(compact) &&
+      new Set(compact).size >= 24)
+  ) {
+    return "key-material";
+  }
+  if (
     /^[0-9a-f]{128,}$/i.test(compact) ||
     (/^[A-Za-z0-9+/]{64,}={0,2}$/.test(compact) && /[g-z+/]/i.test(compact))
   ) {
@@ -783,7 +796,14 @@ function detectUriCredentials(
     const url = new URL(value);
     if (
       ["http:", "https:", "ws:", "wss:"].includes(url.protocol) &&
-      (url.username.length > 0 || url.password.length > 0)
+      (url.username.length > 0 ||
+        url.password.length > 0 ||
+        [...url.searchParams.keys()].some(
+          (name) => forbiddenReasons.get(normalizeKey(name)) !== undefined,
+        ) ||
+        [...new URLSearchParams(url.hash.slice(1)).keys()].some(
+          (name) => forbiddenReasons.get(normalizeKey(name)) !== undefined,
+        ))
     ) {
       return "secret";
     }
@@ -820,6 +840,11 @@ function detectStructuredSecretText(
   while (pending.length > 0 && visited < SANITIZER_LIMITS.maxObjectProperties * 4) {
     visited += 1;
     const current = pending.pop();
+    if (typeof current === "string") {
+      const reason = detectValue(current);
+      if (reason !== undefined) return reason;
+      continue;
+    }
     if (Array.isArray(current)) {
       pending.push(...current);
       continue;
