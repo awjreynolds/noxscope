@@ -186,9 +186,10 @@ export function createRecorder(options: RecordingOptions = {}): Recorder {
 export async function sanitizeRecordingRecord(
   record: unknown,
   context: RecordingSanitizationContext,
+  limits: RecordingLimits = RECORDING_LIMITS,
 ): Promise<Result<SanitizedRecordingRecord>> {
   try {
-    const snapshot = snapshotInert(record, RECORDING_LIMITS);
+    const snapshot = snapshotInert(record, limits);
     if (snapshot.state !== "valid") {
       return snapshot.state === "overflow"
         ? overflow("Recording record exceeds a resource limit")
@@ -1071,9 +1072,13 @@ async function sanitizeRawList(
       accumulator.redactions += 1;
       continue;
     }
-    const result = await sanitizer.sanitizeRawDetail(detail.value, context.manifest, {
-      pseudonymKey: context.pseudonymKey,
-    });
+    const result = await sanitizer.sanitizeRawDetail(
+      detail.value,
+      context.manifest,
+      context.preserveRecordingPseudonyms === true
+        ? { pseudonymKey: context.pseudonymKey, preserveRecordingPseudonyms: true }
+        : { pseudonymKey: context.pseudonymKey },
+    );
     if (!result.ok) {
       accumulator.droppedAttributes += 1;
       if (result.error.code === "overflow") accumulator.redactions += 1;

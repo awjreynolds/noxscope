@@ -162,6 +162,57 @@ describe("Recording v1 hostile import and offline replay", () => {
     expect(second).toEqual({ ok: true, value: expect.objectContaining({ bytes: first.bytes }) });
   });
 
+  it("keeps raw S2 pseudonyms stable across import and re-export", async () => {
+    const rawManifest: AdapterSanitizationManifest = {
+      ...manifest,
+      raw: {
+        namespace: "test.raw.s2",
+        schemaVersion: "1",
+        projections: [
+          {
+            source: "address",
+            target: "address",
+            classification: "S2",
+            transform: "pseudonym",
+          },
+        ],
+      },
+    };
+    const rawRecord = {
+      ...record,
+      event: {
+        ...record.event,
+        raw: [
+          {
+            namespace: "test.raw.s2",
+            schemaVersion: "1",
+            value: { address: "raw-address" },
+            sanitization: {
+              policy: manifest.policy.id,
+              policyVersion: manifest.policy.version,
+              redactions: [],
+            },
+          },
+        ],
+      },
+    } as unknown as RecordingRecord;
+    const first = await makeExport([rawRecord], rawManifest);
+    const firstText = new TextDecoder().decode(first.bytes);
+    expect(firstText).toMatch(/hmac-sha256:[0-9a-f]{64}/u);
+    const imported = await importRecording(first.bytes, {
+      sanitization: { manifest: rawManifest, pseudonymKey: key },
+    });
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const recorder = createRecorder({
+      now: () => "2026-08-18T12:00:02.000Z",
+      sanitization: { manifest: rawManifest, pseudonymKey: key },
+    });
+    await recorder.append(imported.value.records[0]);
+    const second = await recorder.finalize();
+    expect(second).toEqual({ ok: true, value: expect.objectContaining({ bytes: first.bytes }) });
+  });
+
   it("bounds lower file limits and copies the source buffer only once", async () => {
     const exported = await makeExport([record, secondRecord]);
     const sourceSize = exported.bytes.byteLength;
@@ -189,6 +240,31 @@ describe("Recording v1 hostile import and offline replay", () => {
     } finally {
       sliceSpy.mockRestore();
     }
+  });
+
+  it("contains hostile Uint8Array traps and caller re-sanitization limits", async () => {
+    const exported = await makeExport();
+    const hostile = new Proxy(exported.bytes, {
+      get(target, property, receiver) {
+        if (property === "byteLength" || property === "slice") throw new Error("byte trap");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await expect(importRecording(hostile as unknown as Uint8Array, options)).resolves.toMatchObject(
+      { ok: false, error: { code: "invalid" } },
+    );
+
+    const inputLimited = await importRecording(exported.bytes, {
+      ...options,
+      limits: { maxInputBytes: 1 },
+    });
+    expect(inputLimited).toMatchObject({ ok: false, error: { code: "overflow" } });
+
+    const frameLimited = await importRecording(exported.bytes, {
+      ...options,
+      limits: { maxRecordBytes: 1 },
+    });
+    expect(frameLimited).toMatchObject({ ok: false, error: { code: "overflow" } });
   });
 
   it("imports more than 4,095 accepted records while bounding the configured count", async () => {
@@ -396,6 +472,22 @@ describe("Recording v1 hostile import and offline replay", () => {
       value.exportedAt = "2026-08-18T12:00:03.000Z";
     });
     await expectRejected(mismatchedManifest, "incompatible");
+  });
+
+  it("rejects additive manifest, count, and integrity keys without exposing canaries", async () => {
+    const exported = await makeExport();
+    const hostile = await mutateManifestAndReframe(exported.bytes, (value) => {
+      value.mnemonic =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+      (value.counts as Record<string, unknown>).unknownCanary = "count-canary";
+      (value.integrity as Record<string, unknown>).unknownCanary = "integrity-canary";
+    });
+    const result = await importRecording(hostile, options);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(["invalid", "incompatible"]).toContain(result.error.code);
+    expect(JSON.stringify(result)).not.toContain("abandon abandon");
+    expect(JSON.stringify(result)).not.toContain("count-canary");
+    expect(JSON.stringify(result)).not.toContain("integrity-canary");
   });
 
   it("contains hostile direct canonicalization inputs without invoking getters or cycles", async () => {

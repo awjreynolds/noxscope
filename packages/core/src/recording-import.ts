@@ -160,7 +160,7 @@ async function parseRecording(state: ImportState): Promise<Result<ImportedRecord
         return overflow("Recording record count exceeds a resource limit");
       const checked = validateRecord(frame.value.parsed);
       if (!checked.ok) return checked;
-      const sanitized = await sanitizeRecordingRecord(checked.value, state.context);
+      const sanitized = await sanitizeRecordingRecord(checked.value, state.context, state.limits);
       if (!sanitized.ok) return sanitized;
       state.droppedAttributes += sanitized.value.droppedAttributes;
       state.redactions += sanitized.value.redactions;
@@ -284,9 +284,14 @@ async function readFrame(state: ImportState, start: number): Promise<Result<Pars
     return invalid("Recording frame control is invalid");
   const payloadStart = controlLine.value.next;
   const payloadEnd = payloadStart + control.value.bytes;
+  const maxFrameBytes =
+    state.limits.maxRecordBytes < RECORDING_LIMITS.maxRecordBytes
+      ? state.limits.maxRecordBytes
+      : control.value.type === "record"
+        ? state.limits.maxRecordBytes
+        : state.limits.maxFileBytes;
   if (
-    control.value.bytes >
-      (control.value.type === "record" ? state.limits.maxRecordBytes : state.limits.maxFileBytes) ||
+    control.value.bytes > maxFrameBytes ||
     !Number.isSafeInteger(payloadEnd) ||
     payloadEnd < payloadStart ||
     payloadEnd + 1 > state.bytes.byteLength ||
@@ -509,6 +514,15 @@ class JsonParser {
 function validateHeader(value: unknown): Result<ImportHeader> {
   if (
     !isRecord(value) ||
+    !hasExactKeys(value, [
+      "adapters",
+      "exportedAt",
+      "format",
+      "formatVersion",
+      "policies",
+      "protocol",
+      "schemaVersion",
+    ]) ||
     value.format !== NOXSCOPE_RECORDING_FORMAT ||
     value.formatVersion !== 1 ||
     value.protocol !== NOXSCOPE_PROTOCOL ||
@@ -530,6 +544,17 @@ function validateManifest(
 ): Result<RecordingManifest> {
   if (
     !isRecord(value) ||
+    !hasExactKeys(value, [
+      "adapters",
+      "counts",
+      "exportedAt",
+      "format",
+      "formatVersion",
+      "integrity",
+      "policies",
+      "protocol",
+      "schemaVersion",
+    ]) ||
     value.format !== NOXSCOPE_RECORDING_FORMAT ||
     value.formatVersion !== 1 ||
     value.protocol !== NOXSCOPE_PROTOCOL ||
@@ -546,6 +571,13 @@ function validateManifest(
     return incompatible("Recording manifest is incompatible");
   const counts = value.counts as unknown as RecordingCounts;
   if (
+    !hasExactKeys(counts, [
+      "droppedAttributes",
+      "droppedRecords",
+      "gaps",
+      "records",
+      "redactions",
+    ]) ||
     !(["records", "gaps", "droppedRecords", "droppedAttributes", "redactions"] as const).every(
       (key) => nonNegativeInteger(counts[key]),
     ) ||
@@ -558,6 +590,13 @@ function validateManifest(
     return invalid("Recording manifest counts are invalid");
   const integrity = value.integrity;
   if (
+    !hasExactKeys(integrity, [
+      "algorithm",
+      "authenticated",
+      "contentDigest",
+      "frameDigests",
+      "warning",
+    ]) ||
     integrity.algorithm !== "SHA-256" ||
     integrity.authenticated !== false ||
     typeof integrity.contentDigest !== "string" ||
@@ -586,6 +625,7 @@ function validateTerminalIntegrity(
 ): Result<{ readonly contentDigest: string; readonly manifestFrameDigest: string }> {
   if (
     !isRecord(value) ||
+    !hasExactKeys(value, ["contentDigest", "manifestFrameDigest", "type"]) ||
     value.type !== "integrity" ||
     typeof value.contentDigest !== "string" ||
     typeof value.manifestFrameDigest !== "string"
@@ -758,6 +798,7 @@ function isExactControl(value: unknown): value is FrameControl {
 
 function isFrameDigest(value: unknown): value is RecordingFrameDigest {
   if (!isRecord(value)) return false;
+  if (!hasExactKeys(value, ["bytes", "index", "sha256", "type"])) return false;
   const candidate = value as {
     readonly index?: unknown;
     readonly type?: unknown;
@@ -772,6 +813,14 @@ function isFrameDigest(value: unknown): value is RecordingFrameDigest {
     (candidate.bytes as number) >= 0 &&
     typeof candidate.sha256 === "string" &&
     /^[0-9a-f]{64}$/u.test(candidate.sha256)
+  );
+}
+
+function hasExactKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort();
+  return (
+    keys.length === expected.length &&
+    keys.every((key, index) => key === [...expected].sort()[index])
   );
 }
 
@@ -816,9 +865,16 @@ function toBytes(input: Uint8Array | string, maximum: number): Result<Uint8Array
       return invalid("Recording input is invalid");
     }
   }
-  if (!(input instanceof Uint8Array)) return invalid("Recording input is invalid");
-  if (input.byteLength > maximum) return overflow("Recording file exceeds a resource limit");
-  return { ok: true, value: input.slice() };
+  try {
+    if (!(input instanceof Uint8Array)) return invalid("Recording input is invalid");
+    if (input.byteLength > maximum) return overflow("Recording file exceeds a resource limit");
+    return {
+      ok: true,
+      value: Uint8Array.prototype.slice.call(input) as Uint8Array,
+    };
+  } catch {
+    return invalid("Recording input is invalid");
+  }
 }
 
 function isArchive(bytes: Uint8Array): boolean {
