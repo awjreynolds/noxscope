@@ -1,4 +1,10 @@
 import { createMockAdapter, type MockScenario } from "@noxscope/adapter-mock";
+import type {
+  NoxscopeAdapter,
+  NoxscopeRecord,
+  RuntimeDescriptor,
+  RuntimeSession,
+} from "@noxscope/protocol";
 import { describe, expect, it } from "vitest";
 import { createCore, type CoreView } from "./index.js";
 
@@ -151,6 +157,52 @@ describe("Core", () => {
     ]);
   });
 
+  it("keeps stream grouping distinct for NUL and control-character identities", async () => {
+    const core = createCore({ signal: new AbortController().signal });
+    const first = descriptor("s\u0000t", "u");
+    const second = descriptor("s", "t\u0000u");
+    const third = descriptor("ユニコード🙂\u0001", "runtime\u0002");
+    const firstRecords = [
+      diagnosticRecord(first, "1", "2026-08-19T12:00:02.000Z"),
+      diagnosticRecord(first, "2", "2026-08-19T12:00:04.000Z"),
+    ];
+    const secondRecords = [
+      diagnosticRecord(second, "1", "2026-08-19T12:00:01.000Z"),
+      diagnosticRecord(second, "2", "2026-08-19T12:00:03.000Z"),
+    ];
+    const thirdRecords = [
+      diagnosticRecord(third, "1", "2026-08-19T12:00:00.500Z", "events\u0003"),
+      diagnosticRecord(third, "2", "2026-08-19T12:00:05.000Z", "events\u0003"),
+    ];
+    const completed = new Promise<CoreView>((resolve) => {
+      core.subscribe((view) => {
+        if (
+          view.runtimes.length === 3 &&
+          view.runtimes.every((runtime) => runtime.records.length === 2)
+        )
+          resolve(view);
+      });
+    });
+
+    await Promise.all([
+      core.connect(staticAdapter(first, firstRecords)),
+      core.connect(staticAdapter(second, secondRecords)),
+      core.connect(staticAdapter(third, thirdRecords)),
+    ]);
+    const timeline = await completed;
+
+    expect(
+      timeline.timeline.map(({ record }) => [record.meta.sessionId, record.meta.sequence]),
+    ).toEqual([
+      ["ユニコード🙂\u0001", "1"],
+      ["s", "1"],
+      ["s\u0000t", "1"],
+      ["s", "2"],
+      ["s\u0000t", "2"],
+      ["ユニコード🙂\u0001", "2"],
+    ]);
+  });
+
   it("turns a missing source sequence range into canonical stream-gap evidence", async () => {
     const core = createCore({ signal: new AbortController().signal });
     const observed = new Promise<CoreView>((resolve) => {
@@ -256,3 +308,64 @@ describe("Core", () => {
     });
   });
 });
+
+function descriptor(sessionId: string, runtimeId: string): RuntimeDescriptor {
+  return {
+    protocol: "noxscope/adapter/1",
+    sessionId,
+    runtimeId,
+    adapter: { id: "test.adapter", version: "1.0.0" },
+    runtime: { surface: "sdk", identifiers: [], versions: [] },
+    capabilities: [],
+  };
+}
+
+function diagnosticRecord(
+  runtime: RuntimeDescriptor,
+  sequence: string,
+  receivedAt: string,
+  streamId = "events",
+): NoxscopeRecord {
+  return {
+    kind: "diagnostic-event",
+    meta: {
+      protocol: "noxscope/adapter/1",
+      sessionId: runtime.sessionId,
+      runtimeId: runtime.runtimeId,
+      streamId,
+      sequence,
+      observedAt: receivedAt,
+      receivedAt,
+    },
+    event: {
+      type: "diagnostic",
+      name: `event-${sequence}`,
+      category: "test",
+      level: "info",
+      source: "runtime",
+    },
+  };
+}
+
+function staticAdapter(
+  runtime: RuntimeDescriptor,
+  records: readonly NoxscopeRecord[],
+): NoxscopeAdapter {
+  return {
+    async connect() {
+      const session = {
+        descriptor: runtime,
+        async *[Symbol.asyncIterator]() {
+          yield* records;
+        },
+        async request() {
+          return {
+            ok: false as const,
+            error: { code: "unsupported" as const, message: "test", retryable: false },
+          };
+        },
+      } as unknown as RuntimeSession;
+      return { ok: true as const, value: session };
+    },
+  };
+}

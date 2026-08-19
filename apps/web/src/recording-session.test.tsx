@@ -75,6 +75,61 @@ describe("recording session", () => {
     session.dispose();
   });
 
+  it("does not conflate record append identities containing NUL characters", async () => {
+    const sourceRecord = view.timeline[0]!.record;
+    if (sourceRecord.kind !== "diagnostic-event") throw new Error("fixture is not diagnostic");
+    const first = {
+      ...sourceRecord,
+      meta: {
+        ...sourceRecord.meta,
+        runtimeId: "runtime",
+        sessionId: "s\u0000t",
+        streamId: "u",
+        sequence: "1",
+      },
+    };
+    const second = {
+      ...sourceRecord,
+      meta: {
+        ...sourceRecord.meta,
+        runtimeId: "runtime",
+        sessionId: "s",
+        streamId: "t\u0000u",
+        sequence: "1",
+      },
+      event: { ...sourceRecord.event, name: "runtime.second" },
+    };
+    const third = {
+      ...sourceRecord,
+      meta: {
+        ...sourceRecord.meta,
+        runtimeId: "runtime🙂\u0001",
+        sessionId: "ユニコード🙂\u0002",
+        streamId: "events\u0003",
+        sequence: "1",
+      },
+      event: { ...sourceRecord.event, name: "runtime.third" },
+    };
+    const collisionView: CoreView = {
+      ...view,
+      timeline: [
+        { runtimeId: "runtime", record: first },
+        { runtimeId: "runtime", record: second },
+        { runtimeId: "runtime🙂\u0001", record: third },
+      ],
+    };
+    const session = createRecordingSession(fakeCore(collisionView), {
+      store: createMemoryRecordingStore(),
+      randomValues: (bytes) => bytes.fill(15),
+    });
+
+    expect(await session.start("nul-identities")).toMatchObject({ ok: true });
+    const stopped = await session.stop();
+
+    expect(stopped).toMatchObject({ ok: true, value: { recordCount: 3 } });
+    session.dispose();
+  });
+
   it("publishes export storage failures so the UI can show a bounded error", async () => {
     const base = createMemoryRecordingStore();
     const store = {

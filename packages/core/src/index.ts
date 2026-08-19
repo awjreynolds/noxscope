@@ -288,15 +288,24 @@ interface TimelineStream {
 }
 
 function mergeTimeline(runtimes: readonly RuntimeView[]): TimelineEntry[] {
-  const streams = new Map<string, TimelineStream>();
+  const streams = new Map<string, Map<string, Map<string, TimelineStream>>>();
   let streamOrder = 0;
   for (const runtime of runtimes) {
     for (const record of runtime.records) {
-      const key = `${runtime.descriptor.sessionId}\u0000${runtime.descriptor.runtimeId}\u0000${record.meta.streamId}`;
-      let stream = streams.get(key);
+      let byRuntime = streams.get(runtime.descriptor.sessionId);
+      if (byRuntime === undefined) {
+        byRuntime = new Map();
+        streams.set(runtime.descriptor.sessionId, byRuntime);
+      }
+      let byStream = byRuntime.get(runtime.descriptor.runtimeId);
+      if (byStream === undefined) {
+        byStream = new Map();
+        byRuntime.set(runtime.descriptor.runtimeId, byStream);
+      }
+      let stream = byStream.get(record.meta.streamId);
       if (stream === undefined) {
         stream = { order: streamOrder++, index: 0, entries: [] };
-        streams.set(key, stream);
+        byStream.set(record.meta.streamId, stream);
       }
       stream.entries.push({ runtimeId: runtime.descriptor.runtimeId, record });
     }
@@ -305,18 +314,22 @@ function mergeTimeline(runtimes: readonly RuntimeView[]): TimelineEntry[] {
   const timeline: TimelineEntry[] = [];
   while (true) {
     let selected: TimelineStream | undefined;
-    for (const stream of streams.values()) {
-      const candidate = stream.entries[stream.index];
-      if (candidate === undefined) continue;
-      const current = selected?.entries[selected.index];
-      if (
-        current === undefined ||
-        candidate.record.meta.receivedAt < current.record.meta.receivedAt ||
-        (candidate.record.meta.receivedAt === current.record.meta.receivedAt &&
-          selected !== undefined &&
-          stream.order < selected.order)
-      ) {
-        selected = stream;
+    for (const byRuntime of streams.values()) {
+      for (const byStream of byRuntime.values()) {
+        for (const stream of byStream.values()) {
+          const candidate = stream.entries[stream.index];
+          if (candidate === undefined) continue;
+          const current = selected?.entries[selected.index];
+          if (
+            current === undefined ||
+            candidate.record.meta.receivedAt < current.record.meta.receivedAt ||
+            (candidate.record.meta.receivedAt === current.record.meta.receivedAt &&
+              selected !== undefined &&
+              stream.order < selected.order)
+          ) {
+            selected = stream;
+          }
+        }
       }
     }
     if (selected === undefined) return timeline;

@@ -524,7 +524,12 @@ function recordKey(
     };
   },
 ): string {
-  return `${runtimeId}\u0000${record.meta.sessionId}\u0000${record.meta.streamId}\u0000${record.meta.sequence}`;
+  return JSON.stringify([
+    runtimeId,
+    record.meta.sessionId,
+    record.meta.streamId,
+    record.meta.sequence,
+  ]);
 }
 
 function createPseudonymKey(randomValues: (bytes: Uint8Array) => Uint8Array): Result<Uint8Array> {
