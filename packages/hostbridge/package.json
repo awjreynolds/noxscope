@@ -1,10 +1,28 @@
 {
   "name": "@noxscope/hostbridge",
   "version": "0.1.0",
+  "description": "Authenticated, bounded canonical browser-to-Node HostBridge",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./node": "./src/node.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

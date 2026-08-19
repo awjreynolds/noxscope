@@ -6,6 +6,8 @@
     { "path": "packages/core" },
     { "path": "packages/adapter-gsd" },
     { "path": "packages/conformance" },
+    { "path": "packages/adapter-moth" },
+    { "path": "packages/hostbridge" },
     { "path": "apps/web" }
   ]
 }

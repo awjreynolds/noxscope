@@ -1,10 +1,28 @@
 {
   "name": "@noxscope/adapter-moth",
   "version": "0.1.0",
+  "description": "Read-only canonical Adapter for the Moth daemon state contract",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./fixtures": "./src/fixtures.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./fixtures": {
+      "types": "./dist/fixtures.d.ts",
+      "import": "./dist/fixtures.js"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -2,6 +2,11 @@
   "name": "noxscope",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=10.33.0"
+  },
   "packageManager": "pnpm@10.33.0",
   "type": "module",
   "scripts": {
@@ -9,7 +14,11 @@
     "test": "vitest run",
     "typecheck": "tsc -b",
     "lint": "eslint .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "verify:metadata": "node scripts/verify-package-metadata.mjs",
+    "verify:provenance": "node scripts/verify-provenance.mjs",
+    "verify:fixtures": "node scripts/scan-recording-fixtures.mjs",
+    "verify": "pnpm verify:metadata && pnpm verify:provenance && pnpm verify:fixtures && pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build"
   },
   "devDependencies": {
     "@eslint/js": "^9.34.0",

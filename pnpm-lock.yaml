@@ -83,13 +83,22 @@ importers:
         specifier: ^19.1.1
         version: 19.2.8(react@19.2.8)
 
+  packages/adapter-gsd:
+    dependencies:
+      "@noxscope/core":
+        specifier: workspace:*
+        version: link:../core
+      "@noxscope/protocol":
+        specifier: workspace:*
+        version: link:../protocol
+
   packages/adapter-mock:
     dependencies:
       "@noxscope/protocol":
         specifier: workspace:*
         version: link:../protocol
 
-  packages/adapter-gsd:
+  packages/adapter-moth:
     dependencies:
       "@noxscope/core":
         specifier: workspace:*
@@ -107,6 +116,12 @@ importers:
       "@noxscope/adapter-mock":
         specifier: workspace:*
         version: link:../adapter-mock
+
+  packages/hostbridge:
+    dependencies:
+      "@noxscope/protocol":
+        specifier: workspace:*
+        version: link:../protocol
 
   packages/protocol: {}
 
