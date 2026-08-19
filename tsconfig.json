@@ -5,6 +5,7 @@
     { "path": "packages/adapter-mock" },
     { "path": "packages/core" },
     { "path": "packages/adapter-gsd" },
+    { "path": "packages/conformance" },
     { "path": "apps/web" }
   ]
 }
