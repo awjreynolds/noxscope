@@ -234,7 +234,7 @@ describe("HostBridge handshake and policy", () => {
         snapshot: {
           ...base.snapshot,
           revision: "2",
-          raw: [raw({ path: "$.secret", reason: "secret", evil: true })],
+          raw: [raw({ path: "items[0].secret", reason: "secret" })],
         },
       },
       {
@@ -243,7 +243,7 @@ describe("HostBridge handshake and policy", () => {
         snapshot: {
           ...base.snapshot,
           revision: "3",
-          raw: [raw({ path: "x".repeat(257), reason: "secret" })],
+          raw: [raw({ path: "$.seсret", reason: "secret" })],
         },
       },
       {
@@ -252,7 +252,7 @@ describe("HostBridge handshake and policy", () => {
         snapshot: {
           ...base.snapshot,
           revision: "4",
-          raw: [raw({ path: "$.secret", reason: "r".repeat(257) })],
+          raw: [raw({ path: "$.secreτ", reason: "secret" })],
         },
       },
       {
@@ -261,6 +261,60 @@ describe("HostBridge handshake and policy", () => {
         snapshot: {
           ...base.snapshot,
           revision: "5",
+          raw: [raw({ path: "＄.secret", reason: "secret" })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "6" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "6",
+          raw: [raw({ path: "$.sec\u202Eret", reason: "secret" })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "7" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "7",
+          raw: [raw({ path: "$.sec\u200Bret", reason: "secret" })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "8" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "8",
+          raw: [raw({ path: "x".repeat(257), reason: "secret" })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "9" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "9",
+          raw: [raw({ path: "$.secret", reason: "r".repeat(257) })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "10" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "10",
+          raw: [raw({ path: "$.secret", reason: "secret", evil: true })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "11" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "11",
           raw: [raw({ path: "$.secret", reason: "secret" }, { path: "still-forbidden" })],
         },
       },
@@ -292,9 +346,14 @@ describe("HostBridge handshake and policy", () => {
       if (item.kind === "snapshot") received.push(item);
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(received).toHaveLength(1);
-    expect(received[0]?.snapshot.raw?.[0]?.sanitization.redactions).toEqual([
+    expect(received).toHaveLength(2);
+    expect(
+      received
+        .flatMap((item) => item.snapshot.raw ?? [])
+        .flatMap((detail) => detail.sanitization.redactions),
+    ).toEqual([
       { path: "$.secret", reason: "secret" },
+      { path: "items[0].secret", reason: "secret" },
     ]);
     await client.close();
   });

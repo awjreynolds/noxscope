@@ -69,6 +69,9 @@ export const HOSTBRIDGE_DENY_MANIFEST = Object.freeze({
   ]),
 });
 
+const CANONICAL_REDACTION_PATH =
+  /^(?:\$(?:\.[a-z0-9_][a-z0-9_-]*|\[(?:0|[1-9][0-9]*)\]|\["[a-z0-9_][a-z0-9_-]*"\])+|[a-z0-9_][a-z0-9_-]*(?:\.[a-z0-9_][a-z0-9_-]*|\[(?:0|[1-9][0-9]*)\]|\["[a-z0-9_][a-z0-9_-]*"\])*)$/u;
+
 export interface HostBridgeConnection {
   readonly origin: string;
   readonly loopback: boolean;
@@ -1513,7 +1516,7 @@ function isCanonicalRedactionPath(value: unknown): value is string {
       const codePoint = character.codePointAt(0) ?? 0;
       return codePoint >= 0x20 && codePoint !== 0x7f;
     }) &&
-    /^[\p{L}\p{N}$_-]+(?:\.[\p{L}\p{N}$_-]+)*$/u.test(value)
+    CANONICAL_REDACTION_PATH.test(value)
   );
 }
 
