@@ -31,6 +31,11 @@ describe("Moth daemon wire contract", () => {
     );
     const frame = encodeMothFrame({ ok: true });
     expect(() => decodeMothFrame(new Uint8Array([...frame, 0]))).toThrow(/trailing/i);
+    const duplicateJson = new TextEncoder().encode('{"id":"1","id":"2"}');
+    const duplicateFrame = new Uint8Array(duplicateJson.byteLength + 4);
+    new DataView(duplicateFrame.buffer).setUint32(0, duplicateJson.byteLength, false);
+    duplicateFrame.set(duplicateJson, 4);
+    expect(() => decodeMothFrame(duplicateFrame)).toThrow(/duplicate/i);
   });
 });
 
@@ -78,6 +83,7 @@ describe("read-only Moth Adapter", () => {
     }).connect({ signal: signal() });
     expect(connected.ok).toBe(true);
     if (!connected.ok) return;
+    expect(connected.value.descriptor.sessionId).toMatch(/^moth-session-/);
     expect(calls).toEqual(["version", "getState"]);
     expect(connected.value.descriptor.runtime.surface).toBe("daemon");
     expect(connected.value.descriptor.runtime.versions).toContainEqual({
@@ -94,6 +100,7 @@ describe("read-only Moth Adapter", () => {
     if (first.done) return;
     expect(first.value.kind).toBe("snapshot");
     if (first.value.kind !== "snapshot") return;
+    expect(first.value.meta.sessionId).toBe(connected.value.descriptor.sessionId);
     expect(first.value.snapshot.lifecycle?.state).toBe("ready");
     expect(first.value.snapshot.sync?.state).toBe("syncing");
     expect(first.value.snapshot.balances).toHaveLength(3);

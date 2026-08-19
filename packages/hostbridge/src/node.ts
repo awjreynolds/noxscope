@@ -101,7 +101,11 @@ class NodeWebSocketConnection implements HostBridgeConnection {
   readonly #messages = new Set<(data: string) => void>();
   readonly #closes = new Set<() => void>();
   #buffer: Buffer;
+  #fragmentOpcode: 0x1 | undefined;
+  #fragments: Buffer[] = [];
+  #fragmentBytes = 0;
   #closed = false;
+  #closeNotified = false;
   constructor(socket: Socket, origin: string, maxFrameBytes: number, head: Buffer) {
     this.#socket = socket;
     this.origin = origin;
@@ -151,7 +155,12 @@ class NodeWebSocketConnection implements HostBridgeConnection {
     while (this.#buffer.byteLength >= 2 && !this.#closed) {
       const first = this.#buffer[0]!;
       const second = this.#buffer[1]!;
+      const fin = (first & 0x80) !== 0;
       const opcode = first & 0x0f;
+      if ((first & 0x70) !== 0) {
+        this.close();
+        return;
+      }
       const masked = (second & 0x80) !== 0;
       let length = second & 0x7f;
       let offset = 2;
@@ -175,6 +184,11 @@ class NodeWebSocketConnection implements HostBridgeConnection {
         this.close();
         return;
       }
+      const control = opcode >= 0x8;
+      if (control && (!fin || length > 125)) {
+        this.close();
+        return;
+      }
       const mask = this.#buffer.subarray(offset, offset + 4);
       offset += 4;
       const payload = Buffer.from(this.#buffer.subarray(offset, offset + length));
@@ -182,6 +196,10 @@ class NodeWebSocketConnection implements HostBridgeConnection {
       for (let index = 0; index < payload.length; index += 1)
         payload[index] = (payload[index] ?? 0) ^ (mask[index % 4] ?? 0);
       if (opcode === 0x8) {
+        if (!validClosePayload(payload)) {
+          this.close();
+          return;
+        }
         this.close();
         return;
       }
@@ -189,24 +207,89 @@ class NodeWebSocketConnection implements HostBridgeConnection {
         this.#socket.write(frame(payload, 0xa));
         continue;
       }
-      if (opcode !== 0x1) {
+      if (opcode === 0xa) continue;
+      if (control || (opcode !== 0x0 && opcode !== 0x1)) {
         this.close();
         return;
       }
-      let text: string;
-      try {
-        text = payload.toString("utf8");
-      } catch {
+      if (opcode === 0x1) {
+        if (this.#fragmentOpcode !== undefined) {
+          this.close();
+          return;
+        }
+        if (!fin) {
+          this.#fragmentOpcode = 0x1;
+          this.#fragments = [payload];
+          this.#fragmentBytes = payload.byteLength;
+          continue;
+        }
+        if (!this.#emitText(payload)) return;
+        continue;
+      }
+      if (this.#fragmentOpcode === undefined) {
         this.close();
         return;
       }
-      for (const listener of this.#messages) listener(text);
+      if (this.#fragmentBytes + payload.byteLength > this.#maxFrameBytes) {
+        this.close();
+        return;
+      }
+      this.#fragments.push(payload);
+      this.#fragmentBytes += payload.byteLength;
+      if (fin) {
+        const message = Buffer.concat(this.#fragments, this.#fragmentBytes);
+        this.#fragmentOpcode = undefined;
+        this.#fragments = [];
+        this.#fragmentBytes = 0;
+        if (!this.#emitText(message)) return;
+      }
     }
   }
+  #emitText(payload: Buffer): boolean {
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(payload);
+    } catch {
+      this.close();
+      return false;
+    }
+    for (const listener of this.#messages) {
+      try {
+        listener(text);
+      } catch {
+        this.close();
+        return false;
+      }
+    }
+    return true;
+  }
   #emitClose(): void {
-    if (!this.#closed) this.#closed = true;
+    if (this.#closeNotified) return;
+    this.#closed = true;
+    this.#closeNotified = true;
     for (const listener of this.#closes) listener();
     this.#closes.clear();
+  }
+}
+
+function validClosePayload(payload: Buffer): boolean {
+  if (payload.byteLength === 1) return false;
+  if (payload.byteLength < 2) return true;
+  const code = payload.readUInt16BE(0);
+  if (
+    code < 1_000 ||
+    code >= 5_000 ||
+    code === 1_004 ||
+    code === 1_005 ||
+    code === 1_006 ||
+    code === 1_015
+  )
+    return false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(payload.subarray(2));
+    return true;
+  } catch {
+    return false;
   }
 }
 

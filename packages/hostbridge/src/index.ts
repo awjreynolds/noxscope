@@ -190,7 +190,7 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
   ) {
     throw new Error("HostBridge allowedOrigins must contain exact origins");
   }
-  const token = options.token ?? options.tokenFactory?.() ?? launchToken();
+  let token = options.token ?? options.tokenFactory?.() ?? launchToken();
   if (!nonEmpty(token) || byteLength(token) > 256)
     throw new Error("HostBridge launch token is invalid");
   const maxConnections = options.maxConnections ?? HOSTBRIDGE_LIMITS.maxConnections;
@@ -201,13 +201,21 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
   const connections = new Set<ServerConnection>();
   const sessions = new Map<string, HostBridgeSessionSource>();
   const consumers = new Set<string>();
+  const seenClientIds = new Set<string>();
+  let closed = false;
   const consume = async (attached: HostBridgeSessionSource): Promise<void> => {
     if (consumers.has(attached.descriptor.sessionId)) return;
     consumers.add(attached.descriptor.sessionId);
     try {
       for await (const candidate of attached.records()) {
-        const checkedRecord = validateRecord(candidate);
-        if (!checkedRecord.ok || !safeBridgeValue(checkedRecord.value)) continue;
+        let checkedRecord: Result<NoxscopeRecord>;
+        try {
+          checkedRecord = validateRecord(candidate);
+          if (checkedRecord.ok && !safeBridgeValue(checkedRecord.value)) continue;
+        } catch {
+          continue;
+        }
+        if (!checkedRecord.ok) continue;
         for (const connection of connections) {
           if (connection.authorized)
             connection.send({
@@ -223,9 +231,12 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
   };
 
   const server: HostBridgeServer = {
-    token,
+    get token() {
+      return token;
+    },
     accept(connection) {
       if (
+        closed ||
         !connection.loopback ||
         !origins.has(connection.origin) ||
         connections.size >= maxConnections
@@ -240,7 +251,12 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
         handshakeTimeoutMs,
         requestTimeoutMs,
         origin: connection.origin,
-        onAuthorized() {
+        onAuthorized(clientId: string) {
+          if (seenClientIds.has(clientId)) {
+            serverConnection.close();
+            return;
+          }
+          seenClientIds.add(clientId);
           for (const source of sessions.values()) {
             serverConnection.send({ type: "descriptor", descriptor: source.descriptor });
             void consume(source);
@@ -259,7 +275,24 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
             });
             return;
           }
+          if (!serverConnection.canAcceptRequest()) {
+            serverConnection.send({
+              type: "response",
+              requestId: message.requestId,
+              result: {
+                ok: false,
+                error: {
+                  code: "overflow",
+                  message: "HostBridge request queue is full",
+                  retryable: true,
+                },
+              },
+            });
+            return;
+          }
+          serverConnection.requestStarted();
           void routeRequest(source, message.request, requestTimeoutMs).then((result) => {
+            serverConnection.requestFinished();
             serverConnection.send({ type: "response", requestId: message.requestId, result });
           });
         },
@@ -268,23 +301,36 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
       serverConnection.start();
     },
     async attach(source) {
-      const checked = validateRuntimeDescriptor(source.descriptor);
+      if (closed) throw new Error("HostBridge server is closed");
+      let checked: Result<RuntimeDescriptor>;
+      try {
+        checked = validateRuntimeDescriptor(source.descriptor);
+      } catch {
+        throw new Error("Runtime descriptor is malformed");
+      }
       if (!checked.ok) throw new Error(checked.error.message);
-      if (!safeBridgeValue(source.descriptor))
+      if (!safeBridgeValue(checked.value))
         throw new Error("Runtime descriptor contains denied HostBridge fields");
-      if (sessions.has(source.descriptor.sessionId))
+      const normalizedSource: HostBridgeSessionSource = { ...source, descriptor: checked.value };
+      if (sessions.has(checked.value.sessionId))
         throw new Error("Runtime Session is already attached");
-      sessions.set(source.descriptor.sessionId, source);
+      sessions.set(checked.value.sessionId, normalizedSource);
       for (const connection of connections) {
         if (!connection.authorized) continue;
-        connection.send({ type: "descriptor", descriptor: source.descriptor });
-        void consume(source);
+        connection.send({ type: "descriptor", descriptor: checked.value });
+        void consume(normalizedSource);
       }
     },
     connections: () => connections.size,
     close() {
+      if (closed) return;
+      closed = true;
+      token = "";
       for (const connection of [...connections]) connection.close();
       connections.clear();
+      sessions.clear();
+      consumers.clear();
+      seenClientIds.clear();
     },
   };
   return server;
@@ -301,9 +347,16 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
   const records = new Set<(record: NoxscopeRecord) => void>();
   const gaps = new Set<(gap: HostBridgeGap) => void>();
   const bufferedRecords = new Map<string, NoxscopeRecord[]>();
+  const bufferedGaps = new Map<string, HostBridgeGap>();
+  let bufferedRecordCount = 0;
+  let bufferedRecordBytes = 0;
   const pending = new Map<
     string,
-    { resolve: (result: Result<unknown>) => void; timer: ReturnType<typeof setTimeout> }
+    {
+      resolve: (result: Result<unknown>) => void;
+      timer: ReturnType<typeof setTimeout>;
+      cleanup: () => void;
+    }
   >();
   const descriptors = new Map<string, RuntimeDescriptor>();
   let welcome: HostBridgeWelcome | undefined;
@@ -366,39 +419,86 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
         return Promise.resolve({ ok: false, error: unavailable("HostBridge client is closed") });
       if (!validRequest(request))
         return Promise.resolve({ ok: false, error: invalid("HostBridge request is malformed") });
+      if (pending.size >= 128)
+        return Promise.resolve({
+          ok: false,
+          error: { code: "overflow", message: "HostBridge request queue is full", retryable: true },
+        });
+      if (requestOptions?.signal?.aborted)
+        return Promise.resolve({ ok: false, error: cancelled("HostBridge request was cancelled") });
+      const timeoutMs = requestOptions?.timeoutMs ?? requestTimeoutMs;
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 86_400_000)
+        return Promise.resolve({
+          ok: false,
+          error: invalid("HostBridge request timeout is invalid"),
+        });
       const requestId = `${launchToken()}-${pending.size}`;
       const message: WireMessage = { type: "request", requestId, sessionId, request };
       return new Promise((resolve) => {
-        const timeoutMs = requestOptions?.timeoutMs ?? requestTimeoutMs;
-        const timer = setTimeout(() => {
+        const finish = (result: Result<unknown>) => {
+          const current = pending.get(requestId);
+          if (current === undefined) return;
+          clearTimeout(current.timer);
+          current.cleanup();
           pending.delete(requestId);
-          resolve({ ok: false, error: timeout("HostBridge request timed out") });
-        }, timeoutMs);
-        pending.set(requestId, { resolve, timer });
-        send(message);
+          resolve(result);
+        };
+        const timer = setTimeout(
+          () => finish({ ok: false, error: timeout("HostBridge request timed out") }),
+          timeoutMs,
+        );
+        const abort = () =>
+          finish({ ok: false, error: cancelled("HostBridge request was cancelled") });
+        const cleanup = () => requestOptions?.signal?.removeEventListener("abort", abort);
+        pending.set(requestId, { resolve: finish, timer, cleanup });
+        if (requestOptions?.signal?.aborted) abort();
+        else requestOptions?.signal?.addEventListener("abort", abort, { once: true });
+        if (pending.has(requestId)) send(message);
       });
     },
     onRecord(listener) {
       records.add(listener);
       for (const [sessionId, queued] of bufferedRecords) {
-        for (const record of queued) listener(record);
+        for (const record of queued) {
+          listener(record);
+          bufferedRecordCount -= 1;
+          bufferedRecordBytes -= byteLength(JSON.stringify(record));
+        }
         bufferedRecords.delete(sessionId);
       }
       return () => records.delete(listener);
     },
     onGap(listener) {
       gaps.add(listener);
+      for (const [key, gap] of bufferedGaps) {
+        listener(gap);
+        bufferedGaps.delete(key);
+      }
       return () => gaps.delete(listener);
     },
   };
   return client;
 
   function send(message: WireMessage): void {
-    if (!safeWireMessage(message) || byteLength(JSON.stringify(message)) > maxMessageBytes) {
+    let json: string;
+    try {
+      if (
+        !safeWireMessage(message) ||
+        !validWireEnvelope(message as unknown as Record<string, unknown>)
+      ) {
+        void client.close();
+        return;
+      }
+      json = JSON.stringify(message);
+    } catch {
       void client.close();
       return;
     }
-    options.connection.send(JSON.stringify(message));
+    if (byteLength(json) > maxMessageBytes) {
+      void client.close();
+      return;
+    }
+    options.connection.send(json);
   }
   function onMessage(data: string): void {
     if (closed || byteLength(data) > maxMessageBytes) {
@@ -445,28 +545,43 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
       }
       const immutable = deepFreezeCopy(checked.value);
       if (records.size === 0) {
+        const size = byteLength(JSON.stringify(immutable));
+        if (bufferedRecordCount >= 1024 || bufferedRecordBytes + size > 8 * 1024 * 1024) {
+          addBufferedGap({
+            sessionId: message.sessionId,
+            sourceStreamId: immutable.meta.streamId,
+            firstLostSequence: immutable.meta.sequence,
+            lastLostSequence: immutable.meta.sequence,
+          });
+          return;
+        }
         const queued = bufferedRecords.get(message.sessionId) ?? [];
         queued.push(immutable);
         bufferedRecords.set(message.sessionId, queued);
+        bufferedRecordCount += 1;
+        bufferedRecordBytes += size;
       } else {
         for (const listener of records) listener(immutable);
       }
     } else if (message.type === "gap") {
+      if (!descriptors.has(message.sessionId)) {
+        void client.close();
+        return;
+      }
       const gap = {
         sessionId: message.sessionId,
         sourceStreamId: message.sourceStreamId,
         firstLostSequence: message.firstLostSequence,
         lastLostSequence: message.lastLostSequence,
       };
-      for (const listener of gaps) listener(gap);
+      if (gaps.size === 0) addBufferedGap(gap);
+      else for (const listener of gaps) listener(gap);
     } else if (message.type === "response") {
       const request = pending.get(message.requestId);
       if (request === undefined || !safeBridgeValue(message.result)) {
         void client.close();
         return;
       }
-      pending.delete(message.requestId);
-      clearTimeout(request.timer);
       request.resolve(message.result);
     } else {
       void client.close();
@@ -475,12 +590,25 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
   function onClose(): void {
     closed = true;
     for (const request of pending.values()) {
-      clearTimeout(request.timer);
       request.resolve({ ok: false, error: unavailable("HostBridge disconnected") });
     }
     pending.clear();
     descriptorWaiter?.({ ok: false, error: unavailable("HostBridge disconnected") });
     descriptorWaiter = undefined;
+  }
+  function addBufferedGap(gap: HostBridgeGap): void {
+    const key = `${gap.sessionId}\u0000${gap.sourceStreamId}`;
+    const existing = bufferedGaps.get(key);
+    if (existing === undefined) {
+      if (bufferedGaps.size >= 128) {
+        void client.close();
+        return;
+      }
+      bufferedGaps.set(key, gap);
+      return;
+    }
+    if (BigInt(gap.lastLostSequence) > BigInt(existing.lastLostSequence))
+      bufferedGaps.set(key, { ...existing, lastLostSequence: gap.lastLostSequence });
   }
 }
 
@@ -513,12 +641,13 @@ export const createRemoteSessionAdapter = createHostBridgeRemoteAdapter;
 class RemoteRuntimeSession implements RuntimeSession {
   readonly descriptor: RuntimeDescriptor;
   readonly #client: HostBridgeClient;
-  readonly #queue = new RemoteQueue();
+  readonly #queue: RemoteQueue;
   readonly #removeRecord: () => void;
   readonly #removeGap: () => void;
   constructor(descriptor: RuntimeDescriptor, client: HostBridgeClient, signal: AbortSignal) {
     this.descriptor = deepFreezeCopy(descriptor);
     this.#client = client;
+    this.#queue = new RemoteQueue(descriptor);
     this.#removeRecord = client.onRecord((record) => {
       if (record.meta.sessionId === descriptor.sessionId) this.#queue.push(record);
     });
@@ -559,7 +688,7 @@ class ServerConnection {
     readonly handshakeTimeoutMs: number;
     readonly requestTimeoutMs: number;
     readonly origin: string;
-    readonly onAuthorized: () => void;
+    readonly onAuthorized: (clientId: string) => void;
     readonly onClose: () => void;
     readonly onRequest: (message: Extract<WireMessage, { type: "request" }>) => void;
   };
@@ -568,6 +697,9 @@ class ServerConnection {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #authorized = false;
   #messageCount = 0;
+  #pendingRequests = 0;
+  #closed = false;
+  readonly #pendingGaps = new Map<string, HostBridgeGap>();
   constructor(
     connection: HostBridgeConnection,
     config: {
@@ -577,7 +709,7 @@ class ServerConnection {
       readonly handshakeTimeoutMs: number;
       readonly requestTimeoutMs: number;
       readonly origin: string;
-      readonly onAuthorized: () => void;
+      readonly onAuthorized: (clientId: string) => void;
       readonly onClose: () => void;
       readonly onRequest: (message: Extract<WireMessage, { type: "request" }>) => void;
     },
@@ -590,38 +722,103 @@ class ServerConnection {
   get authorized(): boolean {
     return this.#authorized;
   }
+  canAcceptRequest(): boolean {
+    return !this.#closed && this.#pendingRequests < 128;
+  }
+  requestStarted(): void {
+    this.#pendingRequests += 1;
+  }
+  requestFinished(): void {
+    this.#pendingRequests = Math.max(0, this.#pendingRequests - 1);
+  }
   start(): void {
     this.#timer = setTimeout(() => {
       if (!this.#authorized) this.close();
     }, this.#config.handshakeTimeoutMs);
   }
   send(message: WireMessage): void {
+    if (this.#closed) return;
     if (!this.#authorized && message.type !== "welcome") return;
-    const json = JSON.stringify(message);
+    let json: string;
+    try {
+      if (
+        !safeWireMessage(message) ||
+        !validWireEnvelope(message as unknown as Record<string, unknown>)
+      ) {
+        this.close();
+        return;
+      }
+      json = JSON.stringify(message);
+    } catch {
+      this.close();
+      return;
+    }
     if (byteLength(json) > this.#config.maxMessageBytes) {
       this.close();
       return;
     }
+    if (message.type === "record") {
+      if (!this.#flushGaps()) {
+        this.#queueGap(
+          message.sessionId,
+          message.record.meta.streamId,
+          message.record.meta.sequence,
+        );
+        return;
+      }
+      if (!this.#trySend(json)) {
+        this.#queueGap(
+          message.sessionId,
+          message.record.meta.streamId,
+          message.record.meta.sequence,
+        );
+      }
+      return;
+    }
+    if (!this.#flushGaps() || !this.#trySend(json)) this.close();
+  }
+  #trySend(json: string): boolean {
     const buffered = this.#connection.bufferedAmount ?? 0;
     if (
       buffered > this.#config.maxBufferedBytes ||
       buffered + byteLength(json) > this.#config.maxBufferedBytes
-    ) {
-      if (message.type === "record")
-        this.#connection.send(
-          JSON.stringify({
-            type: "gap",
-            sessionId: message.sessionId,
-            sourceStreamId: message.record.meta.streamId,
-            firstLostSequence: message.record.meta.sequence,
-            lastLostSequence: message.record.meta.sequence,
-          } satisfies WireMessage),
-        );
+    )
+      return false;
+    this.#connection.send(json);
+    return true;
+  }
+  #queueGap(sessionId: string, sourceStreamId: string, sequence: string): void {
+    const key = `${sessionId}\u0000${sourceStreamId}`;
+    const existing = this.#pendingGaps.get(key);
+    if (existing !== undefined) {
+      if (BigInt(sequence) > BigInt(existing.lastLostSequence))
+        this.#pendingGaps.set(key, { ...existing, lastLostSequence: sequence });
       return;
     }
-    this.#connection.send(json);
+    if (this.#pendingGaps.size >= 128) {
+      this.close();
+      return;
+    }
+    this.#pendingGaps.set(key, {
+      sessionId,
+      sourceStreamId,
+      firstLostSequence: sequence,
+      lastLostSequence: sequence,
+    });
+  }
+  #flushGaps(): boolean {
+    for (const [key, gap] of this.#pendingGaps) {
+      const message: WireMessage = { type: "gap", ...gap };
+      const json = JSON.stringify(message);
+      if (!this.#trySend(json)) return false;
+      this.#pendingGaps.delete(key);
+    }
+    return true;
   }
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#authorized = false;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#removeMessage();
     this.#removeClose();
@@ -647,7 +844,7 @@ class ServerConnection {
       if (
         message.type !== "hello" ||
         message.protocol !== HOSTBRIDGE_PROTOCOL ||
-        message.token !== this.#config.token ||
+        !constantTimeEqual(message.token, this.#config.token) ||
         !nonEmpty(message.clientId) ||
         !safeWireMessage(message)
       ) {
@@ -662,7 +859,7 @@ class ServerConnection {
         version: HOSTBRIDGE_VERSION,
         capabilities: CAPABILITIES,
       });
-      this.#config.onAuthorized();
+      this.#config.onAuthorized(message.clientId);
       return;
     }
     if (message.type === "request") {
@@ -735,6 +932,7 @@ export class HostBridgeMemoryConnection implements HostBridgeConnection {
 function parseWire(data: string): Result<WireMessage> {
   let value: unknown;
   try {
+    if (hasDuplicateJsonKeys(data)) throw new Error("duplicate");
     value = JSON.parse(data) as unknown;
   } catch {
     return { ok: false, error: invalid("HostBridge message is malformed") };
@@ -747,7 +945,186 @@ function parseWire(data: string): Result<WireMessage> {
     !HOSTBRIDGE_DENY_MANIFEST.allowedMessageTypes.includes(value.type)
   )
     return { ok: false, error: invalid("HostBridge message is not admitted") };
+  if (!validWireEnvelope(value))
+    return { ok: false, error: invalid("HostBridge envelope is malformed") };
   return { ok: true, value: value as WireMessage };
+}
+
+function hasDuplicateJsonKeys(json: string): boolean {
+  let index = 0;
+  let duplicate = false;
+  const whitespace = () => {
+    while (/\s/u.test(json[index] ?? "")) index += 1;
+  };
+  const string = (): string | undefined => {
+    if (json[index] !== '"') return undefined;
+    const start = index;
+    index += 1;
+    while (index < json.length) {
+      const character = json[index++];
+      if (character === "\\") {
+        if (index >= json.length) return undefined;
+        index += json[index] === "u" ? 5 : 1;
+        continue;
+      }
+      if (character === '"') {
+        try {
+          return JSON.parse(json.slice(start, index)) as string;
+        } catch {
+          return undefined;
+        }
+      }
+      if (character !== undefined && character < " ") return undefined;
+    }
+    return undefined;
+  };
+  const value = (): boolean => {
+    whitespace();
+    const character = json[index];
+    if (character === "{") {
+      index += 1;
+      whitespace();
+      const keys = new Set<string>();
+      if (json[index] === "}") {
+        index += 1;
+        return true;
+      }
+      while (index < json.length) {
+        const key = string();
+        if (key === undefined) return false;
+        if (keys.has(key)) {
+          duplicate = true;
+          return false;
+        }
+        keys.add(key);
+        whitespace();
+        if (json[index++] !== ":" || !value()) return false;
+        whitespace();
+        if (json[index] === "}") {
+          index += 1;
+          return true;
+        }
+        if (json[index++] !== ",") return false;
+        whitespace();
+      }
+      return false;
+    }
+    if (character === "[") {
+      index += 1;
+      whitespace();
+      if (json[index] === "]") {
+        index += 1;
+        return true;
+      }
+      while (index < json.length) {
+        if (!value()) return false;
+        whitespace();
+        if (json[index] === "]") {
+          index += 1;
+          return true;
+        }
+        if (json[index++] !== ",") return false;
+        whitespace();
+      }
+      return false;
+    }
+    if (character === '"') return string() !== undefined;
+    const literal = json
+      .slice(index)
+      .match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/u)?.[0];
+    if (literal === undefined) return false;
+    index += literal.length;
+    return true;
+  };
+  if (!value()) return duplicate;
+  whitespace();
+  return duplicate;
+}
+
+function validWireEnvelope(value: Record<string, unknown>): boolean {
+  switch (value.type) {
+    case "hello":
+      return (
+        value.protocol === HOSTBRIDGE_PROTOCOL &&
+        typeof value.token === "string" &&
+        byteLength(value.token) <= 256 &&
+        nonEmpty(value.clientId) &&
+        byteLength(value.clientId) <= 256 &&
+        (value.capabilities === undefined ||
+          (Array.isArray(value.capabilities) && value.capabilities.every(nonEmpty)))
+      );
+    case "welcome":
+      return (
+        value.protocol === HOSTBRIDGE_PROTOCOL &&
+        nonEmpty(value.version) &&
+        Array.isArray(value.capabilities) &&
+        value.capabilities.every(nonEmpty)
+      );
+    case "descriptor":
+      return validateRuntimeDescriptor(value.descriptor).ok;
+    case "record":
+      return (
+        nonEmpty(value.sessionId) &&
+        validateRecord(value.record).ok &&
+        (value.record as { meta?: { sessionId?: unknown } }).meta?.sessionId === value.sessionId
+      );
+    case "gap":
+      return (
+        nonEmpty(value.sessionId) &&
+        nonEmpty(value.sourceStreamId) &&
+        decimal(value.firstLostSequence) &&
+        decimal(value.lastLostSequence) &&
+        BigInt(value.firstLostSequence) <= BigInt(value.lastLostSequence)
+      );
+    case "request":
+      return nonEmpty(value.requestId) && nonEmpty(value.sessionId) && validRequest(value.request);
+    case "response":
+      return nonEmpty(value.requestId) && validResultEnvelope(value.result);
+    case "close":
+      return typeof value.reason === "string";
+    default:
+      return false;
+  }
+}
+
+function validResultEnvelope(value: unknown): value is Result<unknown> {
+  if (!isRecord(value) || typeof value.ok !== "boolean") return false;
+  const hasValue = Object.prototype.hasOwnProperty.call(value, "value");
+  const hasError = Object.prototype.hasOwnProperty.call(value, "error");
+  if (hasValue === hasError) return false;
+  if (value.ok) return hasValue && safeBridgeValue(value.value);
+  return hasError && isNoxscopeError(value.error);
+}
+
+function isNoxscopeError(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    ![
+      "unsupported",
+      "unavailable",
+      "incompatible",
+      "unauthorized",
+      "timeout",
+      "cancelled",
+      "invalid",
+      "rejected",
+      "failed",
+      "protocol",
+      "overflow",
+      "internal",
+    ].includes(value.code as string) ||
+    typeof value.message !== "string" ||
+    typeof value.retryable !== "boolean"
+  )
+    return false;
+  return (
+    (value.retryAfterMs === undefined ||
+      (typeof value.retryAfterMs === "number" &&
+        Number.isFinite(value.retryAfterMs) &&
+        value.retryAfterMs >= 0)) &&
+    (value.capability === undefined || nonEmpty(value.capability)) &&
+    (value.raw === undefined || (Array.isArray(value.raw) && safeBridgeValue(value.raw)))
+  );
 }
 
 function safeWireMessage(value: unknown): boolean {
@@ -780,23 +1157,33 @@ async function routeRequest(
   request: SnapshotRequest | InvokeRequest | CancelRequest,
   timeoutMs: number,
 ): Promise<Result<unknown>> {
-  try {
-    const result = await Promise.race([
-      source.request(request as never),
-      new Promise<Result<never>>((resolve) =>
-        setTimeout(
-          () => resolve({ ok: false, error: timeout("HostBridge request timed out") }),
-          timeoutMs,
-        ),
-      ),
-    ]);
-    return result;
-  } catch {
-    return {
-      ok: false,
-      error: { code: "failed", message: "HostBridge request failed", retryable: true },
-    };
-  }
+  const controller = new AbortController();
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      controller.abort();
+      resolve({ ok: false, error: timeout("HostBridge request timed out") });
+    }, timeoutMs);
+    void Promise.resolve()
+      .then(() => source.request(request as never, { signal: controller.signal }))
+      .then((result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          ok: false,
+          error: { code: "failed", message: "HostBridge request failed", retryable: true },
+        });
+      });
+  });
 }
 
 function makeGapRecord(descriptor: RuntimeDescriptor, gap: HostBridgeGap): NoxscopeRecord {
@@ -822,11 +1209,46 @@ function makeGapRecord(descriptor: RuntimeDescriptor, gap: HostBridgeGap): Noxsc
 }
 
 class RemoteQueue {
+  static readonly MAX_ITEMS = 1_024;
+  static readonly MAX_WAITERS = 128;
+  readonly #descriptor: RuntimeDescriptor;
   readonly #items: NoxscopeRecord[] = [];
   readonly #waiters: ((result: IteratorResult<NoxscopeRecord>) => void)[] = [];
   #closed = false;
+  #pendingGap: HostBridgeGap | undefined;
+  constructor(descriptor: RuntimeDescriptor) {
+    this.#descriptor = descriptor;
+  }
   push(record: NoxscopeRecord): void {
     if (this.#closed) return;
+    if (this.#items.length >= RemoteQueue.MAX_ITEMS) {
+      const existing = this.#pendingGap;
+      this.#pendingGap =
+        existing === undefined
+          ? {
+              sessionId: record.meta.sessionId,
+              sourceStreamId: record.meta.streamId,
+              firstLostSequence: record.meta.sequence,
+              lastLostSequence: record.meta.sequence,
+            }
+          : { ...existing, lastLostSequence: record.meta.sequence };
+      return;
+    }
+    if (this.#pendingGap !== undefined) {
+      const gap = makeGapRecord(this.#descriptor, this.#pendingGap);
+      this.#pendingGap = undefined;
+      if (this.#items.length >= RemoteQueue.MAX_ITEMS) this.#items.shift();
+      this.#items.push(gap);
+      if (this.#items.length >= RemoteQueue.MAX_ITEMS) {
+        this.#pendingGap = {
+          sessionId: record.meta.sessionId,
+          sourceStreamId: record.meta.streamId,
+          firstLostSequence: record.meta.sequence,
+          lastLostSequence: record.meta.sequence,
+        };
+        return;
+      }
+    }
     const waiter = this.#waiters.shift();
     if (waiter) waiter({ done: false, value: record });
     else this.#items.push(record);
@@ -842,9 +1264,17 @@ class RemoteQueue {
         const item = this.#items.shift();
         if (item) return { done: false, value: item };
         if (this.#closed) return { done: true, value: undefined };
+        if (this.#waiters.length >= RemoteQueue.MAX_WAITERS)
+          return { done: true, value: undefined };
         return new Promise((resolve) => this.#waiters.push(resolve));
       },
-      return: async () => ({ done: true, value: undefined }),
+      return: async () => {
+        this.#closed = true;
+        for (const waiter of this.#waiters.splice(0)) waiter({ done: true, value: undefined });
+        this.#items.length = 0;
+        this.#pendingGap = undefined;
+        return { done: true, value: undefined };
+      },
     };
   }
 }
@@ -871,7 +1301,11 @@ function safeBridgeValue(value: unknown): boolean {
       keys.every((key) => !denied.has(normalize(key)) && visit(object[key], depth + 1))
     );
   };
-  return visit(value, 0);
+  try {
+    return visit(value, 0);
+  } catch {
+    return false;
+  }
 }
 
 function deepFreezeCopy<T>(value: T): T {
@@ -889,6 +1323,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+function decimal(value: unknown): value is string {
+  return typeof value === "string" && /^(0|[1-9]\d*)$/u.test(value);
 }
 function normalize(value: string): string {
   return value
@@ -918,6 +1355,18 @@ function launchToken(): string {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function constantTimeEqual(left: string, right: string): boolean {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  const length = Math.max(leftBytes.byteLength, rightBytes.byteLength, 256);
+  let difference = leftBytes.byteLength ^ rightBytes.byteLength;
+  for (let index = 0; index < length; index += 1) {
+    difference |=
+      (leftBytes[index % Math.max(1, leftBytes.byteLength)] ?? 0) ^
+      (rightBytes[index % Math.max(1, rightBytes.byteLength)] ?? 0);
+  }
+  return difference === 0;
 }
 function invalid(message: string): NoxscopeError {
   return { code: "invalid", message, retryable: false };

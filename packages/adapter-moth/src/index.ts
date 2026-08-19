@@ -35,7 +35,7 @@ export interface MothTransport {
   request(
     method: string,
     params?: unknown,
-    options?: { readonly signal?: AbortSignal },
+    options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number },
   ): Promise<Result<unknown>>;
   close(): Promise<void>;
 }
@@ -43,7 +43,7 @@ export interface MothTransport {
 export interface MothTransportFactory {
   connect(
     endpoint: MothEndpoint,
-    options?: { readonly signal?: AbortSignal },
+    options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number },
   ): Promise<Result<MothTransport>>;
 }
 
@@ -117,11 +117,13 @@ export function createMothAdapter(options: MothAdapterOptions): NoxscopeAdapter 
       if (connectOptions.signal.aborted) return cancelled("Moth connection was cancelled");
       const transportResult = await resolved.transportFactory.connect(resolved.endpoint, {
         signal: connectOptions.signal,
+        timeoutMs: resolved.requestTimeoutMs,
       });
       if (!transportResult.ok) return transportResult;
       const transport = transportResult.value;
       const versionResult = await transport.request("version", undefined, {
         signal: connectOptions.signal,
+        timeoutMs: resolved.requestTimeoutMs,
       });
       if (!versionResult.ok) {
         await closeQuietly(transport);
@@ -145,6 +147,7 @@ export function createMothAdapter(options: MothAdapterOptions): NoxscopeAdapter 
       }
       const stateResult = await transport.request("getState", undefined, {
         signal: connectOptions.signal,
+        timeoutMs: resolved.requestTimeoutMs,
       });
       if (!stateResult.ok) {
         await closeQuietly(transport);
@@ -212,11 +215,104 @@ export function decodeMothFrame(frame: Uint8Array): unknown {
   if (frame.byteLength < length + 4) throw new Error("Moth frame is truncated");
   if (frame.byteLength !== length + 4) throw new Error("Moth frame has trailing bytes");
   const json = new TextDecoder("utf-8", { fatal: true }).decode(frame.subarray(4));
+  if (hasDuplicateJsonKeys(json)) throw new Error("Moth frame has duplicate JSON keys");
   try {
     return JSON.parse(json) as unknown;
   } catch {
     throw new Error("Moth frame JSON is malformed");
   }
+}
+
+function hasDuplicateJsonKeys(json: string): boolean {
+  let index = 0;
+  let duplicate = false;
+  const whitespace = () => {
+    while (/\s/u.test(json[index] ?? "")) index += 1;
+  };
+  const string = (): string | undefined => {
+    if (json[index] !== '"') return undefined;
+    const start = index;
+    index += 1;
+    while (index < json.length) {
+      const character = json[index++];
+      if (character === "\\") {
+        if (index >= json.length) return undefined;
+        index += json[index] === "u" ? 5 : 1;
+        continue;
+      }
+      if (character === '"') {
+        try {
+          return JSON.parse(json.slice(start, index)) as string;
+        } catch {
+          return undefined;
+        }
+      }
+      if (character !== undefined && character < " ") return undefined;
+    }
+    return undefined;
+  };
+  const value = (): boolean => {
+    whitespace();
+    const character = json[index];
+    if (character === "{") {
+      index += 1;
+      whitespace();
+      const keys = new Set<string>();
+      if (json[index] === "}") {
+        index += 1;
+        return true;
+      }
+      while (index < json.length) {
+        const key = string();
+        if (key === undefined) return false;
+        if (keys.has(key)) {
+          duplicate = true;
+          return false;
+        }
+        keys.add(key);
+        whitespace();
+        if (json[index++] !== ":") return false;
+        if (!value()) return false;
+        whitespace();
+        if (json[index] === "}") {
+          index += 1;
+          return true;
+        }
+        if (json[index++] !== ",") return false;
+        whitespace();
+      }
+      return false;
+    }
+    if (character === "[") {
+      index += 1;
+      whitespace();
+      if (json[index] === "]") {
+        index += 1;
+        return true;
+      }
+      while (index < json.length) {
+        if (!value()) return false;
+        whitespace();
+        if (json[index] === "]") {
+          index += 1;
+          return true;
+        }
+        if (json[index++] !== ",") return false;
+        whitespace();
+      }
+      return false;
+    }
+    if (character === '"') return string() !== undefined;
+    const literal = json
+      .slice(index)
+      .match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/u)?.[0];
+    if (literal === undefined) return false;
+    index += literal.length;
+    return true;
+  };
+  if (!value()) return duplicate;
+  whitespace();
+  return duplicate;
 }
 
 /** Creates the production Node socket Adapter used by the Node Host. */
@@ -243,9 +339,20 @@ export function createMothNodeTransportFactory(): MothTransportFactory {
           },
         };
       }
-      const socketResult = await openSocket(endpoint, options.signal);
+      const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_POLLING_INTERVAL_MS) {
+        return {
+          ok: false,
+          error: {
+            code: "invalid",
+            message: "Moth connection timeout is invalid",
+            retryable: false,
+          },
+        };
+      }
+      const socketResult = await openSocket(endpoint, options.signal, timeoutMs);
       if (!socketResult.ok) return socketResult;
-      return { ok: true, value: new NodeMothTransport(socketResult.value, endpoint) };
+      return { ok: true, value: new NodeMothTransport(socketResult.value, endpoint, timeoutMs) };
     },
   };
 }
@@ -377,7 +484,10 @@ class MothRuntimeSession implements RuntimeSession {
   }
 
   async #fetchSnapshot(signal?: AbortSignal): Promise<Result<Snapshot>> {
-    const requestOptions = signal === undefined ? {} : { signal };
+    const requestOptions = {
+      ...(signal === undefined ? {} : { signal }),
+      timeoutMs: this.#options.requestTimeoutMs,
+    };
     const result = await this.#transport.request("getState", undefined, requestOptions);
     if (!result.ok) {
       this.#consecutiveFailures += 1;
@@ -463,7 +573,7 @@ function descriptorFor(
   ] as const;
   return {
     protocol: NOXSCOPE_PROTOCOL,
-    sessionId: makeId("moth-session"),
+    sessionId,
     runtimeId,
     adapter: { id: MOTH_ADAPTER_ID, version: MOTH_ADAPTER_VERSION },
     runtime: {
@@ -900,20 +1010,32 @@ async function closeQuietly(transport: MothTransport): Promise<void> {
 }
 
 class RecordQueue {
+  static readonly MAX_ITEMS = 1_024;
+  static readonly MAX_WAITERS = 128;
   readonly #items: NoxscopeRecord[] = [];
   readonly #waiters: ((result: IteratorResult<NoxscopeRecord>) => void)[] = [];
+  readonly #gaps = new Map<
+    string,
+    { readonly meta: NoxscopeRecord["meta"]; firstLostSequence: string; lastLostSequence: string }
+  >();
+  #gapSequence = 0;
   #closed = false;
   push(item: NoxscopeRecord): void {
     const checked = validateRecord(item);
     if (!checked.ok || this.#closed) return;
     const waiter = this.#waiters.shift();
     if (waiter) waiter({ done: false, value: checked.value });
-    else this.#items.push(checked.value);
+    else if (this.#items.length < RecordQueue.MAX_ITEMS) {
+      this.#flushGaps();
+      if (this.#items.length < RecordQueue.MAX_ITEMS) this.#items.push(checked.value);
+      else this.#rememberGap(checked.value);
+    } else this.#rememberGap(checked.value);
   }
   close(): void {
     this.#closed = true;
     for (const waiter of this.#waiters.splice(0)) waiter({ done: true, value: undefined });
     this.#items.length = 0;
+    this.#gaps.clear();
   }
   iterator(): AsyncIterator<NoxscopeRecord> {
     let returned = false;
@@ -923,6 +1045,10 @@ class RecordQueue {
         const item = this.#items.shift();
         if (item) return { done: false, value: item };
         if (this.#closed) {
+          returned = true;
+          return { done: true, value: undefined };
+        }
+        if (this.#waiters.length >= RecordQueue.MAX_WAITERS) {
           returned = true;
           return { done: true, value: undefined };
         }
@@ -936,18 +1062,71 @@ class RecordQueue {
       },
     };
   }
+  #rememberGap(record: NoxscopeRecord): void {
+    const current = this.#gaps.get(record.meta.streamId);
+    if (current === undefined) {
+      if (this.#gaps.size >= 128) return;
+      this.#gaps.set(record.meta.streamId, {
+        meta: record.meta,
+        firstLostSequence: record.meta.sequence,
+        lastLostSequence: record.meta.sequence,
+      });
+      return;
+    }
+    if (BigInt(record.meta.sequence) > BigInt(current.lastLostSequence))
+      current.lastLostSequence = record.meta.sequence;
+  }
+  #flushGaps(): void {
+    for (const [streamId, gap] of this.#gaps) {
+      if (this.#items.length >= RecordQueue.MAX_ITEMS) return;
+      this.#items.push({
+        kind: "diagnostic-event",
+        meta: {
+          protocol: gap.meta.protocol,
+          sessionId: gap.meta.sessionId,
+          runtimeId: gap.meta.runtimeId,
+          streamId: `${gap.meta.sessionId}-diagnostics`,
+          sequence: (++this.#gapSequence).toString(),
+          observedAt: gap.meta.observedAt,
+          receivedAt: gap.meta.receivedAt,
+        },
+        event: {
+          type: "stream-gap",
+          sourceStreamId: streamId,
+          firstLostSequence: gap.firstLostSequence,
+          lastLostSequence: gap.lastLostSequence,
+          reason: "overflow",
+        },
+      });
+      this.#gaps.delete(streamId);
+    }
+  }
 }
 
-async function openSocket(endpoint: MothEndpoint, signal?: AbortSignal): Promise<Result<Socket>> {
+async function openSocket(
+  endpoint: MothEndpoint,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<Result<Socket>> {
   return new Promise((resolve) => {
     const socket =
       endpoint.kind === "unix"
         ? createConnection(endpoint.path)
         : createConnection({ host: endpoint.host, port: endpoint.port });
     let settled = false;
+    let abort: (() => void) | undefined;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      finish({
+        ok: false,
+        error: { code: "timeout", message: "Moth daemon connection timed out", retryable: true },
+      });
+    }, timeoutMs);
     const finish = (result: Result<Socket>) => {
       if (!settled) {
         settled = true;
+        clearTimeout(timer);
+        if (abort !== undefined) signal?.removeEventListener("abort", abort);
         resolve(result);
       }
     };
@@ -963,7 +1142,7 @@ async function openSocket(endpoint: MothEndpoint, signal?: AbortSignal): Promise
       }),
     );
     if (signal) {
-      const abort = () => {
+      abort = () => {
         socket.destroy();
         finish(cancelled("Moth socket connection was cancelled"));
       };
@@ -979,32 +1158,54 @@ class NodeMothTransport implements MothTransport {
   #nextId = 0;
   readonly #pending = new Map<
     string,
-    { resolve: (result: Result<unknown>) => void; timer: ReturnType<typeof setTimeout> }
+    {
+      resolve: (result: Result<unknown>) => void;
+      timer: ReturnType<typeof setTimeout>;
+      cleanup: () => void;
+    }
   >();
+  readonly #requestTimeoutMs: number;
   #buffer = new Uint8Array(0);
   #closed = false;
-  constructor(socket: Socket, endpoint: MothEndpoint) {
+  constructor(socket: Socket, endpoint: MothEndpoint, requestTimeoutMs: number) {
     this.#socket = socket;
     this.#endpoint = endpoint;
+    this.#requestTimeoutMs = requestTimeoutMs;
     socket.on("data", (chunk: Buffer) => this.#onData(new Uint8Array(chunk)));
-    socket.on("close", () =>
-      this.#failAll({ code: "unavailable", message: "Moth daemon socket closed", retryable: true }),
-    );
-    socket.on("error", () =>
-      this.#failAll({ code: "unavailable", message: "Moth daemon socket failed", retryable: true }),
-    );
+    socket.on("close", () => {
+      this.#closed = true;
+      this.#failAll({ code: "unavailable", message: "Moth daemon socket closed", retryable: true });
+    });
+    socket.on("error", () => {
+      this.#closed = true;
+      this.#failAll({ code: "unavailable", message: "Moth daemon socket failed", retryable: true });
+    });
   }
   request(
     method: string,
     params?: unknown,
-    options: { readonly signal?: AbortSignal } = {},
+    options: { readonly signal?: AbortSignal; readonly timeoutMs?: number } = {},
   ): Promise<Result<unknown>> {
+    if (options.signal?.aborted)
+      return Promise.resolve(cancelled("Moth daemon request was cancelled"));
     if (this.#closed)
       return Promise.resolve({
         ok: false,
         error: { code: "unavailable", message: "Moth daemon transport is closed", retryable: true },
       });
     const id = `${++this.#nextId}`;
+    if (this.#pending.size >= 128) {
+      return Promise.resolve({
+        ok: false,
+        error: { code: "overflow", message: "Moth request queue is full", retryable: true },
+      });
+    }
+    const timeoutMs = options.timeoutMs ?? this.#requestTimeoutMs;
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_POLLING_INTERVAL_MS)
+      return Promise.resolve({
+        ok: false,
+        error: { code: "invalid", message: "Moth request timeout is invalid", retryable: false },
+      });
     const wireParams =
       this.#endpoint.kind === "tcp"
         ? {
@@ -1012,26 +1213,41 @@ class NodeMothTransport implements MothTransport {
             authorization: { token: this.#endpoint.token, scope: "read" },
           }
         : params;
-    const frame = encodeMothFrame({
-      id,
-      type: "request",
-      method,
-      ...(wireParams === undefined ? {} : { params: wireParams }),
-    });
+    let frame: Uint8Array;
+    try {
+      frame = encodeMothFrame({
+        id,
+        type: "request",
+        method,
+        ...(wireParams === undefined ? {} : { params: wireParams }),
+      });
+    } catch {
+      return Promise.resolve({
+        ok: false,
+        error: { code: "invalid", message: "Moth request is not serializable", retryable: false },
+      });
+    }
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
+      const finish = (result: Result<unknown>) => {
+        const pending = this.#pending.get(id);
+        if (pending === undefined) return;
+        clearTimeout(pending.timer);
+        pending.cleanup();
         this.#pending.delete(id);
-        resolve({
+        resolve(result);
+      };
+      const timer = setTimeout(() => {
+        finish({
           ok: false,
           error: { code: "timeout", message: "Moth daemon request timed out", retryable: true },
         });
-      }, DEFAULT_REQUEST_TIMEOUT_MS);
-      this.#pending.set(id, { resolve, timer });
+      }, timeoutMs);
+      const abort = () => finish(cancelled("Moth daemon request was cancelled"));
+      const cleanup = () => options.signal?.removeEventListener("abort", abort);
+      this.#pending.set(id, { resolve: finish, timer, cleanup });
       this.#socket.write(frame, (error) => {
         if (error) {
-          clearTimeout(timer);
-          this.#pending.delete(id);
-          resolve({
+          finish({
             ok: false,
             error: {
               code: "unavailable",
@@ -1043,13 +1259,6 @@ class NodeMothTransport implements MothTransport {
       });
       const signal = options.signal;
       if (signal) {
-        const abort = () => {
-          const pending = this.#pending.get(id);
-          if (!pending) return;
-          clearTimeout(pending.timer);
-          this.#pending.delete(id);
-          resolve(cancelled("Moth daemon request was cancelled"));
-        };
         if (signal.aborted) abort();
         else signal.addEventListener("abort", abort, { once: true });
       }
@@ -1095,8 +1304,6 @@ class NodeMothTransport implements MothTransport {
         void this.close();
         return;
       }
-      this.#pending.delete(value.id);
-      clearTimeout(pending.timer);
       const hasResult = Object.prototype.hasOwnProperty.call(value, "result");
       const hasError = Object.prototype.hasOwnProperty.call(value, "error");
       if (hasResult === hasError) {
@@ -1108,10 +1315,8 @@ class NodeMothTransport implements MothTransport {
     }
   }
   #failAll(error: NoxscopeError): void {
-    for (const [id, pending] of this.#pending) {
-      clearTimeout(pending.timer);
+    for (const pending of this.#pending.values()) {
       pending.resolve({ ok: false, error });
-      this.#pending.delete(id);
     }
   }
 }
