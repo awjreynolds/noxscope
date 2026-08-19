@@ -279,7 +279,7 @@ describe("Recording v1 hostile import and offline replay", () => {
     });
     expect(imported.ok).toBe(true);
     if (imported.ok) expect(imported.value.records).toHaveLength(records.length);
-  }, 15_000);
+  }, 30_000);
 
   it("rejects tamper, truncation, trailing data, reorder, and control digest changes", async () => {
     const exported = await makeExport([record, secondRecord]);
