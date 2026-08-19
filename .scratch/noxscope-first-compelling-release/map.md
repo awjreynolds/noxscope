@@ -32,6 +32,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - [Build central sanitizer and portable Recordings](./issues/11-build-central-sanitizer-and-recordings.md) — Enforce one reviewed deny-by-default policy at every trust transition, encode bounded provenance- and integrity-bearing Recording v1 files, and keep browser persistence/export/import plus immutable offline replay entirely local and operation-free.
 - [Integrate GSD through the canonical Adapter](./issues/12-integrate-gsd-through-the-canonical-adapter.md) — Observe the audited GSD worker/GSD Connect boundary through a versioned read-only Adapter, apply its deny manifest before bounded queueing, and keep native continuity separate from canonical backpressure evidence.
 - [Integrate Moth and the Node HostBridge](./issues/13-integrate-moth-and-the-node-hostbridge.md) — Poll only the audited Moth daemon state contract and carry exact canonical records through an authenticated, replay-resistant, loopback-only, strictly bounded HostBridge with honest unsupported capabilities.
+- [Build the first-release observability workbench](./issues/15-build-the-first-release-workbench.md) — Use one collision-safe canonical split-pane inspector for simultaneous live and offline runtimes, combining bounded temporal search, capability/freshness evidence, correlated operations, DUST and failure diagnostics, and local Recording controls.
 
 ## Not yet specified
 
