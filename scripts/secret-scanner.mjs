@@ -209,6 +209,8 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "stack-canary",
   "third-secret-canary",
   "token",
+  "t",
+  "x",
   "transaction-canary",
   "signed-private-transaction",
   "signed-private-payload",
@@ -403,6 +405,14 @@ const MAX_STRUCTURED_BYTES = 16 * 1024;
 const MAX_STRUCTURED_DEPTH = 32;
 const MAX_STRUCTURED_NODES = 4096;
 const STRUCTURED_SECRET_KEYS = new Set([...SECRET_KEYS, "token"]);
+const STRUCTURED_KEY_CANDIDATE = new RegExp(
+  `(?:^|[,\\{])\\s*["']?(${[...STRUCTURED_SECRET_KEYS].join("|")})["']?\\s*:`,
+  "giu",
+);
+const MALFORMED_STRUCTURED_KEY = new RegExp(
+  `["'](?:${[...STRUCTURED_SECRET_KEYS].join("|")})["']\\s*:`,
+  "giu",
+);
 
 function skipWhitespace(text, index) {
   while (index < text.length && /\s/u.test(text[index])) index += 1;
@@ -522,6 +532,109 @@ function scanStructuredNode(node, canaryPath, allowValue = false) {
   return [];
 }
 
+function repairStructuredLiteral(text, start) {
+  const stack = [];
+  let quote;
+  let escaped = false;
+  for (let index = start; index < text.length && index < start + MAX_STRUCTURED_BYTES; index += 1) {
+    const character = text[index];
+    if (quote !== undefined) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+    } else if (character === "{") {
+      stack.push("}");
+    } else if (character === "[") {
+      stack.push("]");
+    } else if (character === "}" || character === "]") {
+      if (character !== stack.at(-1)) return undefined;
+      stack.pop();
+      if (stack.length === 0)
+        return { text: text.slice(start, index + 1), end: index + 1, complete: true };
+    }
+  }
+  if (quote !== undefined || stack.length === 0) return undefined;
+  return { text: text.slice(start) + stack.reverse().join(""), end: text.length, complete: false };
+}
+
+function scanMalformedStructured(text, start) {
+  const repaired = repairStructuredLiteral(text, start);
+  if (repaired !== undefined) {
+    const parsed = parseStructuredLiteral(repaired.text);
+    if (parsed?.node.type === "object") return scanStructuredNode(parsed.node, false);
+  }
+  const remainder = text.slice(start, start + MAX_STRUCTURED_BYTES);
+  for (const match of remainder.matchAll(MALFORMED_STRUCTURED_KEY)) {
+    const valueStart = skipWhitespace(remainder, (match.index ?? 0) + match[0].length);
+    if (
+      remainder[valueStart] === '"' ||
+      remainder[valueStart] === "'" ||
+      remainder[valueStart] === "`"
+    )
+      return ["assignment malformed structured secret"];
+  }
+  return [];
+}
+
+function scanLargeStructuredCandidates(text, canaryPath, depth = 0) {
+  if (depth > MAX_STRUCTURED_DEPTH) return ["structured scanner depth exceeded"];
+  const findings = [];
+  for (const match of text.matchAll(STRUCTURED_KEY_CANDIDATE)) {
+    const valueStart = skipWhitespace(text, (match.index ?? 0) + match[0].length);
+    const first = text[valueStart];
+    if (first === '"' || first === "'" || first === "`") {
+      let escaped = false;
+      let end = valueStart + 1;
+      for (; end < text.length && end < valueStart + MAX_STRUCTURED_BYTES; end += 1) {
+        const character = text[end];
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === first) break;
+      }
+      if (end >= text.length || text[end] !== first) {
+        findings.push("assignment malformed structured secret");
+      } else if (!canaryPath || !syntheticValue(text.slice(valueStart + 1, end))) {
+        findings.push("assignment structured secret");
+      }
+      continue;
+    }
+    if (first === "{" || first === "[") {
+      const parsed = parseStructuredLiteral(
+        text.slice(valueStart, valueStart + MAX_STRUCTURED_BYTES),
+      );
+      if (parsed?.node.type === "object" || parsed?.node.type === "array") {
+        findings.push(
+          ...scanStructuredNode(
+            parsed.node,
+            canaryPath,
+            STRUCTURED_SECRET_KEYS.has(normalize(match[1])),
+          ),
+        );
+      } else if (depth < MAX_STRUCTURED_DEPTH) {
+        findings.push(
+          ...scanLargeStructuredCandidates(text.slice(valueStart + 1), canaryPath, depth + 1),
+        );
+      }
+      continue;
+    }
+    let end = valueStart;
+    while (end < text.length && !/[\s"'`,;}\]]/u.test(text[end])) end += 1;
+    const value = text.slice(valueStart, end);
+    if (
+      value.length === 0 ||
+      (!CODE_REFERENCE.test(value) &&
+        !CODE_PLACEHOLDERS.has(value.toLocaleLowerCase("en-US")) &&
+        (!canaryPath || !syntheticValue(value)))
+    )
+      findings.push("assignment structured secret");
+  }
+  return findings;
+}
+
 function readAssignmentValue(text, start) {
   if (start >= text.length) return undefined;
   const first = text[start];
@@ -611,12 +724,19 @@ export function scanText(text, { canaryPath = false } = {}) {
         if (!literalAllowed(name, span, canaryPath)) findings.push(`literal ${name}`);
       }
     }
-    for (let index = 0; index < variant.length; index += 1) {
-      if (variant[index] !== "{") continue;
-      const parsed = parseStructuredLiteral(variant, index);
-      if (parsed?.node.type === "object") {
-        findings.push(...scanStructuredNode(parsed.node, canaryPath));
-        index = parsed.end - 1;
+    if (variant.length > MAX_STRUCTURED_BYTES) {
+      findings.push(...scanLargeStructuredCandidates(variant, canaryPath));
+    } else {
+      for (let index = 0; index < variant.length; index += 1) {
+        if (variant[index] !== "{") continue;
+        const parsed = parseStructuredLiteral(variant, index);
+        if (parsed?.node.type === "object") {
+          const trailing = skipWhitespace(variant, parsed.end);
+          if (trailing < variant.length && !/[;,)\]]/u.test(variant[trailing]))
+            findings.push(...scanMalformedStructured(variant, index));
+          else findings.push(...scanStructuredNode(parsed.node, canaryPath));
+          index = parsed.end - 1;
+        } else findings.push(...scanMalformedStructured(variant, index));
       }
     }
     for (const { key, pattern } of ASSIGNMENT_PATTERNS) {

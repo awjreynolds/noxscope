@@ -172,6 +172,17 @@ describe("release secret scanner", () => {
     ).not.toEqual([]);
   });
 
+  it("fails closed on malformed structured secret content", () => {
+    expect(scanText('{"authorization":"real-production-value"')).not.toEqual([]);
+    expect(scanText('{"authorization":["real-production-value"')).not.toEqual([]);
+    expect(scanText('{"authorization":{"value":"real-production-value"}')).not.toEqual([]);
+    expect(scanText('{"authorization":"real-production-value')).not.toEqual([]);
+    expect(scanText('{"authorization":"real-production-value"} trailing')).not.toEqual([]);
+    expect(scanText('{"outer":{"authorization":"real-production-value"}')).not.toEqual([]);
+    expect(scanText('{"authorization":"fixture-token"', { canaryPath: true })).not.toEqual([]);
+    expect(scanText('{"authorization":endpoint.token', { canaryPath: true })).toEqual([]);
+  });
+
   it("does not treat normal source identifiers as credentials", () => {
     expect(scanText("const token = endpoint.token; password === undefined;")).toEqual([]);
     expect(scanText("authorization: endpoint.token")).toEqual([]);
