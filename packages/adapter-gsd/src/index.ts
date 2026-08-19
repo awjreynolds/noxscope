@@ -32,6 +32,13 @@ export { GSD_SANITIZATION_MANIFEST, GSD_SOURCE_COMMIT } from "./manifest.js";
 export const GSD_TRANSPORT_VERSION = "gsd/1" as const;
 export const GSD_ADAPTER_ID = "org.noxscope.adapter-gsd" as const;
 export const GSD_ADAPTER_VERSION = "0.1.0" as const;
+const MAX_PENDING_EXACT_RANGES = 32;
+const MAX_PENDING_RECORDS = MAX_PENDING_EXACT_RANGES + 1;
+const OVERFLOW_SUMMARY_NAME = "gsd.adapter.overflow-summary";
+
+type OverflowGapRecord = DiagnosticEventRecord & {
+  readonly event: Extract<DiagnosticEventRecord["event"], { readonly type: "stream-gap" }>;
+};
 
 export type GsdRequestType = "describe" | "getState" | "invoke" | "cancel";
 
@@ -194,8 +201,10 @@ class GsdRuntimeSession implements RuntimeSession {
     this.#signal = signal;
     this.#pseudonymKey = pseudonymKey;
     this.#now = now;
-    this.#queue = new RecordQueue(capacity, (existing, incoming) =>
-      this.mergePendingOverflow(existing, incoming),
+    this.#queue = new RecordQueue(
+      capacity,
+      (pending, incoming) => this.mergePendingOverflow(pending, incoming),
+      MAX_PENDING_RECORDS,
     );
     this.#sanitizer = sanitizer;
     this.descriptor = { ...descriptor, sessionId };
@@ -661,34 +670,111 @@ class GsdRuntimeSession implements RuntimeSession {
   }
 
   private mergePendingOverflow(
-    existing: NoxscopeRecord,
+    pending: readonly NoxscopeRecord[],
     incoming: NoxscopeRecord,
-  ): NoxscopeRecord | undefined {
-    if (
-      existing.kind !== "diagnostic-event" ||
-      existing.event.type !== "stream-gap" ||
-      incoming.kind !== "diagnostic-event" ||
-      incoming.event.type !== "stream-gap" ||
-      existing.event.sourceStreamId !== incoming.event.sourceStreamId
-    ) {
-      return undefined;
+  ): readonly NoxscopeRecord[] {
+    const incomingGap = overflowGap(incoming);
+    if (incomingGap === undefined) return [...pending, incoming];
+    const result = [...pending];
+    for (let index = 0; index < result.length; index += 1) {
+      const candidate = result[index];
+      if (candidate === undefined) continue;
+      const existingGap = overflowGap(candidate);
+      if (existingGap === undefined) continue;
+      const merged = mergeOverflowGaps(existingGap, incomingGap);
+      if (merged === undefined) continue;
+      result[index] = merged;
+      for (let other = result.length - 1; other >= 0; other -= 1) {
+        if (other === index) continue;
+        const otherCandidate = result[other];
+        const otherGap = otherCandidate === undefined ? undefined : overflowGap(otherCandidate);
+        const collapsed = otherGap === undefined ? undefined : mergeOverflowGaps(merged, otherGap);
+        if (collapsed === undefined) continue;
+        result[index] = collapsed;
+        result.splice(other, 1);
+        if (other < index) index -= 1;
+      }
+      return result;
     }
-    const existingFirst = BigInt(existing.event.firstLostSequence);
-    const existingLast = BigInt(existing.event.lastLostSequence);
+    if (
+      result.filter((record) => overflowGap(record) !== undefined).length < MAX_PENDING_EXACT_RANGES
+    ) {
+      result.push(incomingGap);
+      return result;
+    }
+    const summaryIndex = result.findIndex((record) => overflowSummarySource(record) !== undefined);
+    if (summaryIndex >= 0) {
+      const summary = result[summaryIndex];
+      if (summary !== undefined)
+        result[summaryIndex] = this.updateOverflowSummary(summary, incomingGap);
+      return result;
+    }
+    result.push(this.makeOverflowSummary(incomingGap));
+    return result;
+  }
+
+  private makeOverflowSummary(incoming: OverflowGapRecord): DiagnosticEventRecord {
+    const first = BigInt(incoming.event.firstLostSequence);
+    const last = BigInt(incoming.event.lastLostSequence);
+    const summary: DiagnosticEventRecord = {
+      kind: "diagnostic-event",
+      meta: meta(this.descriptor, "0", this.#now(), "events", this.#now()),
+      event: {
+        type: "diagnostic",
+        name: OVERFLOW_SUMMARY_NAME,
+        category: "storage",
+        level: "error",
+        source: "adapter",
+        message:
+          "Overflow loss includes disjoint ranges; exact ranges are bounded and additional ranges are summarized",
+        attributes: {
+          contiguous: false,
+          sourceStreamId: incoming.event.sourceStreamId,
+          rangeCount: "1",
+          lostSequenceCount: (last - first + 1n).toString(),
+          minLostSequence: first.toString(),
+          maxLostSequence: last.toString(),
+        },
+      },
+    };
+    return this.withSequence(summary, "events");
+  }
+
+  private updateOverflowSummary(
+    summary: NoxscopeRecord,
+    incoming: OverflowGapRecord,
+  ): NoxscopeRecord {
+    if (summary.kind !== "diagnostic-event" || summary.event.type !== "diagnostic") {
+      return summary;
+    }
+    const attributes = isPlainObject(summary.event.attributes)
+      ? summary.event.attributes
+      : undefined;
+    if (attributes === undefined) return summary;
+    const previousCount = parseSummaryInteger(attributes, "rangeCount");
+    const previousLost = parseSummaryInteger(attributes, "lostSequenceCount");
+    const previousMin = parseSummaryInteger(attributes, "minLostSequence");
+    const previousMax = parseSummaryInteger(attributes, "maxLostSequence");
     const incomingFirst = BigInt(incoming.event.firstLostSequence);
     const incomingLast = BigInt(incoming.event.lastLostSequence);
-    if (existingLast + 1n < incomingFirst || incomingLast + 1n < existingFirst) {
-      return undefined;
-    }
+    const sourceStreamId = stringAt(attributes, "sourceStreamId");
+    const incomingSource = incoming.event.sourceStreamId;
     return {
-      ...existing,
+      ...summary,
       event: {
-        ...existing.event,
-        firstLostSequence: (existingFirst < incomingFirst
-          ? existingFirst
-          : incomingFirst
-        ).toString(),
-        lastLostSequence: (existingLast > incomingLast ? existingLast : incomingLast).toString(),
+        ...summary.event,
+        attributes: {
+          ...attributes,
+          contiguous: false,
+          sourceStreamId:
+            sourceStreamId === undefined || sourceStreamId === incomingSource
+              ? incomingSource
+              : "multiple",
+          rangeCount: (previousCount + 1n).toString(),
+          lostSequenceCount: (previousLost + incomingLast - incomingFirst + 1n).toString(),
+          minLostSequence: (previousMin < incomingFirst ? previousMin : incomingFirst).toString(),
+          maxLostSequence: (previousMax > incomingLast ? previousMax : incomingLast).toString(),
+        },
       },
     };
   }
@@ -778,6 +864,57 @@ interface StreamState {
   lastSource: bigint | undefined;
 }
 
+function overflowGap(record: NoxscopeRecord): OverflowGapRecord | undefined {
+  if (
+    record.kind !== "diagnostic-event" ||
+    record.event.type !== "stream-gap" ||
+    record.event.reason !== "overflow"
+  ) {
+    return undefined;
+  }
+  return record as OverflowGapRecord;
+}
+
+function mergeOverflowGaps(
+  existing: OverflowGapRecord,
+  incoming: OverflowGapRecord,
+): OverflowGapRecord | undefined {
+  if (existing.event.sourceStreamId !== incoming.event.sourceStreamId) return undefined;
+  const existingFirst = BigInt(existing.event.firstLostSequence);
+  const existingLast = BigInt(existing.event.lastLostSequence);
+  const incomingFirst = BigInt(incoming.event.firstLostSequence);
+  const incomingLast = BigInt(incoming.event.lastLostSequence);
+  if (existingLast + 1n < incomingFirst || incomingLast + 1n < existingFirst) {
+    return undefined;
+  }
+  return {
+    ...existing,
+    event: {
+      ...existing.event,
+      firstLostSequence: (existingFirst < incomingFirst ? existingFirst : incomingFirst).toString(),
+      lastLostSequence: (existingLast > incomingLast ? existingLast : incomingLast).toString(),
+    },
+  };
+}
+
+function overflowSummarySource(record: NoxscopeRecord): string | undefined {
+  if (
+    record.kind !== "diagnostic-event" ||
+    record.event.type !== "diagnostic" ||
+    record.event.name !== OVERFLOW_SUMMARY_NAME ||
+    !isPlainObject(record.event.attributes)
+  ) {
+    return undefined;
+  }
+  return stringAt(record.event.attributes, "sourceStreamId");
+}
+
+function parseSummaryInteger(attributes: Record<string, unknown>, key: string): bigint {
+  const value = stringAt(attributes, key);
+  if (value === undefined || !/^(0|[1-9]\d*)$/u.test(value)) return 0n;
+  return BigInt(value);
+}
+
 function addOverflowRanges(
   ranges: Map<string, Array<[bigint, bigint]>>,
   record: NoxscopeRecord,
@@ -826,13 +963,19 @@ class RecordQueue<T> {
   readonly #capacity: number;
   readonly #buffer: T[] = [];
   readonly #pending: T[] = [];
-  readonly #mergePending: (existing: T, incoming: T) => T | undefined;
+  readonly #mergePending: (pending: readonly T[], incoming: T) => readonly T[];
+  readonly #maxPendingRecords: number;
   #waiting: ((result: IteratorResult<T>) => void) | undefined;
   #closed = false;
 
-  constructor(capacity: number, mergePending: (existing: T, incoming: T) => T | undefined) {
+  constructor(
+    capacity: number,
+    mergePending: (pending: readonly T[], incoming: T) => readonly T[],
+    maxPendingRecords: number,
+  ) {
     this.#capacity = capacity;
     this.#mergePending = mergePending;
+    this.#maxPendingRecords = maxPendingRecords;
   }
 
   push(record: T, overflowRecords: (dropped: T) => readonly T[]): void {
@@ -886,14 +1029,11 @@ class RecordQueue<T> {
   }
 
   #addPending(incoming: T): void {
-    for (let index = 0; index < this.#pending.length; index += 1) {
-      const merged = this.#mergePending(this.#pending[index] as T, incoming);
-      if (merged !== undefined) {
-        this.#pending[index] = merged;
-        return;
-      }
+    const next = this.#mergePending(this.#pending, incoming);
+    if (next.length > this.#maxPendingRecords) {
+      throw new Error("Pending overflow evidence exceeded its hard bound");
     }
-    this.#pending.push(incoming);
+    this.#pending.splice(0, this.#pending.length, ...next);
   }
 }
 
@@ -909,7 +1049,11 @@ class MessagePortConnection implements GsdTransportConnection {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  readonly #messages = new RecordQueue<unknown>(256, (existing) => existing);
+  readonly #messages = new RecordQueue<unknown>(
+    256,
+    (pending, incoming) => (pending.length === 0 ? [incoming] : pending),
+    MAX_PENDING_RECORDS,
+  );
   readonly #listener: (event: { readonly data: unknown }) => void;
 
   constructor(port: GsdMessagePort, signal: AbortSignal, timeoutMs: number) {

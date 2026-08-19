@@ -494,6 +494,52 @@ describe("GSD Adapter", () => {
     });
   }, 20_000);
 
+  it("bounds disjoint overflow evidence while preserving an honest summary", async () => {
+    for (const count of [500, 2_000]) {
+      const messages = Array.from({ length: count }, (_, index) =>
+        minimalState(String(index * 2 + 1)),
+      );
+      const connection = new FixtureConnection(healthyHandshake(), messages);
+      const session = await connect(connection, { queueCapacity: 4 });
+      await connection.completed;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const records = await takeRecords(session, 128);
+      const gaps = records.filter(
+        (record) =>
+          record.kind === "diagnostic-event" &&
+          record.event.type === "stream-gap" &&
+          record.event.reason === "overflow",
+      );
+      const summaries = records.filter(
+        (record) =>
+          record.kind === "diagnostic-event" &&
+          record.event.type === "diagnostic" &&
+          record.event.name === "gsd.adapter.overflow-summary",
+      );
+      expect(gaps.length).toBeLessThanOrEqual(32);
+      expect(summaries.length).toBeGreaterThan(0);
+      const summary = summaries[0];
+      if (summary?.kind !== "diagnostic-event" || summary.event.type !== "diagnostic") continue;
+      expect(summary.event.attributes).toMatchObject({
+        contiguous: false,
+        sourceStreamId: "session-gsd-fixture:state",
+      });
+      const attributes = summary.event.attributes;
+      if (
+        attributes === undefined ||
+        attributes === null ||
+        typeof attributes !== "object" ||
+        Array.isArray(attributes)
+      ) {
+        continue;
+      }
+      const objectAttributes = attributes as { readonly [key: string]: unknown };
+      expect(Number(objectAttributes.rangeCount)).toBeGreaterThan(1);
+      expect(objectAttributes.minLostSequence).toBeDefined();
+      expect(objectAttributes.maxLostSequence).toBeDefined();
+    }
+  }, 20_000);
+
   it("never invokes getters while rejecting hostile native payloads", async () => {
     let invoked = false;
     const payload = Object.create(null) as Record<string, unknown>;
