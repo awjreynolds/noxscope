@@ -123,6 +123,7 @@ const CODE_PLACEHOLDERS = new Set([
   "[",
 ]);
 const CODE_REFERENCE = /^(?:this\.)?(?:#?[A-Za-z_$][\w$]*)(?:\.#?[A-Za-z_$][\w$]*)*$/u;
+const TEMPLATE_REFERENCE = /^\$\{(?:this\.)?(?:#?[A-Za-z_$][\w$]*)(?:\.#?[A-Za-z_$][\w$]*)*\}$/u;
 const EXACT_CANARY_PATHS = new Set([
   "apps/web/src/App.test.tsx",
   "apps/web/src/recording-session.test.tsx",
@@ -389,7 +390,9 @@ function arrayValueAllowed(value, canaryPath) {
   if (elements.length === 0) return true;
   const reconstructed = elements.map(stripQuoted).join(" ");
   if (syntheticValue(reconstructed)) return true;
-  const parsed = parseStructuredLiteral(value);
+  const state = { nodes: 0 };
+  const parsed = parseStructuredLiteral(value, 0, state);
+  if (state.exhausted) return false;
   if (parsed?.node.type === "array") return structuredValueAllowed(parsed.node, canaryPath);
   return elements.every((element) => {
     const trimmed = element.trim();
@@ -420,9 +423,16 @@ function skipWhitespace(text, index) {
 }
 
 function parseStructuredLiteral(text, start = 0, state = { nodes: 0 }, depth = 0) {
-  if (text.length > MAX_STRUCTURED_BYTES || depth > MAX_STRUCTURED_DEPTH) return undefined;
+  if (text.length > MAX_STRUCTURED_BYTES || depth > MAX_STRUCTURED_DEPTH) {
+    state.exhausted = true;
+    return undefined;
+  }
   let index = skipWhitespace(text, start);
-  if (index >= text.length || state.nodes >= MAX_STRUCTURED_NODES) return undefined;
+  if (index >= text.length) return undefined;
+  if (state.nodes >= MAX_STRUCTURED_NODES) {
+    state.exhausted = true;
+    return undefined;
+  }
   state.nodes += 1;
   const valueStart = index;
   const first = text[index];
@@ -435,7 +445,10 @@ function parseStructuredLiteral(text, start = 0, state = { nodes: 0 }, depth = 0
       else if (character === "\\") escaped = true;
       else if (character === quote)
         return {
-          node: { type: "string", value: text.slice(valueStart + 1, index) },
+          node: {
+            type: quote === "`" ? "template" : "string",
+            value: text.slice(valueStart + 1, index),
+          },
           end: index + 1,
         };
     }
@@ -498,6 +511,7 @@ function parseStructuredLiteral(text, start = 0, state = { nodes: 0 }, depth = 0
 
 function structuredValueAllowed(node, canaryPath) {
   if (node.type === "string") return canaryPath && syntheticValue(node.value);
+  if (node.type === "template") return TEMPLATE_REFERENCE.test(node.value);
   if (node.type === "bare")
     return (
       CODE_REFERENCE.test(node.value) ||
@@ -564,7 +578,9 @@ function repairStructuredLiteral(text, start) {
 function scanMalformedStructured(text, start) {
   const repaired = repairStructuredLiteral(text, start);
   if (repaired !== undefined) {
-    const parsed = parseStructuredLiteral(repaired.text);
+    const state = { nodes: 0 };
+    const parsed = parseStructuredLiteral(repaired.text, 0, state);
+    if (state.exhausted) return ["assignment structured limit"];
     if (parsed?.node.type === "object") return scanStructuredNode(parsed.node, false);
   }
   const remainder = text.slice(start, start + MAX_STRUCTURED_BYTES);
@@ -603,10 +619,19 @@ function scanLargeStructuredCandidates(text, canaryPath, depth = 0) {
       continue;
     }
     if (first === "{" || first === "[") {
+      if (text.length - valueStart > MAX_STRUCTURED_BYTES) {
+        findings.push("assignment structured limit");
+        continue;
+      }
+      const state = { nodes: 0 };
       const parsed = parseStructuredLiteral(
         text.slice(valueStart, valueStart + MAX_STRUCTURED_BYTES),
+        0,
+        state,
       );
-      if (parsed?.node.type === "object" || parsed?.node.type === "array") {
+      if (state.exhausted) {
+        findings.push("assignment structured limit");
+      } else if (parsed?.node.type === "object" || parsed?.node.type === "array") {
         findings.push(
           ...scanStructuredNode(
             parsed.node,
@@ -645,7 +670,11 @@ function readAssignmentValue(text, start) {
       if (escaped) escaped = false;
       else if (character === "\\") escaped = true;
       else if (character === first)
-        return { value: text.slice(start + 1, index), end: index + 1, kind: "literal" };
+        return {
+          value: text.slice(start + 1, index),
+          end: index + 1,
+          kind: first === "`" ? "template" : "literal",
+        };
     }
     return undefined;
   }
@@ -729,8 +758,11 @@ export function scanText(text, { canaryPath = false } = {}) {
     } else {
       for (let index = 0; index < variant.length; index += 1) {
         if (variant[index] !== "{") continue;
-        const parsed = parseStructuredLiteral(variant, index);
-        if (parsed?.node.type === "object") {
+        const state = { nodes: 0 };
+        const parsed = parseStructuredLiteral(variant, index, state);
+        if (state.exhausted) {
+          findings.push("assignment structured limit");
+        } else if (parsed?.node.type === "object") {
           const trailing = skipWhitespace(variant, parsed.end);
           if (trailing < variant.length && !/[;,)\]]/u.test(variant[trailing]))
             findings.push(...scanMalformedStructured(variant, index));
@@ -757,6 +789,7 @@ export function scanText(text, { canaryPath = false } = {}) {
           continue;
         }
         if (parsed.kind === "bare" && CODE_REFERENCE.test(value)) continue;
+        if (parsed.kind === "template" && TEMPLATE_REFERENCE.test(value)) continue;
         if (!valueAllowed(value, context, canaryPath))
           findings.push(`assignment ${context.slice(0, 80)}`);
       }

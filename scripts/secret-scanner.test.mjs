@@ -183,6 +183,28 @@ describe("release secret scanner", () => {
     expect(scanText('{"authorization":endpoint.token', { canaryPath: true })).toEqual([]);
   });
 
+  it("fails closed when bounded structured scanning reaches a limit", () => {
+    const nested = (depth, value = '"real-production-value"') =>
+      `{"authorization":${"[".repeat(depth)}${value}${"]".repeat(depth)}}`;
+    expect(scanText(nested(31))).not.toEqual([]);
+    expect(scanText(nested(32))).not.toEqual([]);
+    expect(scanText(nested(40))).not.toEqual([]);
+    expect(scanText(nested(1000))).not.toEqual([]);
+    const nodeExhaustion = `{"authorization":[${'"real-production-value",'.repeat(4097)}]}`;
+    expect(scanText(nodeExhaustion)).not.toEqual([]);
+    const byteExhaustion = `{"authorization":[${'"real-production-value",'.repeat(1024 * 2)}]}`;
+    expect(scanText(byteExhaustion)).not.toEqual([]);
+  });
+
+  it("keeps dynamic templates and comment references clean while scanning literals", () => {
+    expect(scanText("authorization: `${endpoint.token}`")).toEqual([]);
+    expect(scanText("// authorization: endpoint.token")).toEqual([]);
+    expect(scanText("/* authorization: endpoint.token */")).toEqual([]);
+    expect(scanText("authorization: `real-production-value`")).not.toEqual([]);
+    expect(scanText("// authorization: real-production-value")).not.toEqual([]);
+    expect(scanText("/* authorization: real-production-value */")).not.toEqual([]);
+  });
+
   it("does not treat normal source identifiers as credentials", () => {
     expect(scanText("const token = endpoint.token; password === undefined;")).toEqual([]);
     expect(scanText("authorization: endpoint.token")).toEqual([]);
