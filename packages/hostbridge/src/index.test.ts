@@ -165,9 +165,107 @@ describe("HostBridge handshake and policy", () => {
     });
     expect(result).toEqual({ ok: false, error: expect.objectContaining({ code: "unavailable" }) });
   });
+
+  it("rejects a success snapshot with additive nested fields", async () => {
+    const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
+    const snapshot = record("3").snapshot;
+    const source: HostBridgeSessionSource = {
+      descriptor,
+      async *records() {},
+      request: (async () => ({
+        ok: true,
+        value: {
+          ...snapshot,
+          freshness: { ...snapshot.freshness, evil: true },
+        },
+      })) as unknown as HostBridgeSessionSource["request"],
+    };
+    const server = createHostBridgeServer({
+      allowedOrigins: ["http://localhost:5173"],
+      token: "t",
+    });
+    server.accept(pair.server);
+    await server.attach(source);
+    const client = createHostBridgeClient({
+      connection: pair.client,
+      token: "t",
+      origin: "http://localhost:5173",
+    });
+    expect((await client.connect()).ok).toBe(true);
+    const result = await client.request(descriptor.sessionId, {
+      kind: "snapshot",
+      requestId: "nested-evil",
+    });
+    expect(result).toEqual({ ok: false, error: expect.objectContaining({ code: "unavailable" }) });
+  });
 });
 
 describe("remote canonical session", () => {
+  it("keeps buffered gaps separate for NUL and Unicode-delimited session/stream IDs", async () => {
+    const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
+    const sourceFor = (sessionId: string, runtimeId: string): HostBridgeSessionSource => ({
+      descriptor: {
+        ...descriptor,
+        sessionId,
+        runtimeId,
+        runtime: {
+          ...descriptor.runtime,
+          identifiers: [
+            {
+              ...descriptor.runtime.identifiers[0]!,
+              value: runtimeId,
+            },
+          ],
+        },
+      },
+      async *records() {},
+      request: (async () => ({
+        ok: true,
+        value: record("1").snapshot,
+      })) as unknown as HostBridgeSessionSource["request"],
+    });
+    const server = createHostBridgeServer({
+      allowedOrigins: ["http://localhost:5173"],
+      token: "t",
+    });
+    await server.attach(sourceFor("a", "runtime-a"));
+    await server.attach(sourceFor("a\u0000", "runtime-b"));
+    server.accept(pair.server);
+    const client = createHostBridgeClient({
+      connection: pair.client,
+      token: "t",
+      origin: "http://localhost:5173",
+    });
+    expect((await client.connect()).ok).toBe(true);
+    pair.client.receive(
+      JSON.stringify({
+        type: "gap",
+        sessionId: "a",
+        sourceStreamId: "\u0000b",
+        firstLostSequence: "1",
+        lastLostSequence: "1",
+      }),
+    );
+    pair.client.receive(
+      JSON.stringify({
+        type: "gap",
+        sessionId: "a\u0000",
+        sourceStreamId: "b",
+        firstLostSequence: "2",
+        lastLostSequence: "2",
+      }),
+    );
+    const received: { sessionId: string; sourceStreamId: string }[] = [];
+    client.onGap((gap) =>
+      received.push({ sessionId: gap.sessionId, sourceStreamId: gap.sourceStreamId }),
+    );
+    expect(received).toEqual([
+      { sessionId: "a", sourceStreamId: "\u0000b" },
+      { sessionId: "a\u0000", sourceStreamId: "b" },
+    ]);
+    await client.close();
+  });
+
   it("keeps overflow gap summaries separate for each source stream", async () => {
     const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
     const source: HostBridgeSessionSource = {

@@ -213,7 +213,11 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
         let checkedRecord: Result<NoxscopeRecord>;
         try {
           checkedRecord = validateRecord(candidate);
-          if (checkedRecord.ok && !safeBridgeValue(checkedRecord.value)) continue;
+          if (
+            checkedRecord.ok &&
+            (!isCanonicalRecord(checkedRecord.value) || !safeBridgeValue(checkedRecord.value))
+          )
+            continue;
         } catch {
           continue;
         }
@@ -314,7 +318,7 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
         throw new Error("Runtime descriptor is malformed");
       }
       if (!checked.ok) throw new Error(checked.error.message);
-      if (!safeBridgeValue(checked.value))
+      if (!isCanonicalRuntimeDescriptor(checked.value) || !safeBridgeValue(checked.value))
         throw new Error("Runtime descriptor contains denied HostBridge fields");
       const normalizedSource: HostBridgeSessionSource = { ...source, descriptor: checked.value };
       if (sessions.has(checked.value.sessionId))
@@ -576,7 +580,11 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
       };
     } else if (message.type === "descriptor") {
       const checked = validateRuntimeDescriptor(message.descriptor);
-      if (!checked.ok || !safeBridgeValue(checked.value)) {
+      if (
+        !checked.ok ||
+        !isCanonicalRuntimeDescriptor(checked.value) ||
+        !safeBridgeValue(checked.value)
+      ) {
         void client.close();
         return;
       }
@@ -668,7 +676,7 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
     bufferedRecordBytes = 0;
   }
   function addBufferedGap(gap: HostBridgeGap): void {
-    const key = `${gap.sessionId}\u0000${gap.sourceStreamId}`;
+    const key = gapKey(gap.sessionId, gap.sourceStreamId);
     const existing = bufferedGaps.get(key);
     if (existing === undefined) {
       if (bufferedGaps.size >= 128) {
@@ -879,7 +887,7 @@ class ServerConnection {
     }
   }
   #queueGap(sessionId: string, sourceStreamId: string, sequence: string): void {
-    const key = `${sessionId}\u0000${sourceStreamId}`;
+    const key = gapKey(sessionId, sourceStreamId);
     const existing = this.#pendingGaps.get(key);
     if (existing !== undefined) {
       if (BigInt(sequence) > BigInt(existing.lastLostSequence))
@@ -1154,11 +1162,11 @@ function validWireEnvelope(value: Record<string, unknown>, responseKind?: Respon
         value.capabilities.every(nonEmpty)
       );
     case "descriptor":
-      return validateRuntimeDescriptor(value.descriptor).ok;
+      return isCanonicalRuntimeDescriptor(value.descriptor);
     case "record":
       return (
         nonEmpty(value.sessionId) &&
-        validateRecord(value.record).ok &&
+        isCanonicalRecord(value.record) &&
         (value.record as { meta?: { sessionId?: unknown } }).meta?.sessionId === value.sessionId
       );
     case "gap":
@@ -1192,7 +1200,7 @@ function validResultEnvelope(
     return (
       hasValue && exactKeys(value, ["ok", "value"]) && validResultValue(value.value, expectedKind)
     );
-  return hasError && exactKeys(value, ["ok", "error"]) && isNoxscopeError(value.error);
+  return hasError && exactKeys(value, ["ok", "error"]) && isCanonicalError(value.error);
 }
 
 function validResultValue(value: unknown, expectedKind?: ResponseKind): boolean {
@@ -1208,9 +1216,9 @@ function validResultValue(value: unknown, expectedKind?: ResponseKind): boolean 
 }
 
 function isCanonicalSnapshot(value: unknown): boolean {
-  if (
-    !isRecord(value) ||
-    !exactKeys(value, [
+  return (
+    isRecord(value) &&
+    exactKeys(value, [
       "revision",
       "freshness",
       "lifecycle",
@@ -1223,37 +1231,37 @@ function isCanonicalSnapshot(value: unknown): boolean {
       "transactions",
       "dependencies",
       "raw",
-    ])
-  )
-    return false;
-  const checked = validateRecord({
-    kind: "snapshot",
-    meta: {
-      protocol: NOXSCOPE_PROTOCOL,
-      sessionId: "hostbridge",
-      runtimeId: "hostbridge",
-      streamId: "hostbridge",
-      sequence: "0",
-      observedAt: "1970-01-01T00:00:00.000Z",
-      receivedAt: "1970-01-01T00:00:00.000Z",
-    },
-    snapshot: value,
-  });
-  return checked.ok;
+    ]) &&
+    nonEmpty(value.revision) &&
+    isCanonicalFreshness(value.freshness) &&
+    (value.lifecycle === undefined || isCanonicalLifecycle(value.lifecycle)) &&
+    (value.identity === undefined || isCanonicalIdentity(value.identity)) &&
+    (value.network === undefined || isCanonicalNetwork(value.network)) &&
+    (value.sync === undefined || isCanonicalSync(value.sync)) &&
+    (value.balances === undefined || isCanonicalBalances(value.balances)) &&
+    (value.addresses === undefined || isCanonicalAddresses(value.addresses)) &&
+    (value.dust === undefined || isCanonicalDust(value.dust)) &&
+    (value.transactions === undefined || isCanonicalTransactions(value.transactions)) &&
+    (value.dependencies === undefined || isCanonicalDependencies(value.dependencies)) &&
+    (value.raw === undefined || isCanonicalRaw(value.raw))
+  );
 }
 
 function isCanonicalOperationTerminal(value: unknown): boolean {
+  return isCanonicalOperation(value, true);
+}
+
+function isCanonicalOperation(value: unknown, terminal: boolean): boolean {
   if (
     !isRecord(value) ||
     !exactKeys(value, ["kind", "phase", "state", "progress", "result", "error", "raw"])
   )
     return false;
-  if (
-    !nonEmpty(value.kind) ||
-    !nonEmpty(value.phase) ||
-    !["succeeded", "failed", "cancelled"].includes(value.state as string)
-  )
-    return false;
+  if (!nonEmpty(value.kind) || !nonEmpty(value.phase)) return false;
+  const states = terminal
+    ? ["succeeded", "failed", "cancelled"]
+    : ["running", "succeeded", "failed", "cancelled"];
+  if (!states.includes(value.state as string)) return false;
   if (
     value.progress !== undefined &&
     (typeof value.progress !== "number" ||
@@ -1262,10 +1270,219 @@ function isCanonicalOperationTerminal(value: unknown): boolean {
       value.progress > 100)
   )
     return false;
-  if (value.result !== undefined && !safeBridgeValue(value.result)) return false;
-  if (value.error !== undefined && !isNoxscopeError(value.error)) return false;
-  if (value.raw !== undefined && !safeBridgeValue(value.raw)) return false;
+  if (value.result !== undefined && !isJsonValue(value.result)) return false;
+  if (value.error !== undefined && !isCanonicalError(value.error)) return false;
+  if (value.raw !== undefined && !isCanonicalRaw(value.raw)) return false;
   return value.state !== "failed" || value.error !== undefined;
+}
+
+function isCanonicalRuntimeDescriptor(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["protocol", "sessionId", "runtimeId", "adapter", "runtime", "capabilities"])
+  )
+    return false;
+  if (
+    value.protocol !== NOXSCOPE_PROTOCOL ||
+    !nonEmpty(value.sessionId) ||
+    !nonEmpty(value.runtimeId)
+  )
+    return false;
+  if (
+    !isRecord(value.adapter) ||
+    !exactKeys(value.adapter, ["id", "version"]) ||
+    !nonEmpty(value.adapter.id) ||
+    !nonEmpty(value.adapter.version)
+  )
+    return false;
+  if (
+    !isRecord(value.runtime) ||
+    !exactKeys(value.runtime, ["surface", "name", "identifiers", "versions"]) ||
+    !nonEmpty(value.runtime.surface)
+  )
+    return false;
+  if (value.runtime.name !== undefined && !nonEmpty(value.runtime.name)) return false;
+  if (
+    !Array.isArray(value.runtime.identifiers) ||
+    !value.runtime.identifiers.every(isCanonicalRuntimeIdentifier)
+  )
+    return false;
+  if (
+    !Array.isArray(value.runtime.versions) ||
+    !value.runtime.versions.every(isCanonicalVersionFact)
+  )
+    return false;
+  return Array.isArray(value.capabilities) && value.capabilities.every(isCanonicalCapability);
+}
+
+function isCanonicalRuntimeIdentifier(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["scheme", "value", "stability"]) &&
+    nonEmpty(value.scheme) &&
+    nonEmpty(value.value) &&
+    ["diagnostic-session", "installation", "reported"].includes(value.stability as string)
+  );
+}
+
+function isCanonicalVersionFact(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["subject", "version"]) &&
+    nonEmpty(value.subject) &&
+    nonEmpty(value.version)
+  );
+}
+
+function isCanonicalCapability(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["id", "kind", "support", "availability"]) &&
+    nonEmpty(value.id) &&
+    ["snapshot", "event", "operation"].includes(value.kind as string) &&
+    isCanonicalSupport(value.support) &&
+    isCanonicalAvailability(value.availability)
+  );
+}
+
+function isCanonicalSupport(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.evidence) ||
+    !exactKeys(value.evidence, ["source", "observedAt", "summary"]) ||
+    ![
+      "runtime-declaration",
+      "handshake",
+      "probe",
+      "static-wire-contract",
+      "adapter-derivation",
+    ].includes(value.evidence.source as string) ||
+    !validTime(value.evidence.observedAt) ||
+    !nonEmpty(value.evidence.summary)
+  )
+    return false;
+  if (value.state === "supported")
+    return exactKeys(value, ["state", "version", "evidence"]) && nonEmpty(value.version);
+  return (
+    value.state === "unsupported" &&
+    exactKeys(value, ["state", "reason", "evidence"]) &&
+    nonEmpty(value.reason)
+  );
+}
+
+function isCanonicalAvailability(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (value.state === "available") return exactKeys(value, ["state"]);
+  return (
+    exactKeys(value, ["state", "reason", "retryable", "retryAfterMs"]) &&
+    ["degraded", "unavailable"].includes(value.state as string) &&
+    nonEmpty(value.reason) &&
+    typeof value.retryable === "boolean" &&
+    (value.retryAfterMs === undefined || nonNegative(value.retryAfterMs))
+  );
+}
+
+function isCanonicalRecord(value: unknown): value is NoxscopeRecord {
+  if (!isRecord(value) || !nonEmpty(value.kind) || !isCanonicalMeta(value.meta)) return false;
+  if (value.kind === "snapshot")
+    return exactKeys(value, ["kind", "meta", "snapshot"]) && isCanonicalSnapshot(value.snapshot);
+  if (value.kind === "diagnostic-event")
+    return exactKeys(value, ["kind", "meta", "event"]) && isCanonicalEvent(value.event);
+  if (value.kind !== "operation" || !exactKeys(value, ["kind", "meta", "operation"])) return false;
+  const meta = value.meta;
+  if (!isRecord(meta) || !isRecord(meta.correlation) || !nonEmpty(meta.correlation.operationId))
+    return false;
+  return isCanonicalOperation(value.operation, false);
+}
+
+function isCanonicalMeta(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      "protocol",
+      "sessionId",
+      "runtimeId",
+      "streamId",
+      "sequence",
+      "observedAt",
+      "receivedAt",
+      "correlation",
+    ])
+  )
+    return false;
+  if (
+    value.protocol !== NOXSCOPE_PROTOCOL ||
+    !nonEmpty(value.sessionId) ||
+    !nonEmpty(value.runtimeId) ||
+    !nonEmpty(value.streamId) ||
+    !decimal(value.sequence) ||
+    !validTime(value.observedAt) ||
+    !validTime(value.receivedAt)
+  )
+    return false;
+  return value.correlation === undefined || isCanonicalCorrelation(value.correlation);
+}
+
+function isCanonicalCorrelation(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, [
+      "requestId",
+      "operationId",
+      "parentOperationId",
+      "causedBySequence",
+      "traceId",
+    ]) &&
+    ["requestId", "operationId", "parentOperationId", "traceId"].every(
+      (key) => value[key] === undefined || nonEmpty(value[key]),
+    ) &&
+    (value.causedBySequence === undefined || decimal(value.causedBySequence))
+  );
+}
+
+function isCanonicalEvent(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (value.type === "diagnostic")
+    return (
+      exactKeys(value, [
+        "type",
+        "name",
+        "category",
+        "level",
+        "source",
+        "message",
+        "attributes",
+        "raw",
+      ]) &&
+      nonEmpty(value.name) &&
+      nonEmpty(value.category) &&
+      ["trace", "debug", "info", "warn", "error"].includes(value.level as string) &&
+      ["runtime", "adapter"].includes(value.source as string) &&
+      (value.message === undefined || typeof value.message === "string") &&
+      (value.attributes === undefined || isJsonValue(value.attributes)) &&
+      (value.raw === undefined || isCanonicalRaw(value.raw))
+    );
+  if (value.type === "capability-availability")
+    return (
+      exactKeys(value, ["type", "capabilityId", "availability"]) &&
+      nonEmpty(value.capabilityId) &&
+      isCanonicalAvailability(value.availability)
+    );
+  return (
+    value.type === "stream-gap" &&
+    exactKeys(value, [
+      "type",
+      "sourceStreamId",
+      "firstLostSequence",
+      "lastLostSequence",
+      "reason",
+    ]) &&
+    nonEmpty(value.sourceStreamId) &&
+    decimal(value.firstLostSequence) &&
+    decimal(value.lastLostSequence) &&
+    BigInt(value.firstLostSequence) <= BigInt(value.lastLostSequence) &&
+    ["overflow", "source-gap", "reconnect"].includes(value.reason as string)
+  );
 }
 
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
@@ -1273,9 +1490,224 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): 
   return Object.keys(value).every((key) => keys.has(key));
 }
 
-function isNoxscopeError(value: unknown): boolean {
+function validTime(value: unknown): value is string {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+function nonNegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isNamespacedId(value: unknown, minimumSegments: number): value is string {
+  if (!nonEmpty(value)) return false;
+  const segments = value.split(".");
+  return (
+    segments.length >= minimumSegments &&
+    segments.every((segment) => /^[a-z][a-z0-9-]*$/iu.test(segment))
+  );
+}
+
+function gapKey(sessionId: string, sourceStreamId: string): string {
+  return `${sessionId.length}:${sessionId}${sourceStreamId.length}:${sourceStreamId}`;
+}
+
+function isJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "string") return byteLength(value) <= HOSTBRIDGE_LIMITS.maxStringBytes;
+  if (Array.isArray(value))
+    return value.length <= HOSTBRIDGE_LIMITS.maxArrayElements && value.every(isJsonValue);
+  if (!isRecord(value)) return false;
+  return (
+    Object.keys(value).length <= HOSTBRIDGE_LIMITS.maxObjectProperties &&
+    Object.keys(value).every(
+      (key) =>
+        !HOSTBRIDGE_DENY_MANIFEST.forbiddenFields.includes(normalize(key)) &&
+        isJsonValue(value[key]),
+    )
+  );
+}
+
+function isCanonicalRaw(value: unknown): boolean {
+  if (!Array.isArray(value) || !safeBridgeValue(value)) return false;
+  return value.every((detail) => {
+    if (
+      !isRecord(detail) ||
+      !exactKeys(detail, ["namespace", "schemaVersion", "value", "sanitization"]) ||
+      !isNamespacedId(detail.namespace, 2) ||
+      !nonEmpty(detail.schemaVersion) ||
+      !isJsonValue(detail.value) ||
+      !isRecord(detail.sanitization) ||
+      !exactKeys(detail.sanitization, ["policy", "policyVersion", "redactions"]) ||
+      !nonEmpty(detail.sanitization.policy) ||
+      !nonEmpty(detail.sanitization.policyVersion) ||
+      !Array.isArray(detail.sanitization.redactions)
+    )
+      return false;
+    return detail.sanitization.redactions.every(
+      (redaction) =>
+        isRecord(redaction) &&
+        exactKeys(redaction, ["path", "reason"]) &&
+        !(
+          !nonEmpty(redaction.path) ||
+          !["secret", "key-material", "private-payload", "policy"].includes(
+            redaction.reason as string,
+          )
+        ),
+    );
+  });
+}
+
+function isCanonicalFreshness(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, [
+      "state",
+      "observedAt",
+      "receivedAt",
+      "source",
+      "pollingIntervalMs",
+      "consecutiveFailures",
+      "lastSuccessAt",
+    ]) &&
+    ["fresh", "stale", "unknown"].includes(value.state as string) &&
+    validTime(value.observedAt) &&
+    validTime(value.receivedAt) &&
+    ["runtime", "adapter"].includes(value.source as string) &&
+    Number.isInteger(value.consecutiveFailures) &&
+    nonNegative(value.consecutiveFailures) &&
+    (value.pollingIntervalMs === undefined || nonNegative(value.pollingIntervalMs)) &&
+    (value.lastSuccessAt === undefined || validTime(value.lastSuccessAt))
+  );
+}
+
+function isCanonicalLifecycle(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["state"]) &&
+    ["starting", "ready", "locked", "stopping", "stopped", "unknown"].includes(
+      value.state as string,
+    )
+  );
+}
+
+function isCanonicalIdentity(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["account", "walletName"]) &&
+    (value.account === undefined || nonEmpty(value.account)) &&
+    (value.walletName === undefined || nonEmpty(value.walletName))
+  );
+}
+
+function isCanonicalNetwork(value: unknown): boolean {
+  return isRecord(value) && exactKeys(value, ["id"]) && nonEmpty(value.id);
+}
+
+function isCanonicalSync(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["state", "percentage", "etaSeconds", "domains"]) &&
+    ["idle", "syncing", "synced", "stalled", "unknown"].includes(value.state as string) &&
+    (value.percentage === undefined ||
+      (typeof value.percentage === "number" &&
+        Number.isFinite(value.percentage) &&
+        value.percentage >= 0 &&
+        value.percentage <= 100)) &&
+    (value.etaSeconds === undefined ||
+      value.etaSeconds === null ||
+      nonNegative(value.etaSeconds)) &&
+    (value.domains === undefined ||
+      (Array.isArray(value.domains) && value.domains.every(isCanonicalSyncDomain)))
+  );
+}
+
+function isCanonicalSyncDomain(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["domain", "state", "percentage"]) &&
+    nonEmpty(value.domain) &&
+    ["pending", "syncing", "synced", "stalled", "unknown"].includes(value.state as string) &&
+    (value.percentage === undefined ||
+      (typeof value.percentage === "number" &&
+        Number.isFinite(value.percentage) &&
+        value.percentage >= 0 &&
+        value.percentage <= 100))
+  );
+}
+
+function isCanonicalBalances(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        isRecord(item) &&
+        exactKeys(item, ["assetId", "domain", "amount"]) &&
+        nonEmpty(item.assetId) &&
+        nonEmpty(item.domain) &&
+        decimal(item.amount),
+    )
+  );
+}
+
+function isCanonicalAddresses(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        isRecord(item) &&
+        exactKeys(item, ["domain", "value", "account"]) &&
+        nonEmpty(item.domain) &&
+        nonEmpty(item.value) &&
+        (item.account === undefined || nonEmpty(item.account)),
+    )
+  );
+}
+
+function isCanonicalDust(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    exactKeys(value, ["state", "progress"]) &&
+    ["unregistered", "registering", "registered", "unknown"].includes(value.state as string) &&
+    (value.progress === undefined ||
+      (typeof value.progress === "number" &&
+        Number.isFinite(value.progress) &&
+        value.progress >= 0 &&
+        value.progress <= 100))
+  );
+}
+
+function isCanonicalTransactions(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        isRecord(item) &&
+        exactKeys(item, ["id", "state"]) &&
+        nonEmpty(item.id) &&
+        ["pending", "confirmed", "failed", "unknown"].includes(item.state as string),
+    )
+  );
+}
+
+function isCanonicalDependencies(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        isRecord(item) &&
+        exactKeys(item, ["role", "state", "endpoint"]) &&
+        nonEmpty(item.role) &&
+        ["connected", "degraded", "disconnected", "unknown"].includes(item.state as string) &&
+        (item.endpoint === undefined || nonEmpty(item.endpoint)),
+    )
+  );
+}
+
+function isCanonicalError(value: unknown): boolean {
   if (
     !isRecord(value) ||
+    !safeBridgeValue(value) ||
     ![
       "unsupported",
       "unavailable",
@@ -1301,7 +1733,7 @@ function isNoxscopeError(value: unknown): boolean {
         Number.isFinite(value.retryAfterMs) &&
         value.retryAfterMs >= 0)) &&
     (value.capability === undefined || nonEmpty(value.capability)) &&
-    (value.raw === undefined || (Array.isArray(value.raw) && safeBridgeValue(value.raw)))
+    (value.raw === undefined || isCanonicalRaw(value.raw))
   );
 }
 
@@ -1392,7 +1824,7 @@ class RemoteQueue {
   readonly #descriptor: RuntimeDescriptor;
   readonly #items: NoxscopeRecord[] = [];
   readonly #waiters: ((result: IteratorResult<NoxscopeRecord>) => void)[] = [];
-  readonly #pendingGaps = new Map<string, HostBridgeGap>();
+  readonly #pendingGaps = new Map<string, Map<string, HostBridgeGap>>();
   #closed = false;
   constructor(descriptor: RuntimeDescriptor) {
     this.#descriptor = descriptor;
@@ -1444,18 +1876,26 @@ class RemoteQueue {
     };
   }
   #rememberGap(record: NoxscopeRecord): void {
-    const key = `${record.meta.sessionId}\u0000${record.meta.streamId}`;
-    const existing = this.#pendingGaps.get(key);
+    let byStream = this.#pendingGaps.get(record.meta.sessionId);
+    if (byStream === undefined) {
+      byStream = new Map<string, HostBridgeGap>();
+      this.#pendingGaps.set(record.meta.sessionId, byStream);
+    }
+    const existing = byStream.get(record.meta.streamId);
     if (existing !== undefined) {
       if (BigInt(record.meta.sequence) > BigInt(existing.lastLostSequence))
-        this.#pendingGaps.set(key, { ...existing, lastLostSequence: record.meta.sequence });
+        byStream.set(record.meta.streamId, { ...existing, lastLostSequence: record.meta.sequence });
       return;
     }
-    if (this.#pendingGaps.size >= 128) {
+    const pendingCount = [...this.#pendingGaps.values()].reduce(
+      (count, gaps) => count + gaps.size,
+      0,
+    );
+    if (pendingCount >= 128) {
       this.close();
       return;
     }
-    this.#pendingGaps.set(key, {
+    byStream.set(record.meta.streamId, {
       sessionId: record.meta.sessionId,
       sourceStreamId: record.meta.streamId,
       firstLostSequence: record.meta.sequence,
@@ -1463,10 +1903,15 @@ class RemoteQueue {
     });
   }
   #takeGap(): NoxscopeRecord | undefined {
-    const first = this.#pendingGaps.entries().next().value as [string, HostBridgeGap] | undefined;
-    if (first === undefined) return undefined;
-    this.#pendingGaps.delete(first[0]);
-    return makeGapRecord(this.#descriptor, first[1]);
+    const firstSession = this.#pendingGaps.entries().next().value as
+      [string, Map<string, HostBridgeGap>] | undefined;
+    if (firstSession === undefined) return undefined;
+    const firstStream = firstSession[1].entries().next().value as
+      [string, HostBridgeGap] | undefined;
+    if (firstStream === undefined) return undefined;
+    firstSession[1].delete(firstStream[0]);
+    if (firstSession[1].size === 0) this.#pendingGaps.delete(firstSession[0]);
+    return makeGapRecord(this.#descriptor, firstStream[1]);
   }
   #flushGaps(): void {
     while (this.#items.length < RemoteQueue.MAX_ITEMS) {
