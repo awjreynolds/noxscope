@@ -29,6 +29,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - [Define wallet qualification and conformance matrix](./issues/07-define-wallet-qualification-and-conformance-matrix.md) — Separate deep Adapter conformance from connector compatibility, scope every claim to exact evidence, require capability-specific suites, and quarantine false/security-unsafe claims.
 - [Build protocol, Core, and deterministic mock](./issues/10-build-protocol-core-and-deterministic-mock.md) — Established the reviewed dependency-free protocol, multi-session Core, deterministic Adapter scenarios, and runnable React/Vite Overview with validated ordering, lifecycle, and failure invariants.
 - [Prototype the observability workbench](./issues/09-prototype-the-observability-workbench.md) — Use the dense split-pane inspector as the shell, the cross-runtime trace table as the temporal view, and the runtime console's evidence-rich failure treatment; preserve the reviewed three-variant prototype as a disposable branch artifact.
+- [Build central sanitizer and portable Recordings](./issues/11-build-central-sanitizer-and-recordings.md) — Enforce one reviewed deny-by-default policy at every trust transition, encode bounded provenance- and integrity-bearing Recording v1 files, and keep browser persistence/export/import plus immutable offline replay entirely local and operation-free.
 
 ## Not yet specified
 
