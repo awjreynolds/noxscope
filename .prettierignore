@@ -4,3 +4,4 @@ dist/
 node_modules/
 LICENSE
 NOTICE
+packages/*/THIRD_PARTY_NOTICES.md

@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/awjreynolds/noxscope.git"
+  },
+  "homepage": "https://github.com/awjreynolds/noxscope#readme",
+  "bugs": {
+    "url": "https://github.com/awjreynolds/noxscope/issues"
+  },
   "engines": {
     "node": ">=24.0.0",
     "pnpm": ">=10.33.0"
@@ -10,7 +18,7 @@
   "packageManager": "pnpm@10.33.0",
   "type": "module",
   "scripts": {
-    "build": "pnpm -r build",
+    "build": "pnpm -r --workspace-concurrency=1 build",
     "test": "vitest run",
     "typecheck": "tsc -b",
     "lint": "eslint .",
@@ -18,7 +26,8 @@
     "verify:metadata": "node scripts/verify-package-metadata.mjs",
     "verify:provenance": "node scripts/verify-provenance.mjs",
     "verify:fixtures": "node scripts/scan-recording-fixtures.mjs",
-    "verify": "pnpm verify:metadata && pnpm verify:provenance && pnpm verify:fixtures && pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+    "verify:packages": "node scripts/verify-package-content.mjs",
+    "verify": "pnpm verify:metadata && pnpm verify:provenance && pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm verify:fixtures && pnpm verify:packages"
   },
   "devDependencies": {
     "@eslint/js": "^9.34.0",

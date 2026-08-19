@@ -1,49 +1,69 @@
 /* global URL, console, process */
 
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isTestOnlyPath, requireScanSet, scanText } from "./secret-scanner.mjs";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
-const fixtureRoot = join(root, "fixtures", "recordings");
-const candidates = [];
-const visit = (directory) => {
+const root = fileURLToPath(new URL("..", import.meta.url));
+const failures = [];
+const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: root })
+  .toString("utf8")
+  .split("\0")
+  .filter(Boolean);
+const sourcePaths = tracked.filter(
+  (path) =>
+    /^(?:packages|apps)\/.+\.(?:[cm]?[jt]sx?|json)$/u.test(path) && !path.includes("/dist/"),
+);
+const fixturePaths = tracked.filter((path) =>
+  /^(?:packages|apps)\/.*(?:\/fixtures\/|\/src\/fixtures\.[cm]?[jt]s$)/u.test(path),
+);
+const distPaths = [];
+const visitDist = (directory) => {
   if (!existsSync(directory)) return;
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) visit(path);
-    else candidates.push(path);
+    const path = `${directory}/${entry.name}`;
+    if (entry.isDirectory()) visitDist(path);
+    else distPaths.push(path);
   }
 };
-visit(fixtureRoot);
-for (const packageName of readdirSync(join(root, "packages"))) {
-  const directory = join(root, "packages", packageName, "fixtures", "recordings");
-  visit(directory);
+for (const packageName of readdirSync(`${root}/packages`))
+  visitDist(`${root}/packages/${packageName}/dist`);
+
+for (const [name, values] of [
+  ["tracked production source", sourcePaths],
+  ["tracked fixture", fixturePaths],
+  ["built dist", distPaths],
+]) {
+  try {
+    requireScanSet(name, values);
+  } catch (error) {
+    failures.push(error.message);
+  }
+}
+for (const path of fixturePaths) {
+  if (!isTestOnlyPath(path)) failures.push(`fixture path is not classified test-only: ${path}`);
 }
 
-const failures = [];
-const magic = "NOXSCOPE-RECORDING/1";
-const forbidden = [
-  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/u,
-  /\b(?:sk|pk)_(?:live|test)_[A-Za-z0-9]+/u,
-  /\b(?:bearer|basic)\s+[A-Za-z0-9+/._=-]{12,}/iu,
-  /\b(?:mnemonic|recoveryPhrase|seed(?:Bytes)?|privateKey|viewingKey|passphrase|password|apiKey|accessToken)\s*[:=]/iu,
-  /\b(?:witness|redeemer|signedTx|rawTransaction|transactionBytes|provingKey)\s*[:=]/iu,
-];
-for (const path of candidates) {
-  const bytes = readFileSync(path);
-  if (!bytes.toString("utf8", 0, Math.min(bytes.length, 64)).startsWith(magic))
-    failures.push(`${relative(root, path)} does not start with Recording v1 magic`);
-  const text = bytes.toString("utf8");
-  for (const pattern of forbidden) {
-    if (pattern.test(text)) failures.push(`${relative(root, path)} matches ${pattern}`);
-  }
+const scan = (relativePath, testOnly) => {
+  const absolute = `${root}/${relativePath}`;
+  const findings = scanText(readFileSync(absolute, "utf8"), { testOnly });
+  for (const finding of findings) failures.push(`${relativePath}: ${finding}`);
+};
+for (const path of sourcePaths) scan(path, isTestOnlyPath(path));
+for (const path of fixturePaths) {
+  if (!sourcePaths.includes(path)) scan(path, true);
+}
+for (const absolute of distPaths) {
+  const relativePath = absolute.slice(root.length + 1);
+  scan(relativePath, false);
 }
 
 if (failures.length > 0) {
-  console.error(failures.map((failure) => `recording-fixture: ${failure}`).join("\n"));
+  console.error(failures.map((failure) => `content-scan: ${failure}`).join("\n"));
   process.exitCode = 1;
 } else {
   console.log(
-    `recording-fixture: scanned ${candidates.length} committed Recording fixture(s); independent secret scan passed`,
+    `content-scan: checked ${sourcePaths.length} tracked source, ${fixturePaths.length} fixture, and ${distPaths.length} dist file(s); synthetic test canaries are allowlisted only in test fixtures`,
   );
 }

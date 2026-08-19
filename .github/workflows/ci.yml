@@ -16,10 +16,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: pnpm
       - uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify:metadata
       - run: pnpm verify:provenance
@@ -29,4 +32,6 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      - run: pnpm verify:packages
+      - run: pnpm verify:fixtures
       - run: git diff --check
