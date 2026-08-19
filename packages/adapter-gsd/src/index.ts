@@ -912,6 +912,14 @@ class MessagePortConnection implements GsdTransportConnection {
     });
   }
 
+  cancel(requestId: string): void {
+    const pending = this.#pending.get(requestId);
+    if (pending === undefined) return;
+    this.#pending.delete(requestId);
+    clearTimeout(pending.timer);
+    pending.reject(new Error("cancelled"));
+  }
+
   async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
     const iterator = this.#messages.iterator();
     while (true) {

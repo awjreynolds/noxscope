@@ -5,7 +5,7 @@ import type {
   GsdTransport,
   GsdTransportConnection,
 } from "./index.js";
-import { createGsdAdapter } from "./index.js";
+import { createGsdAdapter, createGsdMessagePortTransport } from "./index.js";
 import type { NoxscopeRecord, RuntimeSession } from "@noxscope/protocol";
 import { describe, expect, it } from "vitest";
 
@@ -263,6 +263,30 @@ describe("GSD Adapter", () => {
       error: { code: "cancelled", message: "GSD request was cancelled", retryable: false },
     });
     expect(connection.cancelledRequests).toEqual(["snapshot-abort"]);
+  });
+
+  it("cleans a real MessagePort pending request when the caller aborts", async () => {
+    const port = new FixturePort();
+    const lifetime = new AbortController();
+    const sessionResult = await createGsdAdapter({
+      transport: createGsdMessagePortTransport(port, { timeoutMs: 5_000 }),
+      now: clock,
+      pseudonymKey: key,
+      sessionId: () => "session-message-port",
+    }).connect({ signal: lifetime.signal });
+    if (!sessionResult.ok) throw new Error(sessionResult.error.message);
+    const requestSignal = new AbortController();
+    const pending = sessionResult.value.request(
+      { kind: "snapshot", requestId: "message-port-abort" },
+      { signal: requestSignal.signal, timeoutMs: 5_000 },
+    );
+    requestSignal.abort();
+    await expect(pending).resolves.toEqual({
+      ok: false,
+      error: { code: "cancelled", message: "GSD request was cancelled", retryable: false },
+    });
+    expect(port.requests.filter((request) => request.type === "getState")).toHaveLength(1);
+    lifetime.abort();
   });
 
   it("aborts a delayed handshake without creating a session or leaving the connection open", async () => {
@@ -524,6 +548,41 @@ class FixtureConnection implements GsdTransportConnection {
       await delay(this.#options.messageDelayMs ?? 0);
       yield message;
     }
+  }
+}
+
+class FixturePort {
+  readonly requests: GsdRequest[] = [];
+  readonly #listeners = new Set<(event: { readonly data: unknown }) => void>();
+
+  postMessage(message: unknown): void {
+    if (typeof message !== "object" || message === null) return;
+    const request = message as GsdRequest;
+    this.requests.push(request);
+    if (request.type === "describe") {
+      queueMicrotask(() =>
+        this.emit({ id: request.id, type: "response", payload: healthyHandshake() }),
+      );
+    }
+  }
+
+  addEventListener(_type: "message", listener: (event: { readonly data: unknown }) => void): void {
+    this.#listeners.add(listener);
+  }
+
+  removeEventListener(
+    _type: "message",
+    listener: (event: { readonly data: unknown }) => void,
+  ): void {
+    this.#listeners.delete(listener);
+  }
+
+  close(): void {
+    this.#listeners.clear();
+  }
+
+  private emit(data: unknown): void {
+    for (const listener of this.#listeners) listener({ data });
   }
 }
 
