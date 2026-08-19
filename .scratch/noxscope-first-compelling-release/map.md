@@ -30,6 +30,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - [Build protocol, Core, and deterministic mock](./issues/10-build-protocol-core-and-deterministic-mock.md) — Established the reviewed dependency-free protocol, multi-session Core, deterministic Adapter scenarios, and runnable React/Vite Overview with validated ordering, lifecycle, and failure invariants.
 - [Prototype the observability workbench](./issues/09-prototype-the-observability-workbench.md) — Use the dense split-pane inspector as the shell, the cross-runtime trace table as the temporal view, and the runtime console's evidence-rich failure treatment; preserve the reviewed three-variant prototype as a disposable branch artifact.
 - [Build central sanitizer and portable Recordings](./issues/11-build-central-sanitizer-and-recordings.md) — Enforce one reviewed deny-by-default policy at every trust transition, encode bounded provenance- and integrity-bearing Recording v1 files, and keep browser persistence/export/import plus immutable offline replay entirely local and operation-free.
+- [Integrate GSD through the canonical Adapter](./issues/12-integrate-gsd-through-the-canonical-adapter.md) — Observe the audited GSD worker/GSD Connect boundary through a versioned read-only Adapter, apply its deny manifest before bounded queueing, and keep native continuity separate from canonical backpressure evidence.
 
 ## Not yet specified
 
