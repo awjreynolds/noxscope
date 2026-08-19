@@ -143,6 +143,16 @@ describe("release secret scanner", () => {
         { canaryPath: true },
       ),
     ).not.toEqual([]);
+    expect(
+      scanText("-----BEGIN PRIVATE KEY-----\\nZmFrZS1rZXk=\\n-----END PRIVATE KEY-----", {
+        canaryPath: true,
+      }),
+    ).toEqual([]);
+    expect(
+      scanText("-----BEGIN PRIVATE KEY-----\\nZmFrZS1rZXk=real\\n-----END PRIVATE KEY-----", {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
   });
 
   it("tracks the complete documented S0/S1 vocabulary", () => {
@@ -151,8 +161,21 @@ describe("release secret scanner", () => {
       expect(scanText(`${key}: real-production-value`), key).not.toEqual([]);
   });
 
+  it("scans quoted and nested structured secret values", () => {
+    expect(scanText('{"authorization":"real-production-value"}')).not.toEqual([]);
+    expect(scanText('{"authorization":"fixture-token"}', { canaryPath: true })).toEqual([]);
+    expect(scanText('authorization: { value: "real-production-value" }')).not.toEqual([]);
+    expect(
+      scanText('mnemonic: ["fixture-secret-canary", { value: "real-production-value" }]', {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
+  });
+
   it("does not treat normal source identifiers as credentials", () => {
     expect(scanText("const token = endpoint.token; password === undefined;")).toEqual([]);
+    expect(scanText("authorization: endpoint.token")).toEqual([]);
+    expect(scanText("authorization => endpoint.token")).toEqual([]);
   });
 
   it("scans bounded bytes rather than relying on file extensions", () => {

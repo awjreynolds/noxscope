@@ -122,6 +122,7 @@ const CODE_PLACEHOLDERS = new Set([
   "{",
   "[",
 ]);
+const CODE_REFERENCE = /^(?:this\.)?(?:#?[A-Za-z_$][\w$]*)(?:\.#?[A-Za-z_$][\w$]*)*$/u;
 const EXACT_CANARY_PATHS = new Set([
   "apps/web/src/App.test.tsx",
   "apps/web/src/recording-session.test.tsx",
@@ -254,7 +255,6 @@ const SYNTHETIC_JWT_VALUES = new Set([
   "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJub3hzY29wZSJ9.c2lnbmF0dXJl",
   "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJuZXN0ZWQifQ.c2lnbmF0dXJl",
 ]);
-const SYNTHETIC_PRIVATE_KEY_MARKERS = new Set(["zmfrzs1rzxk="]);
 
 const ASSIGNMENT_PATTERNS = SECRET_KEYS.map((key) => {
   const keyGap = `(?:(?!["'\`:=;,{}\\[\\]])[\\p{P}\\s])*?`;
@@ -315,8 +315,12 @@ function syntheticValue(value) {
 function literalAllowed(name, context, canaryPath) {
   if (!canaryPath) return false;
   const normalized = normalize(context);
-  if (name === "private-key")
-    return [...SYNTHETIC_PRIVATE_KEY_MARKERS].some((marker) => normalized.includes(marker));
+  if (name === "private-key") {
+    const fixture = normalized.replace(/\r\n?/gu, "\n").replace(/\\n/gu, "\n");
+    return (
+      fixture === normalize("-----BEGIN PRIVATE KEY-----\nZmFrZS1rZXk=\n-----END PRIVATE KEY-----")
+    );
+  }
   if (name === "jwt")
     return [...SYNTHETIC_JWT_VALUES].some((value) => normalized === normalize(value));
   if (name === "credential-header")
@@ -383,6 +387,8 @@ function arrayValueAllowed(value, canaryPath) {
   if (elements.length === 0) return true;
   const reconstructed = elements.map(stripQuoted).join(" ");
   if (syntheticValue(reconstructed)) return true;
+  const parsed = parseStructuredLiteral(value);
+  if (parsed?.node.type === "array") return structuredValueAllowed(parsed.node, canaryPath);
   return elements.every((element) => {
     const trimmed = element.trim();
     if (trimmed.startsWith("[") && trimmed.endsWith("]"))
@@ -391,6 +397,129 @@ function arrayValueAllowed(value, canaryPath) {
       return scanText(trimmed, { canaryPath }).length === 0;
     return syntheticValue(stripQuoted(trimmed));
   });
+}
+
+const MAX_STRUCTURED_BYTES = 16 * 1024;
+const MAX_STRUCTURED_DEPTH = 32;
+const MAX_STRUCTURED_NODES = 4096;
+const STRUCTURED_SECRET_KEYS = new Set([...SECRET_KEYS, "token"]);
+
+function skipWhitespace(text, index) {
+  while (index < text.length && /\s/u.test(text[index])) index += 1;
+  return index;
+}
+
+function parseStructuredLiteral(text, start = 0, state = { nodes: 0 }, depth = 0) {
+  if (text.length > MAX_STRUCTURED_BYTES || depth > MAX_STRUCTURED_DEPTH) return undefined;
+  let index = skipWhitespace(text, start);
+  if (index >= text.length || state.nodes >= MAX_STRUCTURED_NODES) return undefined;
+  state.nodes += 1;
+  const valueStart = index;
+  const first = text[index];
+  if (first === '"' || first === "'" || first === "`") {
+    const quote = first;
+    let escaped = false;
+    for (index += 1; index < text.length; index += 1) {
+      const character = text[index];
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote)
+        return {
+          node: { type: "string", value: text.slice(valueStart + 1, index) },
+          end: index + 1,
+        };
+    }
+    return undefined;
+  }
+  if (first === "[") {
+    const items = [];
+    index += 1;
+    while (true) {
+      index = skipWhitespace(text, index);
+      if (text[index] === "]") return { node: { type: "array", items }, end: index + 1 };
+      const parsed = parseStructuredLiteral(text, index, state, depth + 1);
+      if (parsed === undefined) return undefined;
+      items.push(parsed.node);
+      index = skipWhitespace(text, parsed.end);
+      if (text[index] === ",") {
+        index += 1;
+        continue;
+      }
+      if (text[index] === "]") return { node: { type: "array", items }, end: index + 1 };
+      return undefined;
+    }
+  }
+  if (first === "{") {
+    const properties = [];
+    index += 1;
+    while (true) {
+      index = skipWhitespace(text, index);
+      if (text[index] === "}") return { node: { type: "object", properties }, end: index + 1 };
+      let key;
+      const keyParsed = parseStructuredLiteral(text, index, state, depth + 1);
+      if (keyParsed?.node.type === "string") {
+        key = keyParsed.node.value;
+        index = keyParsed.end;
+      } else {
+        const keyStart = index;
+        while (index < text.length && !/[\s:]/u.test(text[index])) index += 1;
+        if (index === keyStart) return undefined;
+        key = text.slice(keyStart, index);
+      }
+      index = skipWhitespace(text, index);
+      if (text[index] !== ":") return undefined;
+      const parsed = parseStructuredLiteral(text, index + 1, state, depth + 1);
+      if (parsed === undefined) return undefined;
+      properties.push({ key: normalize(key), value: parsed.node });
+      index = skipWhitespace(text, parsed.end);
+      if (text[index] === ",") {
+        index += 1;
+        continue;
+      }
+      if (text[index] === "}") return { node: { type: "object", properties }, end: index + 1 };
+      return undefined;
+    }
+  }
+  const bareStart = index;
+  while (index < text.length && !/[\s,}\]]/u.test(text[index])) index += 1;
+  if (index === bareStart) return undefined;
+  return { node: { type: "bare", value: text.slice(bareStart, index) }, end: index };
+}
+
+function structuredValueAllowed(node, canaryPath) {
+  if (node.type === "string") return canaryPath && syntheticValue(node.value);
+  if (node.type === "bare")
+    return (
+      CODE_REFERENCE.test(node.value) ||
+      CODE_PLACEHOLDERS.has(node.value.toLocaleLowerCase("en-US"))
+    );
+  if (node.type === "array")
+    return node.items.every((item) => structuredValueAllowed(item, canaryPath));
+  if (node.type === "object") return scanStructuredObject(node, canaryPath, true).length === 0;
+  return false;
+}
+
+function scanStructuredObject(node, canaryPath, allowValue = false) {
+  const findings = [];
+  for (const property of node.properties) {
+    if (STRUCTURED_SECRET_KEYS.has(property.key)) {
+      if (!structuredValueAllowed(property.value, canaryPath))
+        findings.push("assignment structured secret");
+    } else if (allowValue && property.key === "value") {
+      if (!structuredValueAllowed(property.value, canaryPath))
+        findings.push("assignment structured secret");
+    } else if (property.value.type === "object" || property.value.type === "array") {
+      findings.push(...scanStructuredNode(property.value, canaryPath, allowValue));
+    }
+  }
+  return findings;
+}
+
+function scanStructuredNode(node, canaryPath, allowValue = false) {
+  if (node.type === "object") return scanStructuredObject(node, canaryPath, allowValue);
+  if (node.type === "array")
+    return node.items.flatMap((item) => scanStructuredNode(item, canaryPath, allowValue));
+  return [];
 }
 
 function readAssignmentValue(text, start) {
@@ -447,19 +576,15 @@ function valueAllowed(value, _context, canaryPath) {
   return syntheticValue(value);
 }
 
-const SERIALIZED_SECRET_PROPERTY = new RegExp(
-  `(?:^|[,\\{])\\s*["']?(${[...SECRET_KEYS, "token"].join("|")})["']?\\s*[:=]\\s*(?:"([^"]*)"|'([^']*)')`,
-  "giu",
-);
-
-function scanSerializedObjectLiterals(value, canaryPath) {
-  const findings = [];
-  for (const match of value.matchAll(SERIALIZED_SECRET_PROPERTY)) {
-    const literal = match[2] ?? match[3] ?? "";
-    if (!valueAllowed(literal, match[0], canaryPath))
-      findings.push("assignment serialized object secret");
-  }
-  return findings;
+function scanSerializedObjectLiterals(value, canaryPath, rootKey) {
+  const parsed = parseStructuredLiteral(value);
+  if (parsed?.node.type !== "object" && parsed?.node.type !== "array")
+    return ["assignment structured secret"];
+  return scanStructuredNode(
+    parsed.node,
+    canaryPath,
+    rootKey !== undefined && STRUCTURED_SECRET_KEYS.has(normalize(rootKey)),
+  );
 }
 
 function variants(text) {
@@ -486,12 +611,20 @@ export function scanText(text, { canaryPath = false } = {}) {
         if (!literalAllowed(name, span, canaryPath)) findings.push(`literal ${name}`);
       }
     }
-    for (const { pattern } of ASSIGNMENT_PATTERNS) {
+    for (let index = 0; index < variant.length; index += 1) {
+      if (variant[index] !== "{") continue;
+      const parsed = parseStructuredLiteral(variant, index);
+      if (parsed?.node.type === "object") {
+        findings.push(...scanStructuredNode(parsed.node, canaryPath));
+        index = parsed.end - 1;
+      }
+    }
+    for (const { key, pattern } of ASSIGNMENT_PATTERNS) {
       for (const match of variant.matchAll(pattern)) {
         const start = (match.index ?? 0) + match[0].length;
         const parsed = readAssignmentValue(variant, start);
         if (parsed === undefined) {
-          if (variant[start] === "=") continue;
+          if (/[=<>]/u.test(variant[start] ?? "")) continue;
           findings.push(`assignment ${match[0].slice(0, 80)}`);
           continue;
         }
@@ -499,10 +632,11 @@ export function scanText(text, { canaryPath = false } = {}) {
         if (value === "" || CODE_PLACEHOLDERS.has(value.toLocaleLowerCase("en-US"))) continue;
         const context = variant.slice(match.index ?? 0, parsed.end).slice(0, 256);
         if (parsed.kind === "object") {
-          for (const finding of scanSerializedObjectLiterals(value, canaryPath))
+          for (const finding of scanSerializedObjectLiterals(value, canaryPath, key))
             findings.push(`nested ${finding}`);
           continue;
         }
+        if (parsed.kind === "bare" && CODE_REFERENCE.test(value)) continue;
         if (!valueAllowed(value, context, canaryPath))
           findings.push(`assignment ${context.slice(0, 80)}`);
       }
