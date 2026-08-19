@@ -32,8 +32,9 @@ read-only. The runners retain no provider results, transaction bytes, proofs,
 witnesses, signatures, keys, or credentials; all evidence passes the central
 sanitizer and hostile method getters/calls are bounded.
 
-The deterministic corpus is exposed from `@noxscope/conformance/fixtures`.
-Run its seam tests with:
+The deterministic corpus is retained in repository source for seam tests, but
+is deliberately excluded from the published package and has no public export.
+Run the seam tests with:
 
 ```sh
 pnpm --filter @noxscope/conformance test
@@ -41,4 +42,5 @@ pnpm --filter @noxscope/conformance test
 
 The official SDK and Lace entries are deterministic baseline fixtures. 1AM and
 Gero are explicitly labelled `non-live-qualification`, and the Moth extension
-fixture is deliberately separate from the Moth daemon target.
+fixture is deliberately separate from the Moth daemon target. Fixture output
+must never be presented as a live compatibility or qualification claim.

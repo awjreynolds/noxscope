@@ -1,16 +1,38 @@
 /* global URL, console, process */
 
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 import { scanBytes } from "./secret-scanner.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const packages = ["protocol", "core", "adapter-mock", "adapter-gsd", "adapter-moth", "hostbridge"];
+const packages = [
+  "protocol",
+  "core",
+  "adapter-mock",
+  "adapter-gsd",
+  "adapter-moth",
+  "hostbridge",
+  "conformance",
+];
 const failures = [];
 const staging = mkdtempSync(join(tmpdir(), "noxscope-pack-")).replace(/\\/gu, "/");
+const workspacePackages = new Map(
+  readdirSync(packageRoot(root), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => [`@noxscope/${entry.name}`, resolve(root, "packages", entry.name)]),
+);
 
 const parsePackJson = (output, context) => {
   try {
@@ -57,6 +79,9 @@ try {
       execFileSync("tar", ["-xzf", tarPath, "-C", extract]);
       const packageRoot = join(extract, "package");
       const files = collectRegularFiles(packageRoot, failures);
+      assertExtractedLegalFiles(packageName, packageRoot, failures);
+      linkWorkspaceDependencies(packageRoot, failures);
+      await assertImportable(packageName, packageRoot, failures);
       for (const { absolute, relativePath } of files) {
         let size;
         try {
@@ -119,8 +144,68 @@ function assertPackageEntries(packageName, entries, errors) {
   }
 }
 
+function assertExtractedLegalFiles(packageName, packageRoot, errors) {
+  const checks = [
+    ["LICENSE", "Apache License"],
+    ["NOTICE", "Noxscope"],
+    ["THIRD_PARTY_NOTICES.md", "Apache-2.0"],
+  ];
+  for (const [relativePath, marker] of checks) {
+    let contents;
+    try {
+      contents = readFileSync(join(packageRoot, relativePath), "utf8");
+    } catch (error) {
+      errors.push(`${packageName} tarball ${relativePath}: unreadable (${error.message})`);
+      continue;
+    }
+    if (!contents.includes(marker))
+      errors.push(`${packageName} tarball ${relativePath}: missing ${marker} attribution`);
+  }
+}
+
+function linkWorkspaceDependencies(packageRoot, errors) {
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+  } catch (error) {
+    errors.push(`package extraction ${packageRoot}: invalid package manifest (${error.message})`);
+    return;
+  }
+  const dependencies = Object.keys({
+    ...manifest.dependencies,
+    ...manifest.optionalDependencies,
+    ...manifest.peerDependencies,
+  });
+  for (const dependency of dependencies) {
+    const target = workspacePackages.get(dependency);
+    if (target === undefined) continue;
+    const link = join(packageRoot, "node_modules", dependency);
+    try {
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      errors.push(
+        `${manifest.name ?? "package"}: dependency link ${dependency} failed (${error.message})`,
+      );
+    }
+  }
+}
+
+async function assertImportable(packageName, packageRoot, errors) {
+  const entry = pathToFileURL(join(packageRoot, "dist", "index.js")).href;
+  try {
+    await import(`${entry}?noxscopePackage=${encodeURIComponent(packageName)}`);
+  } catch (error) {
+    errors.push(`${packageName} tarball dist/index.js: cannot import (${error.message})`);
+  }
+}
+
 function normalizeEntry(path) {
   return path.startsWith("package/") ? path : `package/${path}`;
+}
+
+function packageRoot(rootDirectory) {
+  return join(rootDirectory, "packages");
 }
 
 function collectRegularFiles(directory, errors) {
@@ -160,6 +245,6 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    `package-content: dry-run and extracted tarball checks passed for ${packages.length} packages`,
+    `package-content: dry-run, extracted tarball, legal, and import checks passed for ${packages.length} packages`,
   );
 }

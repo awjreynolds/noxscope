@@ -142,6 +142,9 @@ const EXACT_CANARY_PATHS = new Set([
   "packages/core/src/recording-import.test.ts",
   "packages/core/src/recording.test.ts",
   "packages/core/src/sanitizer.test.ts",
+  "packages/conformance/fixtures/README.md",
+  "packages/conformance/src/fixtures.ts",
+  "packages/conformance/src/index.test.ts",
   "packages/hostbridge/src/index.test.ts",
 ]);
 /*
@@ -167,6 +170,7 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "fixture-private-payload",
   "fixture-private-witness",
   "fixture-secret-canary",
+  "fixture-secret",
   "fixture-secret-checkpoint",
   "fixture-secret-key",
   "fixture-secret-vault",

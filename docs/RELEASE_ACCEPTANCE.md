@@ -8,9 +8,13 @@ does not establish wallet compatibility or localnet/Preprod evidence.
 - [ ] `pnpm install --frozen-lockfile` succeeds on Node 24+ / pnpm 10.33+.
 - [ ] `pnpm verify` passes: metadata, provenance, Recording fixture scan,
       formatting, lint, typecheck, tests, and production build.
+- [ ] Exactly seven publishable library packages pass metadata and package
+      content gates; root/`apps/web` remain private.
 - [ ] Package tarballs contain only the declared `dist`, package README,
       Apache-2.0 `LICENSE`, `NOTICE`, and third-party audit; root/`apps/web`
       remain private.
+- [ ] Conformance deterministic fixtures remain test-only source material and
+      are absent from package exports and tarballs; the published entry imports.
 - [ ] `LICENSE`, `NOTICE`, `docs/PROVENANCE.md`, and
       `docs/THIRD_PARTY_NOTICES.md` agree with copied/transformed source.
 - [ ] CI runs the same frozen install and local verification, plus an

@@ -107,6 +107,15 @@ importers:
         specifier: workspace:*
         version: link:../protocol
 
+  packages/conformance:
+    dependencies:
+      "@noxscope/core":
+        specifier: workspace:*
+        version: link:../core
+      "@noxscope/protocol":
+        specifier: workspace:*
+        version: link:../protocol
+
   packages/core:
     dependencies:
       "@noxscope/protocol":

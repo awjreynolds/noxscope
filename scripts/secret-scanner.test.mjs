@@ -83,6 +83,9 @@ describe("release secret scanner", () => {
     expect(scanText('mnemonic: "fixture-secret-canary"')).not.toEqual([]);
     expect(scanText('mnemonic: "fixture-secret-canary"', { testOnly: true })).not.toEqual([]);
     expect(isTestOnlyPath("packages/adapter-gsd/fixtures/hostile-secret.json")).toBe(true);
+    expect(isTestOnlyPath("packages/conformance/src/fixtures.ts")).toBe(true);
+    expect(scanText('seed: "fixture-secret"', { canaryPath: true })).toEqual([]);
+    expect(scanText('seed: "fixture-secret"')).not.toEqual([]);
     expect(isTestOnlyPath("packages/core/src/recording.ts")).toBe(false);
     expect(isTestOnlyPath("packages/other/src/index.test.ts")).toBe(false);
     expect(scanText("privateKey: real-production-value", { canaryPath: true })).not.toEqual([]);

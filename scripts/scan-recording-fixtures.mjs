@@ -7,6 +7,9 @@ import { isTestOnlyPath, requireScanSet, scanText } from "./secret-scanner.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const failures = [];
+const packageNames = readdirSync(`${root}/packages`, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => entry.name);
 const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: root })
   .toString("utf8")
   .split("\0")
@@ -27,8 +30,7 @@ const visitDist = (directory) => {
     else distPaths.push(path);
   }
 };
-for (const packageName of readdirSync(`${root}/packages`))
-  visitDist(`${root}/packages/${packageName}/dist`);
+for (const packageName of packageNames) visitDist(`${root}/packages/${packageName}/dist`);
 
 for (const [name, values] of [
   ["tracked production source", sourcePaths],
@@ -66,6 +68,6 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    `content-scan: checked ${sourcePaths.length} tracked source, ${fixturePaths.length} fixture, and ${distPaths.length} dist file(s); synthetic test canaries are allowlisted only in test fixtures`,
+    `content-scan: checked ${packageNames.length} package(s), ${sourcePaths.length} tracked source, ${fixturePaths.length} fixture, and ${distPaths.length} dist file(s); synthetic test canaries are allowlisted only in test fixtures`,
   );
 }

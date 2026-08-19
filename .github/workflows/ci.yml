@@ -32,6 +32,7 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
-      - run: pnpm verify:packages
+      - name: Verify seven publishable package tarballs
+        run: pnpm verify:packages
       - run: pnpm verify:fixtures
       - run: git diff --check

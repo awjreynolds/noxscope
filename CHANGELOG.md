@@ -9,6 +9,8 @@ The first compelling release line includes:
   Recording v1 export/import/offline replay;
 - deterministic mock, audited GSD, and read-only Moth Adapters;
 - authenticated loopback Node HostBridge with bounded canonical transport;
+- executable adapter/connector conformance admission seams (published as the
+  seventh library package, with deterministic fixtures retained for tests only);
 - browser-first split-pane workbench and detached local Recording storage;
 - fixture-qualified evidence and release documentation for the official SDK,
   GSD, Moth, Lace, 1AM, and Gero validation targets.

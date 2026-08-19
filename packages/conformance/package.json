@@ -1,13 +1,39 @@
 {
   "name": "@noxscope/conformance",
   "version": "0.1.0",
+  "description": "Executable admission and qualification seams for canonical Noxscope adapters and connectors",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/awjreynolds/noxscope.git",
+    "directory": "packages/conformance"
+  },
+  "homepage": "https://github.com/awjreynolds/noxscope#readme",
+  "bugs": {
+    "url": "https://github.com/awjreynolds/noxscope/issues"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./fixtures": "./src/fixtures.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node ../../scripts/build-package.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --root ../.. --config vitest.config.ts packages/conformance/src/index.test.ts"
   },

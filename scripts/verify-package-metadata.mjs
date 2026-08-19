@@ -13,6 +13,7 @@ const expected = [
   "@noxscope/adapter-gsd",
   "@noxscope/adapter-moth",
   "@noxscope/hostbridge",
+  "@noxscope/conformance",
 ];
 const failures = [];
 
@@ -36,6 +37,10 @@ for (const name of expected) {
   if (!packages.some((pkg) => pkg.name === name))
     failures.push(`missing publishable package ${name}`);
 }
+if (packages.length !== expected.length)
+  failures.push(
+    `expected exactly ${expected.length} publishable packages, found ${packages.length}`,
+  );
 
 for (const pkg of packages) {
   if (pkg.private === true) failures.push(`${pkg.name} must not be private`);

@@ -7,5 +7,6 @@
     "rootDir": "src"
   },
   "references": [{ "path": "../protocol" }, { "path": "../core" }],
-  "include": ["src"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/fixtures.ts"]
 }

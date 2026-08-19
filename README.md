@@ -21,6 +21,7 @@ out of scope. A fixture or source audit is not a compatibility claim.
 - `@noxscope/hostbridge`: authenticated, bounded loopback browser-to-Node
   canonical bridge.
 - `@noxscope/adapter-mock`: deterministic local fixture scenarios.
+- `@noxscope/conformance`: executable adapter and connector admission seams.
 - `apps/web`: browser-first split-pane workbench with local Recording controls.
 
 The Moth Node HostBridge entry point is a library, not a command-line daemon:
@@ -43,8 +44,9 @@ pnpm --filter @noxscope/web dev
 
 Open the Vite URL shown by the dev server. The default development composition
 uses deterministic mock data. `pnpm verify` is deterministic and local after
-dependencies are installed: it checks package metadata, provenance, Recording
-fixtures, formatting, lint, types, tests, and production builds.
+dependencies are installed: it checks metadata for seven publishable packages,
+provenance, Recording fixtures, formatting, lint, types, tests, production
+builds, and clean/importable package tarballs.
 
 Useful individual commands:
 
