@@ -1,4 +1,9 @@
-export { deriveAdmission, runAdapterConformance } from "./adapter-suite.js";
+export {
+  deriveAdmission,
+  isTrustedQualificationHarness,
+  normalizeQualificationTarget,
+  runAdapterConformance,
+} from "./adapter-suite.js";
 export {
   discoverMidnightProviders,
   observeMidnightDiscovery,
@@ -22,6 +27,10 @@ export type {
   DiscoveryResult,
   EnvironmentKind,
   EvidenceKind,
+  EvidenceSource,
+  HarmlessConnectorOperationId,
+  HarmlessConnectorOperationPlan,
+  QualificationHarnessAttestation,
   QualificationReport,
   QualificationTarget,
   SafetyControls,

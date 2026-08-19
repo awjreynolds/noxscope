@@ -1,5 +1,9 @@
 import { createSanitizer, type AdapterSanitizationManifest } from "@noxscope/core";
-import { deriveAdmission } from "./adapter-suite.js";
+import {
+  deriveAdmission,
+  isTrustedQualificationHarness,
+  normalizeQualificationTarget,
+} from "./adapter-suite.js";
 import {
   CONFORMANCE_SUITE_VERSION,
   type AssertionResult,
@@ -12,6 +16,7 @@ import {
   type DiscoveryLifecycleResult,
   type DiscoveryResult,
   type EvidenceKind,
+  type HarmlessConnectorOperationPlan,
   type QualificationReport,
 } from "./types.js";
 
@@ -19,7 +24,22 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9a-z.-]+)?$/iu;
 const RDNS = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/iu;
 const DEFAULT_TIMEOUT_MS = 2_000;
+const MAX_PROVIDER_COUNT = 1_024;
+const MAX_PROVIDER_KEYS = 128;
+const MAX_PROVIDER_STRING_BYTES = 16 * 1024;
+const MAX_PROVIDER_MAP_BYTES = 512 * 1024;
 const CONNECTOR_POLICY = "noxscope.conformance.connector-evidence";
+const PUBLIC_PROVIDER_METHODS = new Set([
+  "connect",
+  "getConfiguration",
+  "getShieldedAddresses",
+  "getUnshieldedAddresses",
+  "getDustAddress",
+  "getShieldedBalances",
+  "getUnshieldedBalances",
+  "getDustBalance",
+  "getTransactionHistory",
+]);
 
 const CONNECTOR_MANIFEST: AdapterSanitizationManifest = {
   adapter: {
@@ -29,10 +49,10 @@ const CONNECTOR_MANIFEST: AdapterSanitizationManifest = {
   },
   policy: { id: CONNECTOR_POLICY, version: "1", digest: "connector-evidence-v1" },
   projections: [
-    { source: "target.id", target: "target.id", classification: "S0", transform: "copy" },
-    { source: "target.name", target: "target.name", classification: "S0", transform: "copy" },
-    { source: "environment", target: "environment", classification: "S0", transform: "copy" },
-    { source: "evidence", target: "evidence", classification: "S0", transform: "copy" },
+    { source: "target.id", target: "target.id", classification: "S4", transform: "copy" },
+    { source: "target.name", target: "target.name", classification: "S3", transform: "copy" },
+    { source: "environment", target: "environment", classification: "S4", transform: "copy" },
+    { source: "evidence", target: "evidence", classification: "S4", transform: "copy" },
   ],
 };
 
@@ -44,7 +64,15 @@ export function discoverMidnightProviders(source: unknown): DiscoveryResult {
   const providers: DiscoveredProvider[] = [];
   const issues: string[] = [];
   const byRdns = new Map<string, string[]>();
-  for (const key of ownStringKeys(map)) {
+  const keyResult = ownStringKeys(map);
+  if (keyResult.overflow) issues.push("provider map exceeds the bounded provider count");
+  let keyBytes = 0;
+  for (const key of keyResult.keys) {
+    keyBytes += new TextEncoder().encode(key).byteLength;
+    if (keyBytes > MAX_PROVIDER_MAP_BYTES) {
+      issues.push("provider map exceeds the bounded byte limit");
+      break;
+    }
     let value: unknown;
     try {
       value = map[key];
@@ -150,15 +178,36 @@ export async function observeMidnightDiscovery(
 export async function runConnectorQualification(
   options: ConnectorQualificationOptions,
 ): Promise<QualificationReport> {
-  const evidence = options.evidence ?? "fixture";
+  const requestedEvidence = options.evidence ?? "fixture";
   const environment = options.environment ?? "fixture";
+  const normalizedTarget = normalizeQualificationTarget(options.target);
+  const trustedExercise =
+    requestedEvidence === "exercised" &&
+    environment !== "fixture" &&
+    normalizedTarget.provenance &&
+    isTrustedQualificationHarness(options.harness, environment);
+  const evidence: EvidenceKind = trustedExercise ? "exercised" : "fixture";
   const timeoutMs = clamp(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10, 30_000);
   const now = options.now ?? (() => new Date().toISOString());
   const startedAt = safeTimestamp(now);
   const assertions: AssertionResult[] = [];
   const connectorCapabilities: CapabilityResult[] = [];
   let redactionCount = 0;
-  const source = await readSource(options.source);
+  assertions.push(
+    assertion(
+      "P1.1",
+      normalizedTarget.provenance && (requestedEvidence !== "exercised" || trustedExercise)
+        ? "pass"
+        : "fail",
+      evidence,
+      normalizedTarget.provenance
+        ? requestedEvidence === "exercised" && !trustedExercise
+          ? "Exercised evidence lacks trusted non-mainnet harness provenance"
+          : "Target build, source, protocol, network, and harness provenance are present"
+        : "Target provenance is incomplete; compatibility admission is blocked",
+    ),
+  );
+  const source = await readSource(options.source, timeoutMs);
   const discovery = discoverMidnightProviders(source);
   const valid = discovery.providers.filter((provider) => provider.valid);
   assertions.push(
@@ -352,7 +401,7 @@ export async function runConnectorQualification(
     schemaVersion: "noxscope.qualification/1",
     kind: "connector",
     suite: { id: CONFORMANCE_SUITE_VERSION, version: "1.0.0" },
-    target: options.target,
+    target: normalizedTarget.value,
     evidence,
     evidenceSource: evidenceSourceFor(evidence, environment),
     environment,
@@ -365,11 +414,11 @@ export async function runConnectorQualification(
     safety: {
       isolatedProfile: true,
       noMainnetMutation: true,
-      ...(options.operations?.expectedNetwork === undefined
+      ...(options.operations?.plan?.network === undefined
         ? {}
-        : { expectedNetwork: options.operations.expectedNetwork }),
-      operationAllowlist: options.operations?.enabled ? ["connector.harmless-operation"] : [],
-      maxOperations: options.operations?.maxOperations ?? 0,
+        : { expectedNetwork: options.operations.plan.network }),
+      operationAllowlist: options.operations?.enabled ? ["connector.test-transfer"] : [],
+      maxOperations: options.operations?.enabled ? 1 : 0,
       redactionRequired: true,
     },
     redactions: { count: redactionCount, policy: CONNECTOR_POLICY },
@@ -428,7 +477,10 @@ async function runPublicReads(
       });
       continue;
     }
-    const called = await bounded(() => (candidate as () => Promise<unknown>)(), timeoutMs);
+    const called = await bounded(
+      () => (candidate as (this: Record<string, unknown>) => Promise<unknown>).call(connected),
+      timeoutMs,
+    );
     if (called.state !== "value") {
       assertions.push(
         assertion(`D3.${method}`, "fail", evidence, `${method} exceeded its bounded read timeout`),
@@ -548,50 +600,68 @@ async function runConnectorOperation(
       assertion: assertion("D3.4", "skip", evidence, "Connector operation was not enabled"),
       redactions: 0,
     };
-  if (
-    (environment !== "localnet" && environment !== "preprod") ||
-    configured.expectedNetwork !== environment ||
-    options.requestedNetwork !== configured.expectedNetwork
-  ) {
+  const plan = configured.plan;
+  if (plan === undefined) {
     return {
       assertion: assertion(
         "D3.4",
         "fail",
         evidence,
-        "Connector operation requires an exact localnet or Preprod network",
+        "Connector operation requires a typed allowlisted operation plan",
       ),
       redactions: 0,
     };
   }
-  if (configured.run === undefined || (configured.maxOperations ?? 1) < 1) {
+  const connectedNetwork = stringAt(connected, "network") ?? stringAt(connected, "networkId");
+  const planIssue = validateOperationPlan(
+    plan,
+    environment,
+    options.requestedNetwork,
+    connectedNetwork,
+  );
+  if (planIssue !== undefined) {
+    return {
+      assertion: assertion("D3.4", "fail", evidence, planIssue),
+      redactions: 0,
+    };
+  }
+  const execute = readProperty(connected, "runHarmlessOperation");
+  if (typeof execute !== "function") {
     return {
       assertion: assertion(
         "D3.4",
         "fail",
         evidence,
-        "Connector operation was enabled without a bounded operation runner",
+        "Connected provider did not expose the typed harmless operation",
       ),
       redactions: 0,
     };
   }
-  const outcome = await bounded(() => configured.run?.(connected), timeoutMs);
-  if (outcome.state !== "value")
+  const controller = new AbortController();
+  const boundedPlan: HarmlessConnectorOperationPlan = { ...plan, signal: controller.signal };
+  const outcome = await bounded(
+    () =>
+      (execute as (operation: HarmlessConnectorOperationPlan) => Promise<unknown>).call(
+        connected,
+        boundedPlan,
+      ),
+    Math.min(timeoutMs, plan.timeoutMs),
+  );
+  if (outcome.state !== "value") {
+    controller.abort();
     return {
       assertion: assertion("D3.4", "fail", evidence, "Connector operation exceeded its timeout"),
       redactions: 0,
     };
-  if (containsSecret(outcome.value))
+  }
+  const checked = validateOperationResult(outcome.value, plan.network);
+  if (!checked.ok)
     return {
-      assertion: assertion(
-        "D3.4",
-        "fail",
-        evidence,
-        "Connector operation returned private transaction/proof material",
-      ),
+      assertion: assertion("D3.4", "fail", evidence, checked.reason),
       redactions: 0,
     };
   const sanitized = await createSanitizer().sanitize(
-    { operation: outcome.value },
+    { operation: checked.value },
     CONNECTOR_MANIFEST,
   );
   if (!sanitized.ok)
@@ -613,6 +683,99 @@ async function runConnectorOperation(
     ),
     redactions: sanitized.value.audit.redactions.length,
   };
+}
+
+const MAX_QUALIFICATION_SPEND = 1_000_000n;
+const TEST_IDENTITY = /^noxscope-test-[a-z0-9-]{1,64}$/u;
+const TEST_DESTINATION = /^noxscope-destination-[a-z0-9-]{1,64}$/u;
+const DECIMAL = /^(0|[1-9]\d*)$/u;
+
+function validateOperationPlan(
+  plan: HarmlessConnectorOperationPlan,
+  environment: QualificationReport["environment"],
+  requestedNetwork: string,
+  connectedNetwork: string | undefined,
+): string | undefined {
+  if (plan.id !== "connector.test-transfer") return "Operation ID is not in the local allowlist";
+  if (environment !== "localnet" && environment !== "preprod")
+    return "Connector operation requires localnet or Preprod";
+  if (requestedNetwork !== plan.network || connectedNetwork !== plan.network)
+    return "Requested and connected network evidence must exactly match the operation plan";
+  if (!TEST_IDENTITY.test(plan.testIdentity) || !TEST_DESTINATION.test(plan.destination))
+    return "Operation identity and destination must use the qualification test policy";
+  if (!DECIMAL.test(plan.amount) || !DECIMAL.test(plan.maxSpend))
+    return "Operation amount and max spend must be unsigned decimal strings";
+  try {
+    const amount = BigInt(plan.amount);
+    const maxSpend = BigInt(plan.maxSpend);
+    if (amount > maxSpend || maxSpend > MAX_QUALIFICATION_SPEND)
+      return "Operation exceeds the local spend bound";
+  } catch {
+    return "Operation amount is outside the bounded integer policy";
+  }
+  if (!Number.isInteger(plan.timeoutMs) || plan.timeoutMs < 10 || plan.timeoutMs > 30_000)
+    return "Operation timeout is outside the bounded policy";
+  return undefined;
+}
+
+function validateOperationResult(
+  value: unknown,
+  network: string,
+):
+  | { readonly ok: true; readonly value: Record<string, string> }
+  | { readonly ok: false; readonly reason: string } {
+  if (
+    !isObject(value) ||
+    (!hasExactKeys(value, ["ok", "value"]) && !hasExactKeys(value, ["ok", "error"]))
+  )
+    return { ok: false, reason: "Connector operation returned an inexact Result envelope" };
+  const ok = readProperty(value, "ok");
+  if (ok === true) {
+    const result = readProperty(value, "value");
+    if (!isObject(result) || !hasExactKeys(result, ["state", "operationId", "network"]))
+      return { ok: false, reason: "Connector operation success value has an inexact schema" };
+    const state = stringAt(result, "state");
+    const operationId = stringAt(result, "operationId");
+    const resultNetwork = stringAt(result, "network");
+    if (
+      state === undefined ||
+      !["succeeded", "failed", "cancelled"].includes(state) ||
+      operationId === undefined ||
+      resultNetwork !== network ||
+      containsSecret(result)
+    )
+      return { ok: false, reason: "Connector operation success value is invalid or unsafe" };
+    return { ok: true, value: { state, operationId, network: resultNetwork } };
+  }
+  if (ok !== false) return { ok: false, reason: "Connector operation Result ok flag is invalid" };
+  const error = readProperty(value, "error");
+  if (!isObject(error) || !hasExactKeys(error, ["code", "message", "retryable"]))
+    return { ok: false, reason: "Connector operation error has an inexact schema" };
+  const code = stringAt(error, "code");
+  const message = stringAt(error, "message");
+  const retryable = readProperty(error, "retryable");
+  if (
+    code === undefined ||
+    message === undefined ||
+    typeof retryable !== "boolean" ||
+    containsSecret(error)
+  )
+    return { ok: false, reason: "Connector operation error is invalid or unsafe" };
+  return { ok: true, value: { state: "failed", operationId: "connector.test-transfer", network } };
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  let keys: string[];
+  try {
+    if (Object.getOwnPropertySymbols(value).length !== 0) return false;
+    keys = Object.getOwnPropertyNames(value).sort();
+  } catch {
+    return false;
+  }
+  const sortedExpected = [...expected].sort();
+  return (
+    keys.length === expected.length && keys.every((key, index) => key === sortedExpected[index])
+  );
 }
 
 function validateProvider(discoveryKey: string, value: unknown): DiscoveredProvider {
@@ -653,20 +816,26 @@ function validateProvider(discoveryKey: string, value: unknown): DiscoveredProvi
 
 function unwrapMidnightMap(source: unknown): unknown {
   if (!isObject(source)) return source;
-  if (Object.prototype.hasOwnProperty.call(source, "midnight")) {
-    try {
+  try {
+    if (Object.prototype.hasOwnProperty.call(source, "midnight")) {
       return source.midnight;
-    } catch {
-      return undefined;
     }
+  } catch {
+    return undefined;
   }
   return source;
 }
 
-async function readSource(source: ConnectorQualificationOptions["source"]): Promise<unknown> {
+async function readSource(
+  source: ConnectorQualificationOptions["source"],
+  timeoutMs: number,
+): Promise<unknown> {
   try {
-    if (typeof source === "function") return await source();
-    return source;
+    const result = await bounded(
+      () => (typeof source === "function" ? source() : source),
+      timeoutMs,
+    );
+    return result.state === "value" ? result.value : undefined;
   } catch {
     return undefined;
   }
@@ -676,18 +845,28 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function ownStringKeys(value: Record<string, unknown>): string[] {
+function ownStringKeys(value: Record<string, unknown>): {
+  readonly keys: readonly string[];
+  readonly overflow: boolean;
+} {
   try {
-    return Object.getOwnPropertyNames(value);
+    const keys = Object.getOwnPropertyNames(value);
+    return {
+      keys: keys.slice(0, MAX_PROVIDER_COUNT),
+      overflow: keys.length > MAX_PROVIDER_COUNT,
+    };
   } catch {
-    return [];
+    return { keys: [], overflow: true };
   }
 }
 
 function stringAt(value: Record<string, unknown>, key: string): string | undefined {
   try {
     const candidate = value[key];
-    return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+    if (typeof candidate !== "string" || candidate.length === 0) return undefined;
+    if (new TextEncoder().encode(candidate).byteLength > MAX_PROVIDER_STRING_BYTES)
+      return undefined;
+    return candidate;
   } catch {
     return undefined;
   }
@@ -703,7 +882,9 @@ function iconOrigin(icon: string): string {
 }
 
 function methodNames(value: Record<string, unknown>): string[] {
-  return ownStringKeys(value)
+  return [...ownStringKeys(value).keys]
+    .slice(0, MAX_PROVIDER_KEYS)
+    .filter((key) => PUBLIC_PROVIDER_METHODS.has(key))
     .filter((key) => typeof readProperty(value, key) === "function")
     .sort();
 }
@@ -730,17 +911,24 @@ function assertion(
   return { id, status, required: status !== "skip", evidence, summary };
 }
 
-function containsSecret(value: unknown): boolean {
+function containsSecret(value: unknown, seen = new WeakSet<object>(), depth = 0): boolean {
   const forbidden =
     /(?:seed|mnemonic|private.?key|signing.?key|passphrase|password|authorization|access.?token|witness|proof|signature|raw.?transaction|checkpoint|vault|credential)/iu;
-  if (Array.isArray(value)) return value.some(containsSecret);
+  if (depth > 32) return true;
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return true;
+    seen.add(value);
+    return value.slice(0, 4_096).some((item) => containsSecret(item, seen, depth + 1));
+  }
   if (!isObject(value)) return false;
-  return ownStringKeys(value).some((key) => {
+  if (seen.has(value)) return true;
+  seen.add(value);
+  return [...ownStringKeys(value).keys].slice(0, MAX_PROVIDER_KEYS).some((key) => {
     const nested = readProperty(value, key);
     return (
       forbidden.test(key) ||
       (typeof nested === "string" && forbidden.test(nested) && nested.length < 256) ||
-      containsSecret(nested)
+      containsSecret(nested, seen, depth + 1)
     );
   });
 }

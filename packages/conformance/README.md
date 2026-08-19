@@ -17,16 +17,20 @@ Every assertion is labelled `fixture` or `exercised`. Reports include the target
 evidence key, evidence source, environment, timestamps, capability support and
 availability (`supported`, `unsupported`, `unavailable`, or `not-tested`),
 sanitisation counts, and safety controls. A fixture can only receive
-`admission: "fixture"`; it can never establish a compatibility claim. Live
-reports require an isolated target and use `full` for a deep Adapter or
-`connector` for a public connector.
+`admission: "fixture"`; relabelling it cannot establish a compatibility claim.
+Exercised `full`/`connector` admission additionally requires complete target
+provenance and an isolated qualification-harness attestation for a non-mainnet
+environment.
 
 Mutation/operation checks are opt-in and require exactly `localnet` or
-`preprod`, an expected-network match, an explicit allowlist, one bounded runner,
-and a maximum operation count. Mainnet is read-only. The runners retain no
-provider results, transaction bytes, proofs, witnesses, signatures, keys, or
-credentials; all evidence passes the central sanitizer and hostile method
-getters/calls are bounded.
+`preprod`, an exact network match, and bounded policy. Adapter operations expose
+only the local `wallet.sync` assertion. Connector operations accept only the
+typed `connector.test-transfer` plan with qualification destination/test
+identity, spend, single-operation, timeout, and cancellation bounds; callers
+cannot provide a callback or connected-provider mutation authority. Mainnet is
+read-only. The runners retain no provider results, transaction bytes, proofs,
+witnesses, signatures, keys, or credentials; all evidence passes the central
+sanitizer and hostile method getters/calls are bounded.
 
 The deterministic corpus is exposed from `@noxscope/conformance/fixtures`.
 Run its seam tests with:

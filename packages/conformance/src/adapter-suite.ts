@@ -6,6 +6,7 @@ import {
   type InvokeRequest,
   type NoxscopeRecord,
   type Result,
+  type RuntimeDescriptor,
   type RuntimeSession,
   type Snapshot,
   type SnapshotRequest,
@@ -26,6 +27,20 @@ const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_RECORDS = 128;
 const MAX_RECORD_BYTES = 256 * 1024;
 const REDACTION_POLICY = "noxscope.conformance.evidence";
+const RESULT_ERROR_CODES = new Set([
+  "unsupported",
+  "unavailable",
+  "incompatible",
+  "unauthorized",
+  "timeout",
+  "cancelled",
+  "invalid",
+  "rejected",
+  "failed",
+  "protocol",
+  "overflow",
+  "internal",
+]);
 
 const CONFORMANCE_MANIFEST: AdapterSanitizationManifest = {
   adapter: {
@@ -35,21 +50,21 @@ const CONFORMANCE_MANIFEST: AdapterSanitizationManifest = {
   },
   policy: { id: REDACTION_POLICY, version: "1", digest: "conformance-evidence-v1" },
   projections: [
-    { source: "target.id", target: "target.id", classification: "S0", transform: "copy" },
-    { source: "target.name", target: "target.name", classification: "S0", transform: "copy" },
+    { source: "target.id", target: "target.id", classification: "S4", transform: "copy" },
+    { source: "target.name", target: "target.name", classification: "S3", transform: "copy" },
     {
       source: "target.surface",
       target: "target.surface",
-      classification: "S0",
+      classification: "S4",
       transform: "copy",
     },
     {
       source: "environment",
       target: "environment",
-      classification: "S0",
+      classification: "S4",
       transform: "copy",
     },
-    { source: "evidence", target: "evidence", classification: "S0", transform: "copy" },
+    { source: "evidence", target: "evidence", classification: "S4", transform: "copy" },
   ],
 };
 
@@ -64,8 +79,17 @@ const CONFORMANCE_MANIFEST: AdapterSanitizationManifest = {
 export async function runAdapterConformance(
   options: AdapterConformanceOptions,
 ): Promise<ConformanceRunResult> {
-  const evidence = options.evidence ?? "fixture";
+  const requestedEvidence = options.evidence ?? "fixture";
   const environment = options.environment ?? "fixture";
+  const normalizedTarget = normalizeQualificationTarget(options.target);
+  const target = normalizedTarget.value;
+  const trustedExercise =
+    requestedEvidence === "exercised" &&
+    environment !== "fixture" &&
+    environment !== "mainnet" &&
+    normalizedTarget.provenance &&
+    isTrustedQualificationHarness(options.harness, environment);
+  const evidence: EvidenceKind = trustedExercise ? "exercised" : "fixture";
   const timeoutMs = clampTimeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const maxRecords = clampRecords(options.maxRecords ?? DEFAULT_MAX_RECORDS);
   const now = options.now ?? (() => new Date().toISOString());
@@ -76,6 +100,20 @@ export async function runAdapterConformance(
   let snapshot: Snapshot | undefined;
   let result: Result<unknown> | undefined;
   let redactionCount = 0;
+  assertions.push(
+    assertion(
+      "P1.1",
+      normalizedTarget.provenance && (requestedEvidence !== "exercised" || trustedExercise)
+        ? "pass"
+        : "fail",
+      evidence,
+      normalizedTarget.provenance && (requestedEvidence !== "exercised" || trustedExercise)
+        ? "Target build, source, protocol, network, and harness provenance are present"
+        : requestedEvidence === "exercised" && !trustedExercise
+          ? "Exercised evidence lacks trusted non-mainnet harness provenance"
+          : "Target provenance is incomplete; compatibility admission is blocked",
+    ),
+  );
   const controller = new AbortController();
 
   const connected = await settle(
@@ -112,7 +150,7 @@ export async function runAdapterConformance(
     });
   }
   const connection = connected.value;
-  if (!isResult(connection)) {
+  if (!isExactResult(connection)) {
     assertions.push(assertion("A1.1", "fail", evidence, "Adapter returned a malformed Result"));
     controller.abort();
     return finish({
@@ -129,12 +167,15 @@ export async function runAdapterConformance(
   }
   result = connection as Result<unknown>;
   if (!connection.ok) {
+    const errorCode = safeRead(safeRead(connection, "error"), "code");
     assertions.push(
       assertion(
         "A1.1",
         "fail",
         evidence,
-        `Adapter connection failed with ${connection.error.code}`,
+        typeof errorCode === "string"
+          ? `Adapter connection failed with ${errorCode}`
+          : "Adapter connection failed with a typed error",
       ),
     );
     controller.abort();
@@ -152,8 +193,39 @@ export async function runAdapterConformance(
     });
   }
 
-  const session = connection.value;
-  const checkedDescriptor = validateRuntimeDescriptor(session.descriptor);
+  const sessionValue = safeRead(connection, "value");
+  if (!isObject(sessionValue)) {
+    assertions.push(
+      assertion("A1.1", "fail", evidence, "Adapter returned a non-object Runtime Session"),
+    );
+    controller.abort();
+    return finish({
+      options,
+      evidence,
+      environment,
+      startedAt,
+      now,
+      assertions,
+      capabilities,
+      controller,
+      redactionCount,
+    });
+  }
+  const session = sessionValue as unknown as RuntimeSession;
+  const descriptorValue = safeRead(sessionValue, "descriptor");
+  let checkedDescriptor: ReturnType<typeof validateRuntimeDescriptor>;
+  try {
+    checkedDescriptor = validateRuntimeDescriptor(descriptorValue);
+  } catch {
+    checkedDescriptor = {
+      ok: false,
+      error: {
+        code: "protocol",
+        message: "Runtime descriptor could not be safely read",
+        retryable: false,
+      },
+    };
+  }
   if (!checkedDescriptor.ok) {
     assertions.push(assertion("A1.1", "fail", evidence, checkedDescriptor.error.message));
     controller.abort();
@@ -203,37 +275,79 @@ export async function runAdapterConformance(
       "Capability declarations carry evidence",
     ),
   );
+  assertions.push(
+    assertion(
+      "A2.2",
+      descriptor.capabilities.some((capability) => capability.support.state === "unsupported")
+        ? "pass"
+        : "skip",
+      evidence,
+      descriptor.capabilities.some((capability) => capability.support.state === "unsupported")
+        ? "Unsupported capabilities are explicitly distinguished"
+        : "No unsupported capability declaration was available for rejection testing",
+    ),
+  );
+  assertions.push(
+    assertion(
+      "A1.4",
+      (await reconnectCheck(options.adapter, descriptor, timeoutMs)) ? "pass" : "fail",
+      evidence,
+      "Reconnect negotiation creates a distinct Runtime Session identity",
+    ),
+  );
 
-  let snapshotResult: Result<Snapshot> | undefined;
   const snapshotRequest: SnapshotRequest = {
     kind: "snapshot",
     requestId: "noxscope-conformance-snapshot-1",
   };
-  const requested = await settle(
-    () => session.request(snapshotRequest, { signal: controller.signal, timeoutMs }),
-    timeoutMs,
-  );
-  if (requested.state === "value" && isResult(requested.value)) {
-    snapshotResult = requested.value as Result<Snapshot>;
+  const requestMethod = safeRead(sessionValue, "request");
+  const requested =
+    typeof requestMethod !== "function"
+      ? ({ state: "error", error: new Error("Runtime Session request method is missing") } as const)
+      : await settle(
+          () =>
+            (requestMethod as (request: unknown, options?: unknown) => Promise<unknown>).call(
+              session,
+              snapshotRequest,
+              {
+                signal: controller.signal,
+                timeoutMs,
+              },
+            ),
+          timeoutMs,
+        );
+  if (requested.state === "value" && isExactResult(requested.value)) {
     result = requested.value as Result<unknown>;
-    if (snapshotResult.ok) {
-      snapshot = snapshotResult.value;
-      assertions.push(
-        assertion(
-          "A4.1",
-          snapshot.revision.length > 0 ? "pass" : "fail",
-          evidence,
-          "Snapshot has a revision",
-        ),
-      );
-      assertions.push(
-        assertion(
-          "A4.2",
-          freshnessValid(snapshot) ? "pass" : "fail",
-          evidence,
-          "Snapshot freshness is explicit and bounded",
-        ),
-      );
+    if (requested.value.ok) {
+      const candidateSnapshot = safeRead(requested.value, "value");
+      if (!isSnapshotShape(candidateSnapshot)) {
+        assertions.push(
+          assertion("A4.1", "fail", evidence, "Snapshot Result value has an inexact schema"),
+        );
+        assertions.push(
+          assertion("A4.2", "skip", evidence, "Snapshot freshness was not safely available"),
+        );
+      } else {
+        snapshot = cloneSnapshot(candidateSnapshot);
+        assertions.push(
+          assertion(
+            "A4.1",
+            snapshot === undefined ? "fail" : "pass",
+            evidence,
+            snapshot === undefined
+              ? "Snapshot Result value could not be safely reconstructed"
+              : "Snapshot has a revision",
+          ),
+        );
+        assertions.push(
+          assertion(
+            "A4.2",
+            snapshot === undefined || !freshnessValid(snapshot) ? "fail" : "pass",
+            evidence,
+            "Snapshot freshness is explicit and bounded",
+          ),
+        );
+      }
     } else {
       assertions.push(
         assertion("A4.1", "skip", evidence, "Snapshot request returned a typed error"),
@@ -256,16 +370,6 @@ export async function runAdapterConformance(
   assertions.push(...recordChecks.assertions);
   assertions.push(
     assertion(
-      "A3.6",
-      collected.timedOut && records.length === 0 ? "skip" : "pass",
-      evidence,
-      collected.timedOut
-        ? "Record stream remained open within the bounded observation window"
-        : "Record stream terminated or yielded within the bound",
-    ),
-  );
-  assertions.push(
-    assertion(
       "A5.1",
       operationCorrelationValid(records) ? "pass" : "fail",
       evidence,
@@ -279,18 +383,42 @@ export async function runAdapterConformance(
       options,
       controller.signal,
       timeoutMs,
+      evidence,
     );
     assertions.push(operationCheck.assertion);
     if (operationCheck.result !== undefined) result = operationCheck.result;
   } else {
-    assertions.push(
-      assertion("A5.2", "skip", evidence, "Mutation/operation execution was not enabled"),
-    );
+    const unsupportedCheck = await runUnsupportedRequest(session, descriptor, timeoutMs, evidence);
+    assertions.push(unsupportedCheck);
   }
+
+  const abortedRequest = await runAbortedRequest(session, timeoutMs, evidence);
+  assertions.push(abortedRequest);
+  controller.abort();
+  const closed = await settle(() => collected.iterator.next(), timeoutMs);
+  assertions.push(
+    assertion(
+      "A3.6",
+      closed.state === "value" && closed.value.done === true ? "pass" : "fail",
+      evidence,
+      "Orderly abort terminates the Runtime Session iterator within its bound",
+    ),
+  );
 
   for (const capability of descriptor.capabilities) {
     capabilities.push(capabilityResult(capability, snapshot, records, evidence));
   }
+  const capabilityChecks = capabilities.flatMap((capability) => capability.assertions);
+  assertions.push(
+    assertion(
+      "A2.3",
+      capabilityChecks.some((item) => item.status === "fail") ? "fail" : "pass",
+      evidence,
+      capabilityChecks.some((item) => item.status === "fail")
+        ? "A declared capability failed its specific evidence-bearing suite"
+        : "Every declared supported capability passed its registered suite",
+    ),
+  );
 
   const sanitizer = createSanitizer();
   for (const record of records) {
@@ -312,7 +440,7 @@ export async function runAdapterConformance(
       );
     }
     const sanitized = await sanitizer.sanitize(
-      { target: options.target, environment, evidence, record },
+      { target, environment, evidence, record },
       CONFORMANCE_MANIFEST,
     );
     if (sanitized.ok) redactionCount += sanitized.value.audit.redactions.length;
@@ -327,6 +455,19 @@ export async function runAdapterConformance(
       "Canonical records validate at the conformance seam",
     ),
   );
+  assertions.push(
+    assertion(
+      "A4.3",
+      snapshot === undefined
+        ? "skip"
+        : snapshot.freshness.state === "fresh" ||
+            (snapshot.freshness.state === "stale" && snapshot.freshness.consecutiveFailures > 0)
+          ? "pass"
+          : "fail",
+      evidence,
+      "Snapshot freshness preserves the stale/last-good distinction",
+    ),
+  );
   if (!assertions.some((item) => item.id === "A6.2" && item.status === "fail")) {
     assertions.push(
       assertion("A6.2", "pass", evidence, "Hostile evidence remains within record limits"),
@@ -339,7 +480,6 @@ export async function runAdapterConformance(
     assertions.push(assertion("A6.5", "pass", evidence, "No secret canary crossed the seam"));
   }
 
-  controller.abort();
   return finish({
     options,
     evidence,
@@ -377,24 +517,33 @@ function finish(input: {
     schemaVersion: "noxscope.qualification/1",
     kind: "adapter",
     suite: { id: CONFORMANCE_SUITE_VERSION, version: "1.0.0" },
-    target: input.options.target,
+    target: normalizeQualificationTarget(input.options.target).value,
     evidence: input.evidence,
     evidenceSource: evidenceSourceFor(input.evidence, input.environment ?? "fixture"),
     environment: input.environment ?? "fixture",
     startedAt: input.startedAt,
     endedAt: safeTimestamp(input.now),
-    ...(input.descriptor === undefined ? {} : { descriptor: input.descriptor }),
+    ...(input.descriptor === undefined
+      ? {}
+      : (() => {
+          const safe = sanitizeDescriptor(input.descriptor);
+          return safe === undefined ? {} : { descriptor: safe };
+        })()),
     assertions: input.assertions,
     capabilities: input.capabilities,
     admission: deriveAdmission("adapter", input.evidence, input.assertions),
-    safety: safetyFor(input.options, input.environment ?? "fixture"),
+    safety: safetyFor(input.options),
     redactions: { count: input.redactionCount, policy: REDACTION_POLICY },
   };
   return {
     ...report,
-    ...(input.records === undefined ? {} : { records: input.records }),
-    ...(input.snapshot === undefined ? {} : { snapshot: input.snapshot }),
-    ...(input.result === undefined ? {} : { result: input.result }),
+    ...(input.snapshot === undefined
+      ? {}
+      : (() => {
+          const safe = sanitizeSnapshot(input.snapshot);
+          return safe === undefined ? {} : { snapshot: safe };
+        })()),
+    ...(input.result === undefined ? {} : { result: summarizeResult(input.result) }),
   };
 }
 
@@ -408,13 +557,327 @@ function evidenceSourceFor(
   return "installed-runtime";
 }
 
+export function normalizeQualificationTarget(input: unknown): {
+  readonly value: QualificationReport["target"];
+  readonly provenance: boolean;
+} {
+  const read = (key: string): string | undefined => {
+    if (!isObject(input)) return undefined;
+    return safeString(safeRead(input, key));
+  };
+  const optional = [
+    "platform",
+    "distribution",
+    "buildDigest",
+    "sourceCommit",
+    "nativeProtocol",
+    "network",
+  ] as const;
+  const fields = new Map<string, string | undefined>();
+  for (const key of ["id", "name", "surface", ...optional]) fields.set(key, read(key));
+  const id = fields.get("id") ?? "invalid.target";
+  const name = fields.get("name") ?? "Invalid target";
+  const surface = fields.get("surface") ?? "unknown";
+  const required =
+    fields.get("id") !== undefined &&
+    fields.get("name") !== undefined &&
+    fields.get("surface") !== undefined;
+  const value: QualificationReport["target"] = {
+    id,
+    name,
+    surface,
+    ...Object.fromEntries(
+      optional.flatMap((key) => {
+        const item = fields.get(key);
+        return item === undefined ? [] : [[key, item]];
+      }),
+    ),
+  } as QualificationReport["target"];
+  return {
+    value,
+    provenance: required && optional.every((key) => fields.get(key) !== undefined),
+  };
+}
+
+export function isTrustedQualificationHarness(
+  harness: AdapterConformanceOptions["harness"],
+  environment: AdapterConformanceOptions["environment"],
+): boolean {
+  return (
+    harness?.kind === "noxscope-qualification-harness" &&
+    harness.version === "1" &&
+    harness.isolatedProfile === true &&
+    typeof harness.artifactDigest === "string" &&
+    harness.artifactDigest.length >= 16 &&
+    environment !== "fixture" &&
+    environment !== "mainnet"
+  );
+}
+
+function sanitizeDescriptor(input: RuntimeDescriptor): RuntimeDescriptor | undefined {
+  try {
+    const runtime = input.runtime;
+    const identifiers = runtime.identifiers.map((identifier) => ({
+      scheme: identifier.scheme,
+      value: identifier.value,
+      stability: identifier.stability,
+    }));
+    const versions = runtime.versions.map((version) => ({
+      subject: version.subject,
+      version: version.version,
+    }));
+    const capabilities = input.capabilities.map((capability) => ({
+      id: capability.id,
+      kind: capability.kind,
+      support:
+        capability.support.state === "supported"
+          ? {
+              state: "supported" as const,
+              version: capability.support.version,
+              evidence: {
+                source: capability.support.evidence.source,
+                observedAt: capability.support.evidence.observedAt,
+                summary: capability.support.evidence.summary,
+              },
+            }
+          : {
+              state: "unsupported" as const,
+              reason: capability.support.reason,
+              evidence: {
+                source: capability.support.evidence.source,
+                observedAt: capability.support.evidence.observedAt,
+                summary: capability.support.evidence.summary,
+              },
+            },
+      availability:
+        capability.availability.state === "available"
+          ? { state: "available" as const }
+          : {
+              state: capability.availability.state,
+              reason: capability.availability.reason,
+              retryable: capability.availability.retryable,
+              ...(capability.availability.retryAfterMs === undefined
+                ? {}
+                : { retryAfterMs: capability.availability.retryAfterMs }),
+            },
+    }));
+    const sanitized: RuntimeDescriptor = {
+      protocol: NOXSCOPE_PROTOCOL,
+      sessionId: input.sessionId,
+      runtimeId: input.runtimeId,
+      adapter: { id: input.adapter.id, version: input.adapter.version },
+      runtime: {
+        surface: runtime.surface,
+        ...(runtime.name === undefined ? {} : { name: runtime.name }),
+        identifiers,
+        versions,
+      },
+      capabilities,
+    };
+    return validateRuntimeDescriptor(sanitized).ok ? sanitized : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeSnapshot(input: Snapshot): Snapshot | undefined {
+  try {
+    const freshness = {
+      state: input.freshness.state,
+      observedAt: input.freshness.observedAt,
+      receivedAt: input.freshness.receivedAt,
+      consecutiveFailures: input.freshness.consecutiveFailures,
+      ...(input.freshness.pollingIntervalMs === undefined
+        ? {}
+        : { pollingIntervalMs: input.freshness.pollingIntervalMs }),
+      ...(input.freshness.lastSuccessAt === undefined
+        ? {}
+        : { lastSuccessAt: input.freshness.lastSuccessAt }),
+      source: input.freshness.source,
+    };
+    const safe: Snapshot = {
+      revision: input.revision,
+      freshness,
+      ...(input.lifecycle === undefined ? {} : { lifecycle: { state: input.lifecycle.state } }),
+      ...(input.network === undefined ? {} : { network: { id: input.network.id } }),
+      ...(input.sync === undefined
+        ? {}
+        : {
+            sync: {
+              state: input.sync.state,
+              ...(input.sync.percentage === undefined ? {} : { percentage: input.sync.percentage }),
+              ...(input.sync.etaSeconds === undefined ? {} : { etaSeconds: input.sync.etaSeconds }),
+              ...(input.sync.domains === undefined
+                ? {}
+                : {
+                    domains: input.sync.domains.map((domain) => ({
+                      domain: domain.domain,
+                      state: domain.state,
+                      ...(domain.percentage === undefined ? {} : { percentage: domain.percentage }),
+                    })),
+                  }),
+            },
+          }),
+    };
+    return safe;
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneSnapshot(input: unknown): Snapshot | undefined {
+  try {
+    if (!isSnapshotShape(input)) return undefined;
+    const revision = safeString(safeRead(input, "revision"));
+    const freshness = safeRead(input, "freshness");
+    const state = safeRead(freshness, "state");
+    const observedAt = safeString(safeRead(freshness, "observedAt"));
+    const receivedAt = safeString(safeRead(freshness, "receivedAt"));
+    const source = safeRead(freshness, "source");
+    const consecutiveFailures = safeRead(freshness, "consecutiveFailures");
+    if (
+      revision === undefined ||
+      !isObject(freshness) ||
+      !["fresh", "stale", "unknown"].includes(state as string) ||
+      observedAt === undefined ||
+      receivedAt === undefined ||
+      (source !== "runtime" && source !== "adapter") ||
+      typeof consecutiveFailures !== "number" ||
+      !Number.isInteger(consecutiveFailures) ||
+      consecutiveFailures < 0
+    )
+      return undefined;
+    type MutableSnapshot = { -readonly [Key in keyof Snapshot]: Snapshot[Key] };
+    const safe = {
+      revision,
+      freshness: {
+        state: state as Snapshot["freshness"]["state"],
+        observedAt,
+        receivedAt,
+        source,
+        consecutiveFailures,
+      },
+    } as unknown as MutableSnapshot;
+    const lifecycle = safeRead(input, "lifecycle");
+    if (lifecycle !== undefined) {
+      const lifecycleState = safeString(safeRead(lifecycle, "state"));
+      if (
+        lifecycleState === undefined ||
+        !["starting", "ready", "locked", "stopping", "stopped", "unknown"].includes(lifecycleState)
+      )
+        return undefined;
+      safe.lifecycle = { state: lifecycleState as NonNullable<Snapshot["lifecycle"]>["state"] };
+    }
+    const network = safeRead(input, "network");
+    if (network !== undefined) {
+      const id = safeString(safeRead(network, "id"));
+      if (id === undefined) return undefined;
+      safe.network = { id };
+    }
+    const identity = safeRead(input, "identity");
+    if (identity !== undefined) {
+      if (!isObject(identity)) return undefined;
+      const walletName = safeString(safeRead(identity, "walletName"));
+      const account = safeString(safeRead(identity, "account"));
+      safe.identity = {
+        ...(walletName === undefined ? {} : { walletName }),
+        ...(account === undefined ? {} : { account }),
+      };
+    }
+    const sync = safeRead(input, "sync");
+    if (sync !== undefined) {
+      const syncState = safeString(safeRead(sync, "state"));
+      if (
+        syncState === undefined ||
+        !["idle", "syncing", "synced", "stalled", "unknown"].includes(syncState)
+      )
+        return undefined;
+      safe.sync = { state: syncState as NonNullable<Snapshot["sync"]>["state"] };
+    }
+    const dust = safeRead(input, "dust");
+    if (dust !== undefined) {
+      const dustState = safeString(safeRead(dust, "state"));
+      const progress = safeRead(dust, "progress");
+      if (
+        dustState === undefined ||
+        !["unregistered", "registering", "registered", "unknown"].includes(dustState) ||
+        (progress !== undefined &&
+          (typeof progress !== "number" || !Number.isFinite(progress) || progress < 0))
+      )
+        return undefined;
+      safe.dust = {
+        state: dustState as NonNullable<Snapshot["dust"]>["state"],
+        ...(progress === undefined ? {} : { progress }),
+      };
+    }
+    for (const key of ["balances", "addresses"] as const) {
+      const entries = safeRead(input, key);
+      if (entries === undefined) continue;
+      if (!Array.isArray(entries) || entries.length > 4_096) return undefined;
+      if (key === "balances") {
+        const balances = entries.map((entry) => ({
+          assetId: safeString(safeRead(entry, "assetId")),
+          domain: safeString(safeRead(entry, "domain")),
+          amount: safeString(safeRead(entry, "amount")),
+        }));
+        if (balances.some((entry) => Object.values(entry).some((item) => item === undefined)))
+          return undefined;
+        safe.balances = balances as NonNullable<Snapshot["balances"]>;
+      } else {
+        const addresses = entries.map((entry) => ({
+          domain: safeString(safeRead(entry, "domain")),
+          value: safeString(safeRead(entry, "value")),
+          account: safeString(safeRead(entry, "account")),
+        }));
+        if (addresses.some((entry) => entry.domain === undefined || entry.value === undefined))
+          return undefined;
+        safe.addresses = addresses as NonNullable<Snapshot["addresses"]>;
+      }
+    }
+    return safe;
+  } catch {
+    return undefined;
+  }
+}
+
+function summarizeResult(result: Result<unknown>): NonNullable<ConformanceRunResult["result"]> {
+  try {
+    if (result.ok) return { ok: true, value: { kind: "bounded-result" } };
+    return {
+      ok: false,
+      error: {
+        code: result.error.code,
+        message: "Result error was intentionally redacted",
+        retryable: result.error.retryable,
+      },
+    };
+  } catch {
+    return {
+      ok: false,
+      error: { code: "protocol", message: "Result metadata was invalid", retryable: false },
+    };
+  }
+}
+
 async function collectRecords(
   session: RuntimeSession,
   signal: AbortSignal,
   timeoutMs: number,
   maxRecords: number,
-): Promise<{ readonly records: readonly NoxscopeRecord[]; readonly timedOut: boolean }> {
-  const iterator = session[Symbol.asyncIterator]();
+): Promise<{
+  readonly records: readonly NoxscopeRecord[];
+  readonly timedOut: boolean;
+  readonly iterator: AsyncIterator<NoxscopeRecord>;
+}> {
+  let iterator: AsyncIterator<NoxscopeRecord>;
+  try {
+    const createIterator = safeRead(session, Symbol.asyncIterator);
+    if (typeof createIterator !== "function")
+      throw new Error("Runtime Session iterator is missing");
+    iterator = (createIterator as () => AsyncIterator<NoxscopeRecord>).call(session);
+  } catch {
+    iterator = { next: async () => ({ done: true, value: undefined }) };
+  }
   const records: NoxscopeRecord[] = [];
   let timedOut = false;
   for (let index = 0; index < maxRecords; index += 1) {
@@ -427,7 +890,131 @@ async function collectRecords(
     if (signal.aborted) break;
     if (next.value.value !== undefined) records.push(next.value.value);
   }
-  return { records, timedOut };
+  return { records, timedOut, iterator };
+}
+
+async function reconnectCheck(
+  adapter: AdapterConformanceOptions["adapter"],
+  descriptor: RuntimeDescriptor,
+  timeoutMs: number,
+): Promise<boolean> {
+  const controller = new AbortController();
+  const connected = await settle(() => adapter.connect({ signal: controller.signal }), timeoutMs);
+  controller.abort();
+  if (connected.state !== "value" || !isExactResult(connected.value) || !connected.value.ok)
+    return false;
+  const value = safeRead(connected.value, "value");
+  if (!isObject(value)) return false;
+  let checked: ReturnType<typeof validateRuntimeDescriptor>;
+  try {
+    checked = validateRuntimeDescriptor(safeRead(value, "descriptor"));
+  } catch {
+    return false;
+  }
+  return checked.ok && checked.value.sessionId !== descriptor.sessionId;
+}
+
+async function runUnsupportedRequest(
+  session: RuntimeSession,
+  descriptor: RuntimeDescriptor,
+  timeoutMs: number,
+  evidence: EvidenceKind,
+): Promise<AssertionResult> {
+  const unsupported = descriptor.capabilities.find(
+    (capability) => capability.support.state === "unsupported" && capability.kind === "operation",
+  );
+  if (unsupported === undefined)
+    return assertion(
+      "A5.2",
+      "skip",
+      evidence,
+      "No unsupported operation declaration was available",
+    );
+  const requestMethod = safeRead(session, "request");
+  if (typeof requestMethod !== "function")
+    return assertion("A5.2", "fail", evidence, "Runtime Session request method is missing");
+  const request: InvokeRequest = {
+    kind: "invoke",
+    requestId: "noxscope-conformance-unsupported-1",
+    operationId: "noxscope.conformance.unsupported.1",
+    operation: { kind: "org.noxscope.conformance.unsupported", input: {} },
+  };
+  const outcome = await settle(
+    () =>
+      (requestMethod as (request: unknown, options?: unknown) => Promise<unknown>).call(
+        session,
+        request,
+        {
+          timeoutMs,
+        },
+      ),
+    timeoutMs,
+  );
+  if (outcome.state !== "value" || !isExactResult(outcome.value))
+    return assertion(
+      "A5.2",
+      "fail",
+      evidence,
+      "Unsupported operation returned a malformed or unbounded Result",
+    );
+  if (outcome.value.ok)
+    return assertion("A5.2", "fail", evidence, "Unsupported operation was incorrectly accepted");
+  const error = safeRead(outcome.value, "error");
+  return assertion(
+    "A5.2",
+    isObject(error) && safeRead(error, "code") === "unsupported" ? "pass" : "fail",
+    evidence,
+    "Unsupported operation returns a typed unsupported Result",
+  );
+}
+
+async function runAbortedRequest(
+  session: RuntimeSession,
+  timeoutMs: number,
+  evidence: EvidenceKind,
+): Promise<AssertionResult> {
+  const requestMethod = safeRead(session, "request");
+  if (typeof requestMethod !== "function")
+    return assertion("A5.3", "fail", evidence, "Runtime Session request method is missing");
+  const controller = new AbortController();
+  controller.abort();
+  const request: SnapshotRequest = {
+    kind: "snapshot",
+    requestId: "noxscope-conformance-aborted-1",
+  };
+  const outcome = await settle(
+    () =>
+      (requestMethod as (request: unknown, options?: unknown) => Promise<unknown>).call(
+        session,
+        request,
+        {
+          signal: controller.signal,
+          timeoutMs,
+        },
+      ),
+    timeoutMs,
+  );
+  if (outcome.state !== "value" || !isExactResult(outcome.value))
+    return assertion(
+      "A5.3",
+      "fail",
+      evidence,
+      "Aborted request did not return a bounded typed Result",
+    );
+  if (outcome.value.ok)
+    return assertion(
+      "A5.3",
+      "fail",
+      evidence,
+      "Aborted request was incorrectly reported as successful",
+    );
+  const error = safeRead(outcome.value, "error");
+  return assertion(
+    "A5.3",
+    isObject(error) && safeRead(error, "code") === "cancelled" ? "pass" : "fail",
+    evidence,
+    "Aborted caller wait returns typed cancellation without claiming wallet work stopped",
+  );
 }
 
 async function runAllowedOperation(
@@ -435,19 +1022,14 @@ async function runAllowedOperation(
   options: AdapterConformanceOptions,
   signal: AbortSignal,
   timeoutMs: number,
+  evidence: EvidenceKind,
 ): Promise<{ readonly assertion: AssertionResult; readonly result?: Result<unknown> }> {
   const configured = options.operations;
   if (configured === undefined || !configured.enabled) {
     return {
-      assertion: assertion(
-        "A5.2",
-        "skip",
-        options.evidence ?? "fixture",
-        "Operation execution was not enabled",
-      ),
+      assertion: assertion("A5.2", "skip", evidence, "Operation execution was not enabled"),
     };
   }
-  const evidence = options.evidence ?? "fixture";
   const environment = options.environment ?? "fixture";
   if (
     (environment !== "localnet" && environment !== "preprod") ||
@@ -475,7 +1057,7 @@ async function runAllowedOperation(
     operation: { kind: "wallet.sync", action: "start" },
   };
   const outcome = await settle(() => session.request(invoke, { signal, timeoutMs }), timeoutMs);
-  if (outcome.state !== "value" || !isResult(outcome.value)) {
+  if (outcome.state !== "value" || !isExactResult(outcome.value)) {
     return {
       assertion: assertion(
         "A5.2",
@@ -510,8 +1092,16 @@ function inspectRecords(
   const lastByStream = new Map<string, bigint>();
   let valid = true;
   let gapValid = true;
+  let sourceValid = true;
+  if (records.length === 0) valid = false;
   for (const record of records) {
-    const checked = validateRecord(record);
+    let checked: ReturnType<typeof validateRecord>;
+    try {
+      checked = validateRecord(record);
+    } catch {
+      valid = false;
+      continue;
+    }
     if (!checked.ok) {
       valid = false;
       continue;
@@ -522,6 +1112,10 @@ function inspectRecords(
       record.meta.sessionId !== descriptor.sessionId
     ) {
       valid = false;
+    }
+    if (record.kind === "diagnostic-event" && record.event.type === "diagnostic") {
+      if (record.event.source !== "runtime" && record.event.source !== "adapter")
+        sourceValid = false;
     }
     const sequence = BigInt(record.meta.sequence);
     const previous = lastByStream.get(record.meta.streamId);
@@ -551,7 +1145,7 @@ function inspectRecords(
   assertions.push(
     assertion(
       "A3.5",
-      "pass",
+      sourceValid ? "pass" : "fail",
       evidence,
       "Runtime and Adapter records retain their declared source domains",
     ),
@@ -636,8 +1230,8 @@ function capabilitySpecificCheck(
       summary: "Operation capability has an observed operation record",
     };
   return {
-    status: "pass",
-    summary: "Capability declaration has a canonical evidence-bearing suite",
+    status: "fail",
+    summary: "No registered capability-specific suite exists for this declaration",
   };
 }
 
@@ -686,13 +1280,27 @@ function capabilitiesValid(descriptor: NonNullable<QualificationReport["descript
 function containsSecretField(value: unknown): boolean {
   const forbidden =
     /(?:seed|mnemonic|private.?key|signing.?key|passphrase|password|authorization|access.?token|witness|proof|signature|raw.?transaction|checkpoint|vault|credential)/iu;
-  const visit = (candidate: unknown): boolean => {
-    if (Array.isArray(candidate)) return candidate.some(visit);
-    if (candidate === null || typeof candidate !== "object") return false;
-    for (const [key, nested] of Object.entries(candidate)) {
+  const visit = (candidate: unknown, depth = 0): boolean => {
+    if (depth > 16) return true;
+    if (Array.isArray(candidate)) {
+      try {
+        return candidate.slice(0, 4_096).some((item) => visit(item, depth + 1));
+      } catch {
+        return true;
+      }
+    }
+    if (!isObject(candidate)) return false;
+    let keys: string[];
+    try {
+      keys = Object.getOwnPropertyNames(candidate).slice(0, 4_096);
+    } catch {
+      return true;
+    }
+    for (const key of keys) {
       if (forbidden.test(key)) return true;
+      const nested = safeRead(candidate, key);
       if (typeof nested === "string" && forbidden.test(nested) && nested.length < 256) return true;
-      if (visit(nested)) return true;
+      if (visit(nested, depth + 1)) return true;
     }
     return false;
   };
@@ -708,18 +1316,16 @@ function safeJson(value: unknown): string | undefined {
   }
 }
 
-function safetyFor(
-  options: AdapterConformanceOptions,
-  environment: AdapterConformanceOptions["environment"],
-): SafetyControls {
+function safetyFor(options: AdapterConformanceOptions): SafetyControls {
+  const enabled = options.operations?.enabled === true;
   return {
     isolatedProfile: true,
-    noMainnetMutation: environment !== "mainnet",
+    noMainnetMutation: true,
     ...(options.operations?.expectedNetwork === undefined
       ? {}
       : { expectedNetwork: options.operations.expectedNetwork }),
-    operationAllowlist: options.operations?.allowlist ?? [],
-    maxOperations: options.operations?.maxOperations ?? 0,
+    operationAllowlist: enabled ? ["wallet.sync"] : [],
+    maxOperations: enabled ? 1 : 0,
     redactionRequired: true,
   };
 }
@@ -731,7 +1337,35 @@ export function deriveAdmission(
 ): AdmissionState {
   if (evidence === "fixture") return "fixture";
   if (assertions.some((item) => item.status === "fail")) return "quarantined";
-  if (assertions.some((item) => item.status === "skip")) return "blocked";
+  const mandatory =
+    kind === "adapter"
+      ? [
+          "P1.1",
+          "A1.1",
+          "A1.2",
+          "A1.3",
+          "A1.4",
+          "A2.1",
+          "A2.2",
+          "A2.3",
+          "A3.1",
+          "A3.4",
+          "A3.5",
+          "A3.6",
+          "A4.1",
+          "A4.2",
+          "A4.3",
+          "A5.1",
+          "A5.2",
+          "A5.3",
+          "A6.1",
+          "A6.2",
+          "A6.3",
+          "A6.5",
+        ]
+      : ["P1.1", "D1.1", "D1.2", "D1.3", "D1.4", "D2.1", "D2.2", "D3.1"];
+  if (mandatory.some((id) => assertions.find((item) => item.id === id)?.status !== "pass"))
+    return "blocked";
   return kind === "adapter" ? "full" : "connector";
 }
 
@@ -801,9 +1435,105 @@ async function settle<T>(task: () => Promise<T>, timeoutMs: number): Promise<Set
   }
 }
 
-function isResult(value: unknown): value is Result<unknown> {
+function isExactResult(value: unknown): value is Result<unknown> {
+  if (!isObject(value)) return false;
+  const ok = safeRead(value, "ok");
+  if (ok === true) return hasExactKeys(value, ["ok", "value"]);
+  if (ok !== false || !hasExactKeys(value, ["ok", "error"])) return false;
+  const error = safeRead(value, "error");
+  if (!isObject(error)) return false;
+  const allowed = ["code", "message", "retryable", "retryAfterMs", "capability", "raw"] as const;
+  if (!hasAllowedKeys(error, ["code", "message", "retryable"], allowed)) return false;
+  const code = safeRead(error, "code");
+  const message = safeRead(error, "message");
+  const retryable = safeRead(error, "retryable");
+  if (
+    typeof code !== "string" ||
+    !RESULT_ERROR_CODES.has(code) ||
+    safeString(message) === undefined ||
+    typeof retryable !== "boolean"
+  )
+    return false;
+  const retryAfterMs = safeRead(error, "retryAfterMs");
+  if (
+    retryAfterMs !== undefined &&
+    (typeof retryAfterMs !== "number" || !Number.isFinite(retryAfterMs) || retryAfterMs < 0)
+  )
+    return false;
+  const capability = safeRead(error, "capability");
+  if (capability !== undefined && safeString(capability) === undefined) return false;
+  const raw = safeRead(error, "raw");
+  return raw === undefined || (Array.isArray(raw) && raw.length <= 64);
+}
+
+function isSnapshotShape(value: unknown): value is Snapshot {
+  if (!isObject(value)) return false;
+  const revision = safeRead(value, "revision");
+  const freshness = safeRead(value, "freshness");
+  if (typeof revision !== "string" || !isObject(freshness)) return false;
+  const state = safeRead(freshness, "state");
+  const observedAt = safeRead(freshness, "observedAt");
+  const receivedAt = safeRead(freshness, "receivedAt");
+  const failures = safeRead(freshness, "consecutiveFailures");
   return (
-    (typeof value === "object" && value !== null && (value as { ok?: unknown }).ok === true) ||
-    (typeof value === "object" && value !== null && (value as { ok?: unknown }).ok === false)
+    ["fresh", "stale", "unknown"].includes(state as string) &&
+    typeof observedAt === "string" &&
+    typeof receivedAt === "string" &&
+    typeof failures === "number" &&
+    Number.isInteger(failures) &&
+    failures >= 0
   );
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  try {
+    const keys = Object.getOwnPropertyNames(value);
+    if (Object.getOwnPropertySymbols(value).length !== 0) return false;
+    return (
+      keys.length === expected.length &&
+      expected.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hasAllowedKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  allowed: readonly string[],
+): boolean {
+  try {
+    const keys = Object.getOwnPropertyNames(value);
+    if (Object.getOwnPropertySymbols(value).length !== 0) return false;
+    return (
+      keys.length <= allowed.length &&
+      keys.every((key) => allowed.includes(key)) &&
+      required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function safeRead(value: unknown, key: PropertyKey): unknown {
+  if (!isObject(value)) return undefined;
+  try {
+    return (value as Record<PropertyKey, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeString(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  try {
+    return new TextEncoder().encode(value).byteLength <= 16 * 1024 ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }

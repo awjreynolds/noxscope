@@ -22,6 +22,20 @@ const target = {
   surface: "sdk" as const,
   network: "undeployed",
 };
+const qualifiedTarget = {
+  ...target,
+  platform: "test",
+  distribution: "fixture-harness",
+  buildDigest: "sha256:test-build",
+  sourceCommit: "test-source-commit",
+  nativeProtocol: "test/1",
+};
+const harness = {
+  kind: "noxscope-qualification-harness" as const,
+  version: "1" as const,
+  artifactDigest: "sha256:qualification-artifact",
+  isolatedProfile: true as const,
+};
 
 const descriptor: RuntimeDescriptor = {
   protocol: NOXSCOPE_PROTOCOL,
@@ -97,20 +111,51 @@ const snapshotRecord: NoxscopeRecord = {
 };
 
 function fixtureAdapter(
-  options: { readonly records?: readonly NoxscopeRecord[]; readonly hanging?: boolean } = {},
+  options: {
+    readonly records?: readonly NoxscopeRecord[];
+    readonly hanging?: boolean;
+    readonly descriptor?: RuntimeDescriptor;
+    readonly requestResult?: unknown;
+  } = {},
 ): NoxscopeAdapter {
+  let attempts = 0;
   return {
     async connect() {
+      attempts += 1;
       if (options.hanging === true) await new Promise<never>(() => undefined);
+      const sessionDescriptor = {
+        ...(options.descriptor ?? descriptor),
+        sessionId: `session-${attempts}`,
+      };
+      const sessionRecords = (options.records ?? [snapshotRecord]).map((record) => ({
+        ...record,
+        meta: { ...record.meta, sessionId: sessionDescriptor.sessionId },
+      }));
       return {
         ok: true,
         value: {
-          descriptor,
+          descriptor: sessionDescriptor,
           async *[Symbol.asyncIterator]() {
-            for (const record of options.records ?? [snapshotRecord]) yield record;
+            for (const record of sessionRecords) yield record;
           },
-          async request() {
-            return { ok: true as const, value: snapshot };
+          async request(request: unknown, requestOptions?: { readonly signal?: AbortSignal }) {
+            if (requestOptions?.signal?.aborted) {
+              return {
+                ok: false as const,
+                error: { code: "cancelled" as const, message: "cancelled", retryable: false },
+              };
+            }
+            if (
+              typeof request === "object" &&
+              request !== null &&
+              (request as { readonly kind?: unknown }).kind === "invoke"
+            ) {
+              return {
+                ok: false as const,
+                error: { code: "unsupported" as const, message: "unsupported", retryable: false },
+              };
+            }
+            return options.requestResult ?? { ok: true as const, value: snapshot };
           },
         },
       };
@@ -186,34 +231,158 @@ describe("connector qualification", () => {
   });
 
   it("rejects a mainnet mutation configuration before invoking it", async () => {
-    let invoked = false;
     const report = await runConnectorQualification({
       source: { midnight: { "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": provider() } },
-      target: { ...target, surface: "dapp-connector" },
+      target: { ...qualifiedTarget, surface: "dapp-connector" },
       requestedNetwork: "mainnet",
       evidence: "exercised",
       environment: "mainnet",
+      harness,
       operations: {
         enabled: true,
-        expectedNetwork: "preprod",
-        run: async () => {
+        plan: {
+          id: "connector.test-transfer",
+          network: "preprod",
+          destination: "noxscope-destination-test",
+          testIdentity: "noxscope-test-wallet",
+          amount: "1",
+          maxSpend: "1",
+          timeoutMs: 100,
+        },
+      },
+      now: () => timestamp,
+    });
+    expect(report.assertions.find((assertion) => assertion.id === "D3.4")?.status).toBe("fail");
+    expect(report.evidence).toBe("fixture");
+    expect(report.admission).toBe("fixture");
+  });
+
+  it("enforces typed network, identity, amount, and spend policy before mutation", async () => {
+    let invoked = false;
+    const operationProvider = {
+      ...provider(),
+      connect: async (network: string) => ({
+        network,
+        runHarmlessOperation: async () => {
           invoked = true;
-          return { ok: true };
+          return {
+            ok: true,
+            value: { state: "succeeded", operationId: "op-1", network },
+          };
+        },
+      }),
+    };
+    const report = await runConnectorQualification({
+      source: { midnight: { "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": operationProvider } },
+      target: { ...qualifiedTarget, surface: "dapp-connector", network: "preprod" },
+      requestedNetwork: "preprod",
+      evidence: "exercised",
+      environment: "preprod",
+      harness,
+      operations: {
+        enabled: true,
+        plan: {
+          id: "connector.test-transfer",
+          network: "preprod",
+          destination: "noxscope-destination-test",
+          testIdentity: "noxscope-test-wallet",
+          amount: "2",
+          maxSpend: "1",
+          timeoutMs: 100,
         },
       },
       now: () => timestamp,
     });
     expect(invoked).toBe(false);
     expect(report.assertions.find((assertion) => assertion.id === "D3.4")?.status).toBe("fail");
-    expect(report.admission).toBe("quarantined");
+  });
+
+  it("cannot promote a fixture by relabelling it as exercised", async () => {
+    const fixture = conformanceFixture("1am");
+    const report = await runConnectorQualification({
+      source: fixture.connector ?? {},
+      target: fixture.target,
+      requestedNetwork: "preprod",
+      evidence: "exercised",
+      environment: "preprod",
+      now: () => timestamp,
+    });
+    expect(report.evidence).toBe("fixture");
+    expect(report.admission).toBe("fixture");
+  });
+
+  it("bounds hostile maps and isolates proxy traps", () => {
+    const hostile = new Proxy(
+      {},
+      {
+        ownKeys: () => {
+          throw new Error("trap");
+        },
+        get: () => {
+          throw new Error("trap");
+        },
+      },
+    );
+    expect(() => discoverMidnightProviders({ midnight: hostile })).not.toThrow();
+    const many = Object.fromEntries(
+      Array.from({ length: 10_000 }, (_, index) => [
+        `${String(index).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+        provider(),
+      ]),
+    );
+    const bounded = discoverMidnightProviders({ midnight: many });
+    expect(bounded.providers.length).toBeLessThanOrEqual(1_024);
+    expect(bounded.issues.some((issue) => issue.includes("bounded provider count"))).toBe(true);
+  });
+
+  it("rejects secret read results and keeps them out of the report", async () => {
+    const secretProvider = {
+      ...provider(),
+      connect: async (network: string) => ({
+        network,
+        getShieldedBalances: async () => ({ seed: "fixture-secret" }),
+      }),
+    };
+    const report = await runConnectorQualification({
+      source: { midnight: { "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": secretProvider } },
+      target: conformanceFixture("lace").target,
+      requestedNetwork: "preprod",
+      evidence: "fixture",
+      environment: "fixture",
+      now: () => timestamp,
+    });
+    expect(
+      report.assertions.some(
+        (assertion) => assertion.id === "D3.getShieldedBalances" && assertion.status === "fail",
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(report)).not.toContain("fixture-secret");
+    expect(Object.prototype.hasOwnProperty.call(report, "raw")).toBe(false);
   });
 });
 
 describe("adapter qualification", () => {
+  it("admits a healthy exercised adapter only after the full A1-A6 gate", async () => {
+    const report = await runAdapterConformance({
+      adapter: fixtureAdapter(),
+      target: qualifiedTarget,
+      evidence: "exercised",
+      environment: "localnet",
+      harness,
+      now: () => timestamp,
+      timeoutMs: 20,
+    });
+    expect(report.evidence).toBe("exercised");
+    expect(report.assertions.filter((item) => item.status === "fail")).toEqual([]);
+    expect(report.admission).toBe("full");
+    expect(report.assertions.find((item) => item.id === "A6.3")?.status).toBe("pass");
+    expect(report.assertions.find((item) => item.id === "A6.5")?.status).toBe("pass");
+  });
+
   it("validates canonical records while preserving fixture-only admission", async () => {
     const report = await runAdapterConformance({
       adapter: fixtureAdapter(),
-      target,
+      target: qualifiedTarget,
       evidence: "fixture",
       environment: "fixture",
       now: () => timestamp,
@@ -228,13 +397,107 @@ describe("adapter qualification", () => {
   it("bounds a hanging adapter connection", async () => {
     const report = await runAdapterConformance({
       adapter: fixtureAdapter({ hanging: true }),
-      target,
+      target: qualifiedTarget,
       evidence: "exercised",
       environment: "localnet",
+      harness,
       timeoutMs: 10,
       now: () => timestamp,
     });
     expect(report.admission).toBe("quarantined");
     expect(report.assertions.find((assertion) => assertion.id === "A1.1")?.status).toBe("fail");
+  });
+
+  it("fails an empty Runtime Session instead of treating it as conformant", async () => {
+    const report = await runAdapterConformance({
+      adapter: fixtureAdapter({ records: [] }),
+      target: qualifiedTarget,
+      evidence: "exercised",
+      environment: "localnet",
+      harness,
+      timeoutMs: 20,
+      now: () => timestamp,
+    });
+    expect(report.assertions.find((assertion) => assertion.id === "A3.1")?.status).toBe("fail");
+    expect(report.admission).toBe("quarantined");
+  });
+
+  it("rejects additive Result envelopes without echoing hostile fields", async () => {
+    const report = await runAdapterConformance({
+      adapter: fixtureAdapter({
+        requestResult: { ok: true, value: snapshot, evil: "must-not-echo" },
+      }),
+      target: qualifiedTarget,
+      evidence: "exercised",
+      environment: "localnet",
+      harness,
+      now: () => timestamp,
+      timeoutMs: 20,
+    });
+    expect(report.assertions.find((item) => item.id === "A4.1")?.status).toBe("fail");
+    expect(JSON.stringify(report)).not.toContain("must-not-echo");
+  });
+
+  it("contains hostile snapshot getters without crashing the report path", async () => {
+    const hostileSnapshot = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error("snapshot getter trap");
+        },
+        ownKeys: () => {
+          throw new Error("snapshot key trap");
+        },
+      },
+    );
+    const report = await runAdapterConformance({
+      adapter: fixtureAdapter({ requestResult: { ok: true, value: hostileSnapshot } }),
+      target: qualifiedTarget,
+      evidence: "exercised",
+      environment: "localnet",
+      harness,
+      now: () => timestamp,
+      timeoutMs: 20,
+    });
+    expect(report.assertions.find((item) => item.id === "A4.1")?.status).toBe("fail");
+    expect(report.admission).toBe("quarantined");
+  });
+
+  it("does not auto-pass an unknown supported capability", async () => {
+    const unknownDescriptor: RuntimeDescriptor = {
+      ...descriptor,
+      capabilities: [
+        ...descriptor.capabilities,
+        {
+          id: "wallet.mystery",
+          kind: "snapshot",
+          support: {
+            state: "supported",
+            version: "1",
+            evidence: {
+              source: "runtime-declaration",
+              observedAt: timestamp,
+              summary: "declared for negative qualification coverage",
+            },
+          },
+          availability: { state: "available" },
+        },
+      ],
+    };
+    const report = await runAdapterConformance({
+      adapter: fixtureAdapter({ descriptor: unknownDescriptor }),
+      target: qualifiedTarget,
+      evidence: "exercised",
+      environment: "localnet",
+      harness,
+      now: () => timestamp,
+      timeoutMs: 20,
+    });
+    expect(
+      report.capabilities
+        .find((capability) => capability.id === "wallet.mystery")
+        ?.assertions.find((item) => item.id === "CAP.wallet.mystery.suite")?.status,
+    ).toBe("fail");
+    expect(report.admission).toBe("quarantined");
   });
 });

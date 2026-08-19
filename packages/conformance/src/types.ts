@@ -1,8 +1,7 @@
 import type {
   CapabilityAvailability,
   NoxscopeAdapter,
-  NoxscopeRecord,
-  Result,
+  NoxscopeError,
   RuntimeDescriptor,
   Snapshot,
 } from "@noxscope/protocol";
@@ -12,6 +11,12 @@ export const CONFORMANCE_SUITE_VERSION = "noxscope-conformance/1" as const;
 export type EvidenceKind = "fixture" | "exercised";
 export type EvidenceSource =
   "fixture-corpus" | "installed-runtime" | "localnet-harness" | "preprod-harness";
+export interface QualificationHarnessAttestation {
+  readonly kind: "noxscope-qualification-harness";
+  readonly version: "1";
+  readonly artifactDigest: string;
+  readonly isolatedProfile: true;
+}
 export type EnvironmentKind = "fixture" | "localnet" | "preprod" | "preview" | "mainnet";
 export type AssertionStatus = "pass" | "fail" | "skip";
 export type AdmissionState =
@@ -27,6 +32,23 @@ export interface QualificationTarget {
   readonly sourceCommit?: string;
   readonly nativeProtocol?: string;
   readonly network?: string;
+}
+
+export type HarmlessConnectorOperationId = "connector.test-transfer";
+
+/**
+ * The only connector mutation admitted by this package. The provider receives
+ * this typed plan, never the connected provider object or a caller callback.
+ */
+export interface HarmlessConnectorOperationPlan {
+  readonly id: HarmlessConnectorOperationId;
+  readonly network: "localnet" | "preprod";
+  readonly destination: string;
+  readonly testIdentity: string;
+  readonly amount: string;
+  readonly maxSpend: string;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface AssertionResult {
@@ -82,6 +104,7 @@ export interface AdapterConformanceOptions {
   readonly timeoutMs?: number;
   readonly maxRecords?: number;
   readonly now?: () => string;
+  readonly harness?: QualificationHarnessAttestation;
   readonly operations?: {
     readonly enabled: boolean;
     readonly expectedNetwork: "localnet" | "preprod";
@@ -135,6 +158,7 @@ export interface ConnectorQualificationOptions {
   readonly environment?: EnvironmentKind;
   readonly timeoutMs?: number;
   readonly now?: () => string;
+  readonly harness?: QualificationHarnessAttestation;
   readonly observe?: {
     readonly read: () => unknown | Promise<unknown>;
     readonly intervalMs?: number;
@@ -143,9 +167,7 @@ export interface ConnectorQualificationOptions {
   };
   readonly operations?: {
     readonly enabled: boolean;
-    readonly expectedNetwork: "localnet" | "preprod";
-    readonly maxOperations?: number;
-    readonly run?: (connected: Record<string, unknown>) => Promise<unknown>;
+    readonly plan?: HarmlessConnectorOperationPlan;
   };
 }
 
@@ -167,7 +189,16 @@ export interface ConnectorSelection {
 }
 
 export interface ConformanceRunResult extends QualificationReport {
-  readonly records?: readonly NoxscopeRecord[];
   readonly snapshot?: Snapshot;
-  readonly result?: Result<unknown>;
+  readonly result?:
+    | { readonly ok: true; readonly value: { readonly kind: "bounded-result" } }
+    | {
+        readonly ok: false;
+        readonly error: {
+          readonly code: NoxscopeError["code"];
+          readonly message:
+            "Result error was intentionally redacted" | "Result metadata was invalid";
+          readonly retryable: boolean;
+        };
+      };
 }

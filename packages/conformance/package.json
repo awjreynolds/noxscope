@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run src/index.test.ts"
+    "test": "vitest run --root ../.. --config vitest.config.ts packages/conformance/src/index.test.ts"
   },
   "dependencies": {
     "@noxscope/core": "workspace:*",
