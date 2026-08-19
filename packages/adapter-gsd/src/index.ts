@@ -35,6 +35,7 @@ export const GSD_ADAPTER_VERSION = "0.1.0" as const;
 const MAX_PENDING_EXACT_RANGES = 32;
 const MAX_PENDING_RECORDS = MAX_PENDING_EXACT_RANGES + 1;
 const OVERFLOW_SUMMARY_NAME = "gsd.adapter.overflow-summary";
+const MAX_SUMMARY_SOURCE_IDS = 8;
 
 type OverflowGapRecord = DiagnosticEventRecord & {
   readonly event: Extract<DiagnosticEventRecord["event"], { readonly type: "stream-gap" }>;
@@ -602,7 +603,7 @@ class GsdRuntimeSession implements RuntimeSession {
     firstLostSequence?: string,
     lastLostSequence?: string,
   ): void {
-    const sourceStreamId = `${this.descriptor.sessionId}:${stream}`;
+    const sourceStreamId = `${this.descriptor.sessionId}:native:${stream}`;
     const state = this.#streams.get(stream);
     const first =
       firstLostSequence ??
@@ -761,6 +762,8 @@ class GsdRuntimeSession implements RuntimeSession {
         attributes: {
           contiguous: false,
           sourceStreamId: incoming.event.sourceStreamId,
+          sourceStreamIds: [incoming.event.sourceStreamId],
+          sourceStreamCount: "1",
           rangeCount: "1",
           lostSequenceCount: (last - first + 1n).toString(),
           minLostSequence: first.toString(),
@@ -788,8 +791,14 @@ class GsdRuntimeSession implements RuntimeSession {
     const previousMax = parseSummaryInteger(attributes, "maxLostSequence");
     const incomingFirst = BigInt(incoming.event.firstLostSequence);
     const incomingLast = BigInt(incoming.event.lastLostSequence);
-    const sourceStreamId = stringAt(attributes, "sourceStreamId");
     const incomingSource = incoming.event.sourceStreamId;
+    const previousSources = summarySourceIds(attributes);
+    const sourceKnown = previousSources.includes(incomingSource);
+    const sourceCount =
+      parseSummaryInteger(attributes, "sourceStreamCount") + (sourceKnown ? 0n : 1n);
+    const sourceStreamIds = sourceKnown
+      ? previousSources
+      : [...previousSources, incomingSource].slice(0, MAX_SUMMARY_SOURCE_IDS);
     return {
       ...summary,
       event: {
@@ -797,10 +806,9 @@ class GsdRuntimeSession implements RuntimeSession {
         attributes: {
           ...attributes,
           contiguous: false,
-          sourceStreamId:
-            sourceStreamId === undefined || sourceStreamId === incomingSource
-              ? incomingSource
-              : "multiple",
+          sourceStreamId: sourceCount === 1n ? incomingSource : "multiple",
+          sourceStreamIds,
+          sourceStreamCount: sourceCount.toString(),
           rangeCount: (previousCount + 1n).toString(),
           lostSequenceCount: (previousLost + incomingLast - incomingFirst + 1n).toString(),
           minLostSequence: (previousMin < incomingFirst ? previousMin : incomingFirst).toString(),
@@ -938,6 +946,15 @@ function overflowSummarySource(record: NoxscopeRecord): string | undefined {
     return undefined;
   }
   return stringAt(record.event.attributes, "sourceStreamId");
+}
+
+function summarySourceIds(attributes: Record<string, unknown>): readonly string[] {
+  const value = attributes.sourceStreamIds;
+  if (Array.isArray(value)) {
+    return value.filter((source): source is string => typeof source === "string");
+  }
+  const source = stringAt(attributes, "sourceStreamId");
+  return source === undefined ? [] : [source];
 }
 
 function parseSummaryInteger(attributes: Record<string, unknown>, key: string): bigint {

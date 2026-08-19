@@ -520,10 +520,7 @@ describe("GSD Adapter", () => {
       expect(summaries.length).toBeGreaterThan(0);
       const summary = summaries[0];
       if (summary?.kind !== "diagnostic-event" || summary.event.type !== "diagnostic") continue;
-      expect(summary.event.attributes).toMatchObject({
-        contiguous: false,
-        sourceStreamId: "session-gsd-fixture:state",
-      });
+      expect(summary.event.attributes).toMatchObject({ contiguous: false });
       const attributes = summary.event.attributes;
       if (
         attributes === undefined ||
@@ -564,6 +561,30 @@ describe("GSD Adapter", () => {
     );
     expect(exactGaps.length).toBeLessThanOrEqual(32);
     expect(summaries.length).toBeGreaterThan(0);
+  }, 20_000);
+
+  it("does not conflate native continuity gaps with canonical queue overflow", async () => {
+    const messages = Array.from({ length: 500 }, (_, index) => minimalState(String(index * 2 + 1)));
+    const connection = new FixtureConnection(healthyHandshake(), messages);
+    const session = await connect(connection, { queueCapacity: 4 });
+    await connection.completed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const records = await takeRecords(session, 128);
+    const gaps = records.filter(
+      (record) =>
+        record.kind === "diagnostic-event" &&
+        record.event.type === "stream-gap" &&
+        record.event.reason === "overflow",
+    );
+    const sourceStreamIds = new Set(
+      gaps.flatMap((record) =>
+        record.kind === "diagnostic-event" && record.event.type === "stream-gap"
+          ? [record.event.sourceStreamId]
+          : [],
+      ),
+    );
+    expect(sourceStreamIds).toContain("session-gsd-fixture:state");
+    expect(sourceStreamIds).toContain("session-gsd-fixture:native:state");
   }, 20_000);
 
   it("never invokes getters while rejecting hostile native payloads", async () => {
