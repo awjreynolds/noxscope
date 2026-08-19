@@ -75,6 +75,49 @@ describe("recording session", () => {
     session.dispose();
   });
 
+  it("publishes export storage failures so the UI can show a bounded error", async () => {
+    const base = createMemoryRecordingStore();
+    const store = {
+      ...base,
+      load: async () => ({
+        ok: false as const,
+        error: {
+          code: "unavailable" as const,
+          message: "Recording store is offline",
+          retryable: true,
+        },
+      }),
+    };
+    const session = createRecordingSession(fakeCore(), { store });
+    const changes: RecordingSessionState[] = [];
+    session.subscribe((state) => changes.push(state));
+
+    const exported = await session.export("recording-missing");
+
+    expect(exported).toMatchObject({ ok: false, error: { code: "unavailable" } });
+    expect(changes.at(-1)).toMatchObject({
+      phase: "error",
+      error: { code: "unavailable", message: "Recording store is offline" },
+    });
+    session.dispose();
+  });
+
+  it("publishes download failures after a stored Recording is found", async () => {
+    const store = createMemoryRecordingStore();
+    const saved = await store.save({ name: "capture", bytes: new Uint8Array([1, 2, 3]) });
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) throw new Error(saved.error.message);
+    const session = createRecordingSession(fakeCore(), { store });
+    const changes: RecordingSessionState[] = [];
+    session.subscribe((state) => changes.push(state));
+
+    const exported = await session.export(saved.value.id);
+
+    expect(exported).toMatchObject({ ok: false, error: { code: "unavailable" } });
+    expect(changes.at(-1)).toMatchObject({ phase: "error", error: { code: "unavailable" } });
+    session.dispose();
+  });
+
   it("records deterministic provenance for every distinct runtime adapter", async () => {
     const sourceRecord = view.timeline[0]!.record;
     if (sourceRecord.kind !== "diagnostic-event") throw new Error("fixture is not diagnostic");

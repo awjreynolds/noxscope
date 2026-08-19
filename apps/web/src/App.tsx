@@ -1,6 +1,7 @@
 import type { Core, CoreView, RuntimeView, TimelineEntry } from "@noxscope/core";
 import type {
   CapabilityDeclaration,
+  DustState,
   NoxscopeError,
   NoxscopeRecord,
   SanitizedRawDetail,
@@ -14,6 +15,8 @@ import {
 import { createMemoryRecordingStore } from "./recording-store.js";
 
 const emptyView: CoreView = { runtimes: [], timeline: [], ordering: "display-time-only" };
+const LEDGER_PAGE_SIZE = 100;
+const SEARCH_TEXT_LIMIT = 2048;
 
 export interface AppProps {
   readonly core: Core;
@@ -21,6 +24,10 @@ export interface AppProps {
 }
 
 type RecordFilter = "all" | NoxscopeRecord["kind"];
+
+interface IndexedTimelineEntry extends TimelineEntry {
+  readonly searchText: string;
+}
 
 interface FailureEntry {
   readonly runtime: RuntimeView;
@@ -65,32 +72,31 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
   }, [recordingSession]);
 
   const offline = recording.offline;
-  const entries = useMemo<TimelineEntry[]>(
-    () =>
+  const entries = useMemo<IndexedTimelineEntry[]>(() => {
+    const source =
       offline === undefined
-        ? [...view.timeline]
-        : offline.imported.records.map((record) => ({ runtimeId: "offline", record })),
-    [offline, view.timeline],
-  );
+        ? view.timeline
+        : offline.imported.records.map((record) => ({ runtimeId: "offline", record }));
+    return source.map(indexTimelineEntry);
+  }, [offline, view.timeline]);
   const runtimes = offline === undefined ? view.runtimes : [];
   const runtime =
     runtimes.find((candidate) => candidate.descriptor.sessionId === selectedSession) ?? runtimes[0];
   const failures = useMemo(() => collectFailures(runtimes), [runtimes]);
-  const filteredEntries = useMemo(
+  const filteredEntries = useMemo<IndexedTimelineEntry[]>(
     () => filterEntries(entries, query, recordFilter, failuresOnly),
     [entries, failuresOnly, query, recordFilter],
   );
-  const selectedEntry =
-    focusedFailure !== undefined && focusedFailure.record === undefined
-      ? undefined
-      : (entries.find((entry) => recordKey(entry.record) === selectedRecord) ??
-        (offline !== undefined
-          ? [...entries].reverse()[0]
-          : runtime === undefined
-            ? undefined
-            : [...entries]
-                .reverse()
-                .find((entry) => entry.runtimeId === runtime.descriptor.runtimeId)));
+  const selectedEntry = useMemo<IndexedTimelineEntry | undefined>(() => {
+    if (focusedFailure !== undefined && focusedFailure.record === undefined) return undefined;
+    if (selectedRecord !== undefined) {
+      const matching = entries.find((entry) => recordKey(entry.record) === selectedRecord);
+      if (matching !== undefined) return matching;
+    }
+    if (offline !== undefined) return entries.at(-1);
+    if (runtime === undefined) return undefined;
+    return lastEntryForSession(entries, runtime.descriptor.sessionId);
+  }, [entries, focusedFailure, offline, runtime, selectedRecord]);
 
   useEffect(() => {
     if (selectedSession !== undefined && runtime === undefined) setSelectedSession(undefined);
@@ -102,6 +108,34 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
     if (failure.record !== undefined) setSelectedRecord(recordKey(failure.record));
     else setSelectedRecord(undefined);
   };
+
+  const selectEntry = (entry: IndexedTimelineEntry) => {
+    setFocusedFailure(undefined);
+    setSelectedRecord(recordKey(entry.record));
+    const matching = runtimes.find(
+      (candidate) => candidate.descriptor.sessionId === entry.record.meta.sessionId,
+    );
+    if (matching !== undefined) setSelectedSession(matching.descriptor.sessionId);
+  };
+
+  const exportRecording = async (id: string) => {
+    if (recordingSession === undefined) return;
+    try {
+      const result = await recordingSession.export(id);
+      if (!result.ok) {
+        setRecording((current) => ({ ...current, phase: "error", error: result.error }));
+      }
+    } catch {
+      setRecording((current) => ({
+        ...current,
+        phase: "error",
+        error: { code: "internal", message: "Recording export failed", retryable: true },
+      }));
+    }
+  };
+
+  const relatedEntry =
+    selectedEntry === undefined ? undefined : findCausedByEntry(selectedEntry, entries);
 
   return (
     <main className="workbench">
@@ -188,19 +222,14 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
             onFilter={setRecordFilter}
             onFailuresOnly={setFailuresOnly}
           />
-          <TraceTable
-            entries={filteredEntries}
-            selected={selectedEntry}
-            onSelect={(entry) => {
-              setFocusedFailure(undefined);
-              setSelectedRecord(recordKey(entry.record));
-              const matching = runtimes.find(
-                (candidate) => candidate.descriptor.runtimeId === entry.runtimeId,
-              );
-              if (matching !== undefined) setSelectedSession(matching.descriptor.sessionId);
-            }}
+          <TraceTable entries={filteredEntries} selected={selectedEntry} onSelect={selectEntry} />
+          <RecordInspector
+            entry={selectedEntry}
+            runtime={runtime}
+            failure={focusedFailure}
+            relatedEntry={relatedEntry}
+            onSelectEntry={selectEntry}
           />
-          <RecordInspector entry={selectedEntry} runtime={runtime} failure={focusedFailure} />
         </section>
       </div>
       <RecordingLibrary
@@ -208,7 +237,7 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
         disabled={recordingSession === undefined}
         onLoad={(id) => void recordingSession?.load(id)}
         onDelete={(id) => void recordingSession?.delete(id)}
-        onExport={(id) => void recordingSession?.export(id)}
+        onExport={exportRecording}
       />
     </main>
   );
@@ -243,13 +272,22 @@ function RuntimeRail({
       ) : (
         runtimes.map((candidate, index) => {
           const isSelected = selected?.descriptor.sessionId === candidate.descriptor.sessionId;
+          const duplicateName =
+            runtimes.filter((other) => runtimeName(other) === runtimeName(candidate)).length > 1;
+          const duplicateRuntimeId =
+            runtimes.filter(
+              (other) => other.descriptor.runtimeId === candidate.descriptor.runtimeId,
+            ).length > 1;
+          const contextLabel = `${candidate.descriptor.runtimeId} · session ${candidate.descriptor.sessionId}`;
           return (
             <button
               className={`runtime-selector${isSelected ? " is-selected" : ""}`}
               key={candidate.descriptor.sessionId}
               type="button"
               aria-pressed={isSelected}
-              aria-label={`Select ${runtimeName(candidate)}`}
+              aria-label={`Select ${runtimeName(candidate)}${
+                duplicateName || duplicateRuntimeId ? ` (${contextLabel})` : ""
+              }`}
               onClick={() => onSelect(candidate)}
             >
               <span className="runtime-index">{String(index + 1).padStart(2, "0")}</span>
@@ -260,6 +298,9 @@ function RuntimeRail({
                 <small>
                   {candidate.descriptor.runtime.surface} · {candidate.descriptor.runtimeId}
                 </small>
+                {duplicateName || duplicateRuntimeId ? (
+                  <small>session {candidate.descriptor.sessionId}</small>
+                ) : null}
                 <small>
                   {candidate.latestSnapshot?.network?.id ?? "network unknown"} ·{" "}
                   {candidate.records.length} records
@@ -421,15 +462,18 @@ function RuntimeState({
 function DustDiagnostics({ runtime }: { readonly runtime: RuntimeView }) {
   const dust = runtime.latestSnapshot?.dust;
   const capability = runtime.capabilities.find((candidate) => candidate.id.includes("dust"));
+  const status = dustStatus(runtime, dust, capability);
   return (
     <section className="state-section dust-section" aria-labelledby="dust-title">
       <SectionHeading kicker="Capability evidence" title="DUST diagnostics" id="dust-title" />
       <div className="dust-grid">
         <div>
           <span className="field-label">Snapshot state</span>
-          <strong>{dust?.state ?? "unknown"}</strong>
+          <strong>{status}</strong>
           <small>
-            {dust?.progress === undefined ? "Progress indeterminate" : `${dust.progress}% observed`}
+            {dust?.progress === undefined
+              ? dustStatusExplanation(status, capability)
+              : `${dust.progress}% observed`}
           </small>
         </div>
         {capability === undefined ? (
@@ -440,6 +484,31 @@ function DustDiagnostics({ runtime }: { readonly runtime: RuntimeView }) {
       </div>
     </section>
   );
+}
+
+function dustStatus(
+  runtime: RuntimeView,
+  dust: DustState | undefined,
+  capability: CapabilityDeclaration | undefined,
+): string {
+  if (runtime.latestSnapshot?.freshness.state === "stale") return "stale";
+  if (dust !== undefined && typeof dust === "object" && dust !== null && "state" in dust)
+    return dust.state;
+  if (capability?.support.state === "unsupported") return "unsupported";
+  if (capability?.availability.state !== undefined && capability.availability.state !== "available")
+    return "unavailable";
+  return runtime.latestSnapshot === undefined ? "unavailable" : "absent";
+}
+
+function dustStatusExplanation(status: string, capability: CapabilityDeclaration | undefined) {
+  if (status === "unsupported")
+    return capability?.support.state === "unsupported"
+      ? capability.support.reason
+      : "DUST is not supported.";
+  if (status === "unavailable") return "DUST state is currently unavailable.";
+  if (status === "stale") return "DUST state is from a stale snapshot.";
+  if (status === "absent") return "No DUST state was included in this snapshot.";
+  return "Progress indeterminate";
 }
 
 function Capabilities({
@@ -525,7 +594,7 @@ function TraceToolbar({
           <p className="eyebrow">Display-time projection · per-stream order retained</p>
           <h2>Evidence ledger</h2>
         </div>
-        <span className="result-count">{resultCount} shown</span>
+        <span className="result-count">{resultCount} matching</span>
       </div>
       <div className="trace-filters" aria-label="Trace filters">
         <label>
@@ -567,10 +636,13 @@ function TraceTable({
   selected,
   onSelect,
 }: {
-  readonly entries: readonly TimelineEntry[];
-  readonly selected: TimelineEntry | undefined;
-  readonly onSelect: (entry: TimelineEntry) => void;
+  readonly entries: readonly IndexedTimelineEntry[];
+  readonly selected: IndexedTimelineEntry | undefined;
+  readonly onSelect: (entry: IndexedTimelineEntry) => void;
 }) {
+  const [visibleCount, setVisibleCount] = useState(LEDGER_PAGE_SIZE);
+  useEffect(() => setVisibleCount(LEDGER_PAGE_SIZE), [entries]);
+  const visibleEntries = entries.slice(0, visibleCount);
   return (
     <section className="trace-table" aria-label="Ordered event stream">
       <div className="trace-row trace-header" role="row">
@@ -582,7 +654,7 @@ function TraceTable({
       {entries.length === 0 ? (
         <p className="trace-empty">No records match the current filters.</p>
       ) : (
-        entries.map((entry) => {
+        visibleEntries.map((entry) => {
           const isSelected =
             selected !== undefined && recordKey(selected.record) === recordKey(entry.record);
           return (
@@ -609,6 +681,25 @@ function TraceTable({
           );
         })
       )}
+      {entries.length > visibleEntries.length ? (
+        <div className="trace-pagination">
+          <p>
+            Showing {visibleEntries.length.toLocaleString()} of {entries.length.toLocaleString()}{" "}
+            matching records.
+          </p>
+          <button
+            type="button"
+            onClick={() => setVisibleCount((count) => count + LEDGER_PAGE_SIZE)}
+          >
+            Load next {LEDGER_PAGE_SIZE}
+          </button>
+        </div>
+      ) : entries.length > 0 ? (
+        <p className="trace-pagination-count">
+          Showing {visibleEntries.length.toLocaleString()} of {entries.length.toLocaleString()}{" "}
+          matching records.
+        </p>
+      ) : null}
     </section>
   );
 }
@@ -617,10 +708,14 @@ function RecordInspector({
   entry,
   runtime,
   failure,
+  relatedEntry,
+  onSelectEntry,
 }: {
-  readonly entry: TimelineEntry | undefined;
+  readonly entry: IndexedTimelineEntry | undefined;
   readonly runtime: RuntimeView | undefined;
   readonly failure: FailureEntry | undefined;
+  readonly relatedEntry: IndexedTimelineEntry | undefined;
+  readonly onSelectEntry: (entry: IndexedTimelineEntry) => void;
 }) {
   if (entry === undefined && failure !== undefined)
     return (
@@ -638,6 +733,7 @@ function RecordInspector({
     );
   const record = entry.record;
   const error = recordError(record);
+  const canonicalPayload = useMemo(() => JSON.stringify(recordPayload(record), null, 2), [record]);
   return (
     <section className="record-inspector" aria-label="Record inspector">
       <div className="inspector-heading">
@@ -655,14 +751,14 @@ function RecordInspector({
         <Fact label="Observed" value={record.meta.observedAt} />
         <Fact label="Received" value={record.meta.receivedAt} />
       </dl>
-      <Correlation record={record} />
+      <Correlation record={record} relatedEntry={relatedEntry} onSelectEntry={onSelectEntry} />
       {error === undefined ? null : <FailureInspector error={error} record={record} />}
       {record.kind === "operation" ? (
         <OperationTimeline runtime={runtime} operationId={record.meta.correlation.operationId} />
       ) : null}
       <details className="payload-disclosure">
         <summary>Canonical payload</summary>
-        <pre>{JSON.stringify(recordPayload(record), null, 2)}</pre>
+        <pre>{canonicalPayload}</pre>
       </details>
       <RawDetailDisclosure record={record} />
     </section>
@@ -733,19 +829,17 @@ function FailureStrip({
         </span>
       ) : (
         <div className="failure-items">
-          {failures.slice(0, 4).map((failure, index) => (
-            <button
-              type="button"
-              key={`${failure.runtime.descriptor.sessionId}-${failure.source}-${index}`}
-              onClick={() => onSelect(failure)}
-            >
-              <b>{failure.error.code}</b>
-              <span>{failure.error.message}</span>
-              <small>
-                {failure.source} · {failure.error.retryable ? "retryable" : "terminal"}
-              </small>
-            </button>
-          ))}
+          {sortFailures(failures)
+            .slice(0, 4)
+            .map((failure) => (
+              <button type="button" key={failureKey(failure)} onClick={() => onSelect(failure)}>
+                <b>{failure.error.code}</b>
+                <span>{failure.error.message}</span>
+                <small>
+                  {failure.source} · {failure.error.retryable ? "retryable" : "terminal"}
+                </small>
+              </button>
+            ))}
         </div>
       )}
     </section>
@@ -783,7 +877,15 @@ function FailureInspector({
   );
 }
 
-function Correlation({ record }: { readonly record: NoxscopeRecord }) {
+function Correlation({
+  record,
+  relatedEntry,
+  onSelectEntry,
+}: {
+  readonly record: NoxscopeRecord;
+  readonly relatedEntry: IndexedTimelineEntry | undefined;
+  readonly onSelectEntry: (entry: IndexedTimelineEntry) => void;
+}) {
   const correlation = record.meta.correlation;
   return (
     <section className="correlation-block" aria-label="Record correlation">
@@ -798,8 +900,20 @@ function Correlation({ record }: { readonly record: NoxscopeRecord }) {
           <Fact label="Request" value={correlation.requestId ?? "not observed"} />
           <Fact label="Operation" value={correlation.operationId ?? "not observed"} />
           <Fact label="Parent" value={correlation.parentOperationId ?? "not observed"} />
+          <Fact label="Caused by sequence" value={correlation.causedBySequence ?? "not observed"} />
           <Fact label="Trace" value={correlation.traceId ?? "not observed"} />
         </dl>
+      )}
+      {correlation?.causedBySequence === undefined ? null : relatedEntry === undefined ? (
+        <p className="empty-copy">Caused-by record is not present in this projection.</p>
+      ) : (
+        <button
+          className="related-record-link"
+          type="button"
+          onClick={() => onSelectEntry(relatedEntry)}
+        >
+          Select caused-by record #{relatedEntry.record.meta.sequence}
+        </button>
       )}
     </section>
   );
@@ -812,13 +926,20 @@ function RawDetailDisclosure({
   readonly record?: NoxscopeRecord;
   readonly raw?: readonly SanitizedRawDetail[];
 }) {
-  const details = raw ?? (record === undefined ? [] : rawDetailFor(record));
+  const details = useMemo(
+    () => raw ?? (record === undefined ? [] : rawDetailFor(record)),
+    [raw, record],
+  );
+  const formattedDetails = useMemo(
+    () => details.map((detail) => ({ detail, value: JSON.stringify(detail.value, null, 2) })),
+    [details],
+  );
   if (details.length === 0) return null;
   return (
     <details className="raw-disclosure">
       <summary>Sanitised raw detail · {details.length}</summary>
       <div className="raw-detail-list">
-        {details.map((detail, index) => (
+        {formattedDetails.map(({ detail, value }, index) => (
           <div
             className="raw-detail-entry"
             key={`${detail.namespace}-${detail.schemaVersion}-${index}`}
@@ -827,7 +948,7 @@ function RawDetailDisclosure({
             <span>
               schema {detail.schemaVersion} · policy {detail.sanitization.policy}
             </span>
-            <pre>{JSON.stringify(detail.value, null, 2)}</pre>
+            <pre>{value}</pre>
           </div>
         ))}
       </div>
@@ -1029,20 +1150,74 @@ function RecordKind({ record }: { readonly record: NoxscopeRecord }) {
   return <span className={`record-kind kind-${record.kind}`}>{record.kind}</span>;
 }
 
+function indexTimelineEntry(entry: TimelineEntry): IndexedTimelineEntry {
+  return { ...entry, searchText: buildSearchText(entry) };
+}
+
+function buildSearchText(entry: TimelineEntry): string {
+  const { record } = entry;
+  const correlation = record.meta.correlation;
+  const error = recordError(record);
+  const fields = [
+    entry.runtimeId,
+    record.kind,
+    recordTitle(record),
+    record.meta.sessionId,
+    record.meta.streamId,
+    record.meta.sequence,
+    correlation?.requestId,
+    correlation?.operationId,
+    correlation?.parentOperationId,
+    correlation?.causedBySequence,
+    correlation?.traceId,
+    error?.code,
+    error?.message,
+  ];
+  return fields
+    .filter((field): field is string => field !== undefined)
+    .map((field) => field.slice(0, 256))
+    .join(" ")
+    .toLowerCase()
+    .slice(0, SEARCH_TEXT_LIMIT);
+}
+
+function lastEntryForSession(
+  entries: readonly IndexedTimelineEntry[],
+  sessionId: string,
+): IndexedTimelineEntry | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry?.record.meta.sessionId === sessionId) return entry;
+  }
+  return undefined;
+}
+
+function findCausedByEntry(
+  entry: IndexedTimelineEntry,
+  entries: readonly IndexedTimelineEntry[],
+): IndexedTimelineEntry | undefined {
+  const causedBySequence = entry.record.meta.correlation?.causedBySequence;
+  if (causedBySequence === undefined) return undefined;
+  return entries.find(
+    (candidate) =>
+      candidate.record.meta.sessionId === entry.record.meta.sessionId &&
+      candidate.record.meta.streamId === entry.record.meta.streamId &&
+      candidate.record.meta.sequence === causedBySequence,
+  );
+}
+
 function filterEntries(
-  entries: readonly TimelineEntry[],
+  entries: readonly IndexedTimelineEntry[],
   query: string,
   filter: RecordFilter,
   failuresOnly: boolean,
 ) {
   const needle = query.trim().toLowerCase();
-  return entries.filter(({ record }) => {
+  return entries.filter(({ record, searchText }) => {
     if (filter !== "all" && record.kind !== filter) return false;
     if (failuresOnly && !isFailureRecord(record)) return false;
     if (needle.length === 0) return true;
-    return `${recordTitle(record)} ${record.meta.streamId} ${record.meta.sequence} ${record.meta.sessionId} ${JSON.stringify(recordPayload(record))}`
-      .toLowerCase()
-      .includes(needle);
+    return searchText.includes(needle);
   });
 }
 function collectFailures(runtimes: readonly RuntimeView[]): FailureEntry[] {
@@ -1074,7 +1249,40 @@ function collectFailures(runtimes: readonly RuntimeView[]): FailureEntry[] {
         failures.push({ runtime, record, error, source: recordSource(record) });
     }
   }
-  return failures;
+  return sortFailures(failures);
+}
+
+function sortFailures(failures: readonly FailureEntry[]): FailureEntry[] {
+  return [...failures].sort((left, right) => {
+    const severity = failureSeverity(right) - failureSeverity(left);
+    if (severity !== 0) return severity;
+    const current = failureCurrentAt(right).localeCompare(failureCurrentAt(left));
+    if (current !== 0) return current;
+    return failureKey(left).localeCompare(failureKey(right));
+  });
+}
+
+function failureSeverity(failure: FailureEntry): number {
+  if (!failure.error.retryable) return 3;
+  if (failure.runtime.status === "failed") return 2;
+  return 1;
+}
+
+function failureCurrentAt(failure: FailureEntry): string {
+  if (failure.record !== undefined) return failure.record.meta.receivedAt;
+  return failure.runtime.records.at(-1)?.meta.receivedAt ?? "";
+}
+
+function failureKey(failure: FailureEntry): string {
+  const record = failure.record;
+  return [
+    failure.runtime.descriptor.sessionId,
+    record?.meta.streamId ?? "",
+    record?.meta.sequence ?? "",
+    failure.error.code,
+    failure.error.message,
+    failure.source,
+  ].join("\u0000");
 }
 function recordError(record: NoxscopeRecord): NoxscopeError | undefined {
   if (record.kind === "operation") return record.operation.error;

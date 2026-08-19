@@ -711,6 +711,29 @@ button:disabled {
   color: #6a867d;
   font-size: 0.7rem;
 }
+.trace-pagination,
+.trace-pagination-count {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 15px;
+  border-top: 1px solid #29423c;
+  color: #78958b;
+  font: 0.62rem/1.3 monospace;
+}
+.trace-pagination button,
+.related-record-link {
+  border: 1px solid #386454;
+  border-radius: 3px;
+  padding: 5px 8px;
+  color: #a4d7c2;
+  background: #12251e;
+  font: 700 0.61rem/1.2 monospace;
+}
+.related-record-link {
+  margin-top: 8px;
+}
 .record-kind {
   width: fit-content;
   border-radius: 3px;

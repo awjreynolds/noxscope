@@ -372,8 +372,13 @@ export function createRecordingSession(
     async export(id) {
       if (current.phase === "offline") return offlineDenied();
       const loaded = await store.load(id);
-      if (!loaded.ok) return loaded;
-      return downloadRecording(loaded.value.bytes, loaded.value.name);
+      if (!loaded.ok) {
+        publish({ ...current, phase: "error", error: loaded.error });
+        return loaded;
+      }
+      const downloaded = downloadRecording(loaded.value.bytes, loaded.value.name);
+      if (!downloaded.ok) publish({ ...current, phase: "error", error: downloaded.error });
+      return downloaded;
     },
     async requestOperation() {
       if (current.phase === "offline") return offlineDenied();
