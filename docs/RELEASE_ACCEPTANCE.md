@@ -3,6 +3,13 @@
 This checklist is the gate for a tagged Noxscope release. A green build alone
 does not establish wallet compatibility or localnet/Preprod evidence.
 
+Noxscope 0.1.0 uses the **source/fixture** release profile. For that profile,
+the repository/package gates and automated runtime/security gates are
+mandatory; unchecked live-wallet, localnet/Preprod, and manual-browser items
+are documented limitations. They block a target-specific compatibility claim,
+not the source tag. A later **wallet-qualified** release must sign every item
+for each target it claims, with the exact build and environment evidence.
+
 ## Repository and package gates
 
 - [ ] `pnpm install --frozen-lockfile` succeeds on Node 24+ / pnpm 10.33+.

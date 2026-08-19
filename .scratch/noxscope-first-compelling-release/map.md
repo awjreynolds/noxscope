@@ -34,6 +34,7 @@ Deliver a runnable, tested, Apache-2.0 Noxscope release that can connect to GSD 
 - [Integrate Moth and the Node HostBridge](./issues/13-integrate-moth-and-the-node-hostbridge.md) — Poll only the audited Moth daemon state contract and carry exact canonical records through an authenticated, replay-resistant, loopback-only, strictly bounded HostBridge with honest unsupported capabilities.
 - [Build the first-release observability workbench](./issues/15-build-the-first-release-workbench.md) — Use one collision-safe canonical split-pane inspector for simultaneous live and offline runtimes, combining bounded temporal search, capability/freshness evidence, correlated operations, DUST and failure diagnostics, and local Recording controls.
 - [Build wallet conformance and connector validation](./issues/14-build-wallet-conformance-and-connector-validation.md) — Qualify canonical Adapters and connector discovery separately through bounded executable evidence, exact harmless-operation safety plans, sanitized scoped reports, and admission rules that cannot turn fixtures into live compatibility claims.
+- [Verify, package, and release Noxscope](./issues/16-verify-package-and-release-noxscope.md) — Ship one reproducible 0.1.0 source release gate covering 179 tests, production builds, provenance/legal checks, bounded secret scans, and clean extracted imports for seven packages while keeping every wallet-compatibility claim scoped to its real evidence.
 
 ## Not yet specified
 
