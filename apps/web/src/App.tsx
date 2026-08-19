@@ -30,6 +30,7 @@ interface IndexedTimelineEntry extends TimelineEntry {
 }
 
 interface FailureEntry {
+  readonly id: string;
   readonly runtime: RuntimeView;
   readonly record?: NoxscopeRecord;
   readonly error: NoxscopeError;
@@ -76,7 +77,10 @@ export function App({ core, recordingSession: providedRecordingSession }: AppPro
     const source =
       offline === undefined
         ? view.timeline
-        : offline.imported.records.map((record) => ({ runtimeId: "offline", record }));
+        : offline.imported.records.map((record) => ({
+            runtimeId: record.meta.runtimeId,
+            record,
+          }));
     return source.map(indexTimelineEntry);
   }, [offline, view.timeline]);
   const runtimes = offline === undefined ? view.runtimes : [];
@@ -444,7 +448,7 @@ function RuntimeState({
         ) : (
           <div className="balance-grid">
             {snapshot.balances.map((balance) => (
-              <div className="balance-card" key={`${balance.assetId}-${balance.domain}`}>
+              <div className="balance-card" key={JSON.stringify([balance.assetId, balance.domain])}>
                 <span>{balance.assetId}</span>
                 <strong>{formatDecimal(balance.amount)}</strong>
                 <small>{balance.domain}</small>
@@ -832,7 +836,7 @@ function FailureStrip({
           {sortFailures(failures)
             .slice(0, 4)
             .map((failure) => (
-              <button type="button" key={failureKey(failure)} onClick={() => onSelect(failure)}>
+              <button type="button" key={failure.id} onClick={() => onSelect(failure)}>
                 <b>{failure.error.code}</b>
                 <span>{failure.error.message}</span>
                 <small>
@@ -942,7 +946,7 @@ function RawDetailDisclosure({
         {formattedDetails.map(({ detail, value }, index) => (
           <div
             className="raw-detail-entry"
-            key={`${detail.namespace}-${detail.schemaVersion}-${index}`}
+            key={JSON.stringify([detail.namespace, detail.schemaVersion, index])}
           >
             <strong>{detail.namespace}</strong>
             <span>
@@ -1223,18 +1227,30 @@ function filterEntries(
 function collectFailures(runtimes: readonly RuntimeView[]): FailureEntry[] {
   const failures: FailureEntry[] = [];
   for (const runtime of runtimes) {
-    for (const error of runtime.failures) {
-      const relatedRecord = runtime.records.find((record) => {
-        const recordFailure = recordError(record);
-        return recordFailure?.code === error.code && recordFailure.message === error.message;
-      });
+    const relatedRecords = new Map<string, NoxscopeRecord[]>();
+    for (const record of runtime.records) {
+      const error = recordError(record);
+      if (error === undefined) continue;
+      const key = errorIdentity(error);
+      const records = relatedRecords.get(key) ?? [];
+      records.push(record);
+      relatedRecords.set(key, records);
+    }
+    const relatedIndexes = new Map<string, number>();
+    runtime.failures.forEach((error, failureIndex) => {
+      const key = errorIdentity(error);
+      const records = relatedRecords.get(key) ?? [];
+      const relatedIndex = relatedIndexes.get(key) ?? 0;
+      const relatedRecord = records[relatedIndex];
+      relatedIndexes.set(key, relatedIndex + 1);
       failures.push({
+        id: failureIdentity(runtime, error, relatedRecord, failureIndex),
         runtime,
         error,
         source: "Runtime Session",
         ...(relatedRecord === undefined ? {} : { record: relatedRecord }),
       });
-    }
+    });
     for (const record of runtime.records) {
       const error = recordError(record);
       if (
@@ -1246,10 +1262,36 @@ function collectFailures(runtimes: readonly RuntimeView[]): FailureEntry[] {
           )
         )
       )
-        failures.push({ runtime, record, error, source: recordSource(record) });
+        failures.push({
+          id: failureIdentity(runtime, error, record),
+          runtime,
+          record,
+          error,
+          source: recordSource(record),
+        });
     }
   }
   return sortFailures(failures);
+}
+
+function errorIdentity(error: NoxscopeError): string {
+  return JSON.stringify([error.code, error.message, error.retryable, error.capability]);
+}
+
+function failureIdentity(
+  runtime: RuntimeView,
+  error: NoxscopeError,
+  record: NoxscopeRecord | undefined,
+  occurrence = 0,
+): string {
+  return JSON.stringify([
+    "failure",
+    runtime.descriptor.sessionId,
+    record === undefined ? "runtime" : recordKey(record),
+    error.code,
+    error.message,
+    occurrence,
+  ]);
 }
 
 function sortFailures(failures: readonly FailureEntry[]): FailureEntry[] {
@@ -1258,7 +1300,7 @@ function sortFailures(failures: readonly FailureEntry[]): FailureEntry[] {
     if (severity !== 0) return severity;
     const current = failureCurrentAt(right).localeCompare(failureCurrentAt(left));
     if (current !== 0) return current;
-    return failureKey(left).localeCompare(failureKey(right));
+    return left.id.localeCompare(right.id);
   });
 }
 
@@ -1273,17 +1315,6 @@ function failureCurrentAt(failure: FailureEntry): string {
   return failure.runtime.records.at(-1)?.meta.receivedAt ?? "";
 }
 
-function failureKey(failure: FailureEntry): string {
-  const record = failure.record;
-  return [
-    failure.runtime.descriptor.sessionId,
-    record?.meta.streamId ?? "",
-    record?.meta.sequence ?? "",
-    failure.error.code,
-    failure.error.message,
-    failure.source,
-  ].join("\u0000");
-}
 function recordError(record: NoxscopeRecord): NoxscopeError | undefined {
   if (record.kind === "operation") return record.operation.error;
   if (
@@ -1325,7 +1356,7 @@ function rawDetailFor(record: NoxscopeRecord): readonly SanitizedRawDetail[] {
   return record.event.type === "diagnostic" ? (record.event.raw ?? []) : [];
 }
 function recordKey(record: NoxscopeRecord) {
-  return `${record.meta.sessionId}-${record.meta.streamId}-${record.meta.sequence}`;
+  return JSON.stringify([record.meta.sessionId, record.meta.streamId, record.meta.sequence]);
 }
 function recordTone(record: NoxscopeRecord) {
   if (recordError(record) !== undefined) return "danger";

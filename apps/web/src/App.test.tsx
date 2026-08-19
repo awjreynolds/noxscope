@@ -2,7 +2,7 @@
 
 import { createMockAdapter, type MockScenario } from "@noxscope/adapter-mock";
 import { createCore, type Core, type CoreView } from "@noxscope/core";
-import type { NoxscopeRecord } from "@noxscope/protocol";
+import type { NoxscopeError, NoxscopeRecord } from "@noxscope/protocol";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -92,12 +92,29 @@ describe("Overview", () => {
         message: "offline fixture",
       },
     };
+    const secondRecord: NoxscopeRecord = {
+      ...record,
+      meta: {
+        ...record.meta,
+        sessionId: "offline-session-2",
+        runtimeId: "offline-runtime-2",
+        sequence: "2",
+      },
+      event: {
+        type: "diagnostic",
+        name: "runtime.second",
+        category: "lifecycle",
+        level: "info",
+        source: "runtime",
+        message: "offline fixture two",
+      },
+    };
     const state = {
       phase: "offline",
       summaries: [],
       offline: {
         name: "captured-fixture",
-        imported: { records: [record] },
+        imported: { records: [record, secondRecord] },
       },
     } as unknown as RecordingSessionState;
     const recordingSession = {
@@ -111,6 +128,8 @@ describe("Overview", () => {
 
     expect(await screen.findByText("Replay-only evidence")).toBeTruthy();
     expect(screen.getByText("runtime.ready")).toBeTruthy();
+    expect(screen.getAllByText("offline-runtime").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("offline-runtime-2").length).toBeGreaterThan(0);
     expect(screen.getByText("Canonical payload")).toBeTruthy();
     expect(
       screen
@@ -318,6 +337,86 @@ describe("Overview", () => {
     expect(buttons[2]?.textContent).toContain("Stream gap");
   });
 
+  it("gives repeated identical failures unique record-linked identities", () => {
+    const operation = (sequence: string, receivedAt: string): NoxscopeRecord => ({
+      kind: "operation",
+      meta: {
+        protocol: "noxscope/adapter/1",
+        sessionId: "session-repeated-failures",
+        runtimeId: "runtime-repeated-failures",
+        streamId: "operations",
+        sequence,
+        observedAt: receivedAt,
+        receivedAt,
+        correlation: { operationId: `operation-${sequence}` },
+      },
+      operation: {
+        kind: "transaction.submit",
+        phase: "submitting",
+        state: "failed",
+        error: { code: "rejected", message: "same failure", retryable: false },
+      },
+    });
+    const error: NoxscopeError = {
+      code: "rejected",
+      message: "same failure",
+      retryable: false,
+    };
+    render(
+      <App
+        core={staticCore(
+          [operation("1", "2026-08-19T12:00:01.000Z"), operation("2", "2026-08-19T12:00:02.000Z")],
+          [error, error],
+        )}
+      />,
+    );
+
+    const failureButtons = within(screen.getByLabelText("Current failures")).getAllByRole("button");
+    expect(failureButtons).toHaveLength(2);
+    fireEvent.click(failureButtons[0]!);
+    expect(screen.getByLabelText("Record inspector").textContent).toContain("2");
+    fireEvent.click(failureButtons[1]!);
+    expect(screen.getByLabelText("Record inspector").textContent).toContain("1");
+  });
+
+  it("keeps record keys unique when IDs contain delimiter-like characters", () => {
+    const makeRecord = (sessionId: string, streamId: string, name: string): NoxscopeRecord => ({
+      kind: "diagnostic-event",
+      meta: {
+        protocol: "noxscope/adapter/1",
+        sessionId,
+        runtimeId: "runtime-key-collision",
+        streamId,
+        sequence: "1",
+        observedAt: "2026-08-19T12:00:00.000Z",
+        receivedAt: "2026-08-19T12:00:00.000Z",
+      },
+      event: {
+        type: "diagnostic",
+        name,
+        category: "test",
+        level: "info",
+        source: "runtime",
+      },
+    });
+    const consoleErrors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      render(
+        <App
+          core={staticCore([
+            makeRecord("a-b", "c", "first-key-record"),
+            makeRecord("a", "b-c", "second-key-record"),
+          ])}
+        />,
+      );
+      const stream = screen.getByLabelText("Ordered event stream");
+      expect(within(stream).getAllByRole("button")).toHaveLength(2);
+      expect(consoleErrors.mock.calls.flat().join(" ")).not.toContain("same key");
+    } finally {
+      consoleErrors.mockRestore();
+    }
+  });
+
   it("links a caused-by sequence to the record in the same session and stream", () => {
     const first: NoxscopeRecord = {
       kind: "diagnostic-event",
@@ -393,7 +492,10 @@ describe("Overview", () => {
   });
 });
 
-function staticCore(records: readonly NoxscopeRecord[]): Core {
+function staticCore(
+  records: readonly NoxscopeRecord[],
+  failures: readonly NoxscopeError[] = [],
+): Core {
   const sessionId = records[0]?.meta.sessionId ?? "session-static";
   const runtimeId = records[0]?.meta.runtimeId ?? "runtime-static";
   const runtime = {
@@ -408,7 +510,7 @@ function staticCore(records: readonly NoxscopeRecord[]): Core {
     status: "observing" as const,
     capabilities: [],
     records,
-    failures: [],
+    failures,
   };
   const view = {
     runtimes: [runtime],
