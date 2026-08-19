@@ -495,7 +495,7 @@ describe("GSD Adapter", () => {
   }, 20_000);
 
   it("bounds disjoint overflow evidence while preserving an honest summary", async () => {
-    for (const count of [500, 2_000]) {
+    for (const count of [500, 2_000, 10_000]) {
       const messages = Array.from({ length: count }, (_, index) =>
         minimalState(String(index * 2 + 1)),
       );
@@ -538,6 +538,32 @@ describe("GSD Adapter", () => {
       expect(objectAttributes.minLostSequence).toBeDefined();
       expect(objectAttributes.maxLostSequence).toBeDefined();
     }
+  }, 60_000);
+
+  it("keeps the exact bound after coalescing and then receiving disjoint ranges", async () => {
+    const messages = [
+      ...Array.from({ length: 100 }, (_, index) => minimalState(String(index + 1))),
+      ...Array.from({ length: 200 }, (_, index) => minimalState(String(202 + index * 2))),
+    ];
+    const connection = new FixtureConnection(healthyHandshake(), messages);
+    const session = await connect(connection, { queueCapacity: 4 });
+    await connection.completed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const records = await takeRecords(session, 128);
+    const exactGaps = records.filter(
+      (record) =>
+        record.kind === "diagnostic-event" &&
+        record.event.type === "stream-gap" &&
+        record.event.reason === "overflow",
+    );
+    const summaries = records.filter(
+      (record) =>
+        record.kind === "diagnostic-event" &&
+        record.event.type === "diagnostic" &&
+        record.event.name === "gsd.adapter.overflow-summary",
+    );
+    expect(exactGaps.length).toBeLessThanOrEqual(32);
+    expect(summaries.length).toBeGreaterThan(0);
   }, 20_000);
 
   it("never invokes getters while rejecting hostile native payloads", async () => {

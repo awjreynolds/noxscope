@@ -674,7 +674,7 @@ class GsdRuntimeSession implements RuntimeSession {
     incoming: NoxscopeRecord,
   ): readonly NoxscopeRecord[] {
     const incomingGap = overflowGap(incoming);
-    if (incomingGap === undefined) return [...pending, incoming];
+    if (incomingGap === undefined) return this.normalizePendingOverflow([...pending, incoming]);
     const result = [...pending];
     for (let index = 0; index < result.length; index += 1) {
       const candidate = result[index];
@@ -694,22 +694,53 @@ class GsdRuntimeSession implements RuntimeSession {
         result.splice(other, 1);
         if (other < index) index -= 1;
       }
-      return result;
+      return this.normalizePendingOverflow(result);
     }
     if (
       result.filter((record) => overflowGap(record) !== undefined).length < MAX_PENDING_EXACT_RANGES
     ) {
       result.push(incomingGap);
-      return result;
+      return this.normalizePendingOverflow(result);
     }
     const summaryIndex = result.findIndex((record) => overflowSummarySource(record) !== undefined);
     if (summaryIndex >= 0) {
       const summary = result[summaryIndex];
       if (summary !== undefined)
         result[summaryIndex] = this.updateOverflowSummary(summary, incomingGap);
-      return result;
+      return this.normalizePendingOverflow(result);
     }
     result.push(this.makeOverflowSummary(incomingGap));
+    return this.normalizePendingOverflow(result);
+  }
+
+  private normalizePendingOverflow(pending: readonly NoxscopeRecord[]): readonly NoxscopeRecord[] {
+    const result = [...pending];
+    const exactIndices = result.flatMap((record, index) =>
+      overflowGap(record) === undefined ? [] : [index],
+    );
+    if (exactIndices.length <= MAX_PENDING_EXACT_RANGES) return result;
+    let summaryIndex = result.findIndex((record) => overflowSummarySource(record) !== undefined);
+    let summary = summaryIndex < 0 ? undefined : result[summaryIndex];
+    for (const index of exactIndices.slice(MAX_PENDING_EXACT_RANGES)) {
+      const gap = result[index];
+      const overflow = gap === undefined ? undefined : overflowGap(gap);
+      if (overflow === undefined) continue;
+      summary =
+        summary === undefined
+          ? this.makeOverflowSummary(overflow)
+          : this.updateOverflowSummary(summary, overflow);
+    }
+    if (summary !== undefined) {
+      if (summaryIndex < 0) {
+        result.push(summary);
+        summaryIndex = result.length - 1;
+      } else {
+        result[summaryIndex] = summary;
+      }
+    }
+    for (const index of exactIndices.slice(MAX_PENDING_EXACT_RANGES).sort((a, b) => b - a)) {
+      result.splice(index, 1);
+    }
     return result;
   }
 
