@@ -1,11 +1,11 @@
 /* global URL, console, process */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanText } from "./secret-scanner.mjs";
+import { scanBytes } from "./secret-scanner.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const packages = ["protocol", "core", "adapter-mock", "adapter-gsd", "adapter-moth", "hostbridge"];
@@ -56,12 +56,35 @@ try {
     try {
       execFileSync("tar", ["-xzf", tarPath, "-C", extract]);
       const packageRoot = join(extract, "package");
-      for (const entry of entries.filter((candidate) => candidate.startsWith("package/"))) {
-        const relative = entry.slice("package/".length);
-        if (!/\.(?:[cm]?[jt]s|json|md|txt|d\.ts)$/u.test(relative)) continue;
-        const findings = scanText(readFileSync(join(packageRoot, relative), "utf8"));
+      const files = collectRegularFiles(packageRoot, failures);
+      for (const { absolute, relativePath } of files) {
+        let size;
+        try {
+          size = lstatSync(absolute).size;
+        } catch (error) {
+          failures.push(
+            `${packageName} tarball ${relativePath}: cannot inspect file size (${error.message})`,
+          );
+          continue;
+        }
+        if (size > 16 * 1024 * 1024) {
+          failures.push(
+            `${packageName} tarball ${relativePath}: file exceeds bounded scanner input`,
+          );
+          continue;
+        }
+        let bytes;
+        try {
+          bytes = readFileSync(absolute);
+        } catch (error) {
+          failures.push(
+            `${packageName} tarball ${relativePath}: unreadable file (${error.message})`,
+          );
+          continue;
+        }
+        const findings = scanBytes(bytes);
         for (const finding of findings)
-          failures.push(`${packageName} tarball ${relative}: ${finding}`);
+          failures.push(`${packageName} tarball ${relativePath}: ${finding}`);
       }
     } finally {
       rmSync(extract, { recursive: true, force: true });
@@ -98,6 +121,38 @@ function assertPackageEntries(packageName, entries, errors) {
 
 function normalizeEntry(path) {
   return path.startsWith("package/") ? path : `package/${path}`;
+}
+
+function collectRegularFiles(directory, errors) {
+  const files = [];
+  let entries;
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    errors.push(`package extraction ${directory}: unreadable directory (${error.message})`);
+    return files;
+  }
+  for (const entry of entries) {
+    const absolute = join(directory, entry.name);
+    const relativePath = relative(join(directory, ".."), absolute).replaceAll("\\", "/");
+    let stats;
+    try {
+      stats = lstatSync(absolute);
+    } catch (error) {
+      errors.push(`${relativePath}: cannot inspect extracted entry (${error.message})`);
+      continue;
+    }
+    if (stats.isSymbolicLink()) {
+      errors.push(`${relativePath}: symlink is forbidden in a publishable tarball`);
+    } else if (stats.isDirectory()) {
+      files.push(...collectRegularFiles(absolute, errors));
+    } else if (stats.isFile()) {
+      files.push({ absolute, relativePath });
+    } else {
+      errors.push(`${relativePath}: non-regular extracted entry is forbidden`);
+    }
+  }
+  return files;
 }
 
 if (failures.length > 0) {

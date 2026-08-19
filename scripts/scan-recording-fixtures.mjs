@@ -42,21 +42,23 @@ for (const [name, values] of [
   }
 }
 for (const path of fixturePaths) {
-  if (!isTestOnlyPath(path)) failures.push(`fixture path is not classified test-only: ${path}`);
+  if (!isTestOnlyPath(path)) failures.push(`fixture path is not explicitly registered: ${path}`);
 }
 
-const scan = (relativePath, testOnly) => {
+const scan = (relativePath) => {
   const absolute = `${root}/${relativePath}`;
-  const findings = scanText(readFileSync(absolute, "utf8"), { testOnly });
+  const findings = scanText(readFileSync(absolute, "utf8"), {
+    canaryPath: isTestOnlyPath(relativePath),
+  });
   for (const finding of findings) failures.push(`${relativePath}: ${finding}`);
 };
-for (const path of sourcePaths) scan(path, isTestOnlyPath(path));
+for (const path of sourcePaths) scan(path);
 for (const path of fixturePaths) {
-  if (!sourcePaths.includes(path)) scan(path, true);
+  if (!sourcePaths.includes(path)) scan(path);
 }
 for (const absolute of distPaths) {
   const relativePath = absolute.slice(root.length + 1);
-  scan(relativePath, false);
+  scan(relativePath);
 }
 
 if (failures.length > 0) {
