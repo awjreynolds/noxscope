@@ -397,6 +397,7 @@ export async function runConnectorQualification(
     );
   }
 
+  const expectedNetwork = safeOperationNetwork(options.operations?.plan);
   const report: QualificationReport = {
     schemaVersion: "noxscope.qualification/1",
     kind: "connector",
@@ -414,9 +415,7 @@ export async function runConnectorQualification(
     safety: {
       isolatedProfile: true,
       noMainnetMutation: true,
-      ...(options.operations?.plan?.network === undefined
-        ? {}
-        : { expectedNetwork: options.operations.plan.network }),
+      ...(expectedNetwork === undefined ? {} : { expectedNetwork }),
       operationAllowlist: options.operations?.enabled ? ["connector.test-transfer"] : [],
       maxOperations: options.operations?.enabled ? 1 : 0,
       redactionRequired: true,
@@ -613,15 +612,15 @@ async function runConnectorOperation(
     };
   }
   const connectedNetwork = stringAt(connected, "network") ?? stringAt(connected, "networkId");
-  const planIssue = validateOperationPlan(
+  const validatedPlan = validateOperationPlan(
     plan,
     environment,
     options.requestedNetwork,
     connectedNetwork,
   );
-  if (planIssue !== undefined) {
+  if (!validatedPlan.ok) {
     return {
-      assertion: assertion("D3.4", "fail", evidence, planIssue),
+      assertion: assertion("D3.4", "fail", evidence, validatedPlan.reason),
       redactions: 0,
     };
   }
@@ -638,14 +637,17 @@ async function runConnectorOperation(
     };
   }
   const controller = new AbortController();
-  const boundedPlan: HarmlessConnectorOperationPlan = { ...plan, signal: controller.signal };
+  const boundedPlan: HarmlessConnectorOperationPlan = {
+    ...validatedPlan.plan,
+    signal: controller.signal,
+  };
   const outcome = await bounded(
     () =>
       (execute as (operation: HarmlessConnectorOperationPlan) => Promise<unknown>).call(
         connected,
         boundedPlan,
       ),
-    Math.min(timeoutMs, plan.timeoutMs),
+    Math.min(timeoutMs, validatedPlan.plan.timeoutMs),
   );
   if (outcome.state !== "value") {
     controller.abort();
@@ -654,7 +656,7 @@ async function runConnectorOperation(
       redactions: 0,
     };
   }
-  const checked = validateOperationResult(outcome.value, plan.network);
+  const checked = validateOperationResult(outcome.value, validatedPlan.plan.network);
   if (!checked.ok)
     return {
       assertion: assertion("D3.4", "fail", evidence, checked.reason),
@@ -690,32 +692,120 @@ const TEST_IDENTITY = /^noxscope-test-[a-z0-9-]{1,64}$/u;
 const TEST_DESTINATION = /^noxscope-destination-[a-z0-9-]{1,64}$/u;
 const DECIMAL = /^(0|[1-9]\d*)$/u;
 
+type ValidatedOperationPlan = Omit<HarmlessConnectorOperationPlan, "signal">;
+
+type OperationPlanValidation =
+  | { readonly ok: true; readonly plan: ValidatedOperationPlan }
+  | { readonly ok: false; readonly reason: string };
+
+const OPERATION_PLAN_KEYS = [
+  "id",
+  "network",
+  "destination",
+  "testIdentity",
+  "amount",
+  "maxSpend",
+  "timeoutMs",
+] as const;
+
 function validateOperationPlan(
   plan: HarmlessConnectorOperationPlan,
   environment: QualificationReport["environment"],
   requestedNetwork: string,
   connectedNetwork: string | undefined,
-): string | undefined {
-  if (plan.id !== "connector.test-transfer") return "Operation ID is not in the local allowlist";
+): OperationPlanValidation {
+  if (!isObject(plan) || !isPlainPlan(plan) || !hasExactKeys(plan, OPERATION_PLAN_KEYS))
+    return { ok: false, reason: "Operation plan has additive, symbol, or inherited fields" };
+  const id = planString(plan, "id");
+  const network = planString(plan, "network");
+  const destination = planString(plan, "destination");
+  const testIdentity = planString(plan, "testIdentity");
+  const amount = planString(plan, "amount");
+  const maxSpend = planString(plan, "maxSpend");
+  const timeoutMs = planData(plan, "timeoutMs");
+  if (
+    id === undefined ||
+    network === undefined ||
+    destination === undefined ||
+    testIdentity === undefined ||
+    amount === undefined ||
+    maxSpend === undefined ||
+    typeof timeoutMs !== "number"
+  )
+    return { ok: false, reason: "Operation plan fields must be own data properties" };
+  if (id !== "connector.test-transfer")
+    return { ok: false, reason: "Operation ID is not in the local allowlist" };
   if (environment !== "localnet" && environment !== "preprod")
-    return "Connector operation requires localnet or Preprod";
-  if (requestedNetwork !== plan.network || connectedNetwork !== plan.network)
-    return "Requested and connected network evidence must exactly match the operation plan";
-  if (!TEST_IDENTITY.test(plan.testIdentity) || !TEST_DESTINATION.test(plan.destination))
-    return "Operation identity and destination must use the qualification test policy";
-  if (!DECIMAL.test(plan.amount) || !DECIMAL.test(plan.maxSpend))
-    return "Operation amount and max spend must be unsigned decimal strings";
+    return { ok: false, reason: "Connector operation requires localnet or Preprod" };
+  if (network !== "localnet" && network !== "preprod")
+    return { ok: false, reason: "Operation network is outside the local allowlist" };
+  if (requestedNetwork !== network || connectedNetwork !== network)
+    return {
+      ok: false,
+      reason: "Requested and connected network evidence must exactly match the operation plan",
+    };
+  if (!TEST_IDENTITY.test(testIdentity) || !TEST_DESTINATION.test(destination))
+    return {
+      ok: false,
+      reason: "Operation identity and destination must use the qualification test policy",
+    };
+  if (!DECIMAL.test(amount) || !DECIMAL.test(maxSpend))
+    return {
+      ok: false,
+      reason: "Operation amount and max spend must be unsigned decimal strings",
+    };
   try {
-    const amount = BigInt(plan.amount);
-    const maxSpend = BigInt(plan.maxSpend);
-    if (amount > maxSpend || maxSpend > MAX_QUALIFICATION_SPEND)
-      return "Operation exceeds the local spend bound";
+    const amountValue = BigInt(amount);
+    const maxSpendValue = BigInt(maxSpend);
+    if (amountValue > maxSpendValue || maxSpendValue > MAX_QUALIFICATION_SPEND)
+      return { ok: false, reason: "Operation exceeds the local spend bound" };
   } catch {
-    return "Operation amount is outside the bounded integer policy";
+    return { ok: false, reason: "Operation amount is outside the bounded integer policy" };
   }
-  if (!Number.isInteger(plan.timeoutMs) || plan.timeoutMs < 10 || plan.timeoutMs > 30_000)
-    return "Operation timeout is outside the bounded policy";
-  return undefined;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 30_000)
+    return { ok: false, reason: "Operation timeout is outside the bounded policy" };
+  return {
+    ok: true,
+    plan: { id, network, destination, testIdentity, amount, maxSpend, timeoutMs },
+  };
+}
+
+function isPlainPlan(value: Record<string, unknown>): boolean {
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
+}
+
+function planData(value: Record<string, unknown>, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && descriptor.enumerable && "value" in descriptor
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function planString(value: Record<string, unknown>, key: string): string | undefined {
+  const candidate = planData(value, key);
+  if (typeof candidate !== "string" || candidate.length === 0) return undefined;
+  try {
+    return new TextEncoder().encode(candidate).byteLength <= MAX_PROVIDER_STRING_BYTES
+      ? candidate
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeOperationNetwork(plan: unknown): "localnet" | "preprod" | undefined {
+  if (!isObject(plan)) return undefined;
+  const network = planString(plan, "network");
+  return network === "localnet" || network === "preprod" ? network : undefined;
 }
 
 function validateOperationResult(

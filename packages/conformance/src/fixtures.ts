@@ -50,7 +50,7 @@ function connectorFixture(
  * intentionally not live evidence: fixture admission is enforced by the
  * conformance runner and cannot be promoted by a passing replay.
  */
-export const CONFORMANCE_FIXTURES: readonly QualificationFixture[] = Object.freeze([
+export const CONFORMANCE_FIXTURES: readonly QualificationFixture[] = deepFreeze([
   {
     id: "official-wallet-sdk",
     target: {
@@ -163,6 +163,28 @@ export const CONFORMANCE_FIXTURES: readonly QualificationFixture[] = Object.free
     ),
   },
 ]);
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (
+    (typeof value !== "object" && typeof value !== "function") ||
+    value === null ||
+    seen.has(value)
+  )
+    return value;
+  seen.add(value);
+  if (typeof value === "object") {
+    for (const key of Reflect.ownKeys(value)) {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor !== undefined && "value" in descriptor) deepFreeze(descriptor.value, seen);
+      } catch {
+        // The deterministic corpus contains plain data; a hostile descriptor
+        // must not make publication partially mutable.
+      }
+    }
+  }
+  return Object.freeze(value);
+}
 
 export function conformanceFixture(id: QualificationFixture["id"]): QualificationFixture {
   const fixture = CONFORMANCE_FIXTURES.find((candidate) => candidate.id === id);

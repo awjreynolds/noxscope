@@ -6,7 +6,8 @@ import {
   runConnectorQualification,
   selectMidnightProvider,
 } from "./index.js";
-import { conformanceFixture } from "./fixtures.js";
+import { CONFORMANCE_FIXTURES, conformanceFixture } from "./fixtures.js";
+import type { HarmlessConnectorOperationPlan } from "./types.js";
 import {
   NOXSCOPE_PROTOCOL,
   type NoxscopeAdapter,
@@ -297,6 +298,77 @@ describe("connector qualification", () => {
     expect(report.assertions.find((assertion) => assertion.id === "D3.4")?.status).toBe("fail");
   });
 
+  it("rejects additive, accessor, symbol, non-enumerable, and proxy plans before mutation", async () => {
+    const basePlan = {
+      id: "connector.test-transfer" as const,
+      network: "preprod" as const,
+      destination: "noxscope-destination-test",
+      testIdentity: "noxscope-test-wallet",
+      amount: "1",
+      maxSpend: "1",
+      timeoutMs: 100,
+    };
+    const getterPlan = Object.defineProperty({ ...basePlan }, "amount", {
+      enumerable: true,
+      get: () => {
+        throw new Error("amount getter must not run");
+      },
+    });
+    const symbolPlan = { ...basePlan } as Record<string | symbol, unknown>;
+    symbolPlan[Symbol("additive")] = "reject";
+    const nonEnumerablePlan = { ...basePlan } as Record<string, unknown>;
+    Object.defineProperty(nonEnumerablePlan, "callback", {
+      configurable: true,
+      enumerable: false,
+      value: () => "reject",
+    });
+    const inheritedPlan = Object.assign(Object.create({ callback: () => "reject" }), basePlan);
+    const proxyPlan = new Proxy(
+      { ...basePlan, callback: () => "reject" },
+      {
+        get: () => {
+          throw new Error("plan getter must not run");
+        },
+      },
+    );
+    const cases: readonly { readonly name: string; readonly plan: unknown }[] = [
+      { name: "callback", plan: { ...basePlan, callback: () => "reject" } },
+      { name: "getter", plan: getterPlan },
+      { name: "symbol", plan: symbolPlan },
+      { name: "non-enumerable", plan: nonEnumerablePlan },
+      { name: "inherited", plan: inheritedPlan },
+      { name: "proxy", plan: proxyPlan },
+    ];
+    for (const testCase of cases) {
+      let invoked = false;
+      const operationProvider = {
+        ...provider(),
+        connect: async (network: string) => ({
+          network,
+          runHarmlessOperation: async () => {
+            invoked = true;
+            return { ok: true, value: { state: "succeeded", operationId: "op-1", network } };
+          },
+        }),
+      };
+      const report = await runConnectorQualification({
+        source: { midnight: { "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": operationProvider } },
+        target: { ...qualifiedTarget, surface: "dapp-connector", network: "preprod" },
+        requestedNetwork: "preprod",
+        evidence: "exercised",
+        environment: "preprod",
+        harness,
+        operations: {
+          enabled: true,
+          plan: testCase.plan as HarmlessConnectorOperationPlan,
+        },
+        now: () => timestamp,
+      });
+      expect(invoked, testCase.name).toBe(false);
+      expect(report.assertions.find((assertion) => assertion.id === "D3.4")?.status).toBe("fail");
+    }
+  });
+
   it("cannot promote a fixture by relabelling it as exercised", async () => {
     const fixture = conformanceFixture("1am");
     const report = await runConnectorQualification({
@@ -309,6 +381,24 @@ describe("connector qualification", () => {
     });
     expect(report.evidence).toBe("fixture");
     expect(report.admission).toBe("fixture");
+  });
+
+  it("keeps every fixture entry transitively immutable", () => {
+    const fixture = conformanceFixture("lace");
+    expect(CONFORMANCE_FIXTURES.every((entry) => Object.isFrozen(entry))).toBe(true);
+    expect(Object.isFrozen(fixture.target)).toBe(true);
+    expect(Reflect.set(fixture.target, "name", "mutated")).toBe(false);
+    expect(fixture.target.name).toBe("Lace browser connector");
+    const connector = fixture.connector;
+    expect(connector).toBeDefined();
+    expect(Object.isFrozen(connector)).toBe(true);
+    const map = connector?.midnight as Record<string, unknown>;
+    expect(Object.isFrozen(map)).toBe(true);
+    const providerEntry = map["11111111-1111-4111-8111-111111111111"];
+    expect(Object.isFrozen(providerEntry)).toBe(true);
+    expect(Object.isFrozen((providerEntry as Record<string, unknown>).connect)).toBe(true);
+    expect(Reflect.set(providerEntry as Record<string, unknown>, "name", "mutated")).toBe(false);
+    expect((providerEntry as Record<string, unknown>).name).toBe("Lace");
   });
 
   it("bounds hostile maps and isolates proxy traps", () => {
