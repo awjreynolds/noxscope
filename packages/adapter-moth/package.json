@@ -1,0 +1,17 @@
+{
+  "name": "@noxscope/adapter-moth",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./fixtures": "./src/fixtures.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@noxscope/core": "workspace:*",
+    "@noxscope/protocol": "workspace:*"
+  }
+}

@@ -11,6 +11,8 @@ These repositories inform interoperability and architecture but have not yet bee
 | `https://github.com/awjreynolds/gsd-wallet` | `3ec1b1ffd21c371cf769fe1c49e38f837a0f9255` | Apache-2.0; `packages/gsd-socket` is MIT | GSD architecture, diagnostics, and external protocol reference |
 | `https://github.com/shieldedtech/moth-wallet` | `e9a974eb6aa49e4db66c8910328f2f787dde541b` | Apache-2.0 | Moth daemon and connector wire-behavior reference |
 
+The Moth Adapter and HostBridge implementation are original Noxscope code. They depend on the public Moth wire contract above and do not copy Moth source. The implementation paths are `packages/adapter-moth` and `packages/hostbridge`; the Node HostBridge WebSocket entry point is `packages/hostbridge/src/node.ts`.
+
 ## Copied or transformed source
 
 The GSD Adapter is an independent codec and allowlist projection. It copies no

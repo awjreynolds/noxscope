@@ -57,6 +57,8 @@ Connector discovery UUIDs identify a provider instance for the Diagnostic Sessio
 
 Native framing and authentication remain inside Adapters. HostBridge transports only canonical descriptors, Results, and Records. It is implemented after in-process Adapter conformance is passing.
 
+The implementation is split between the platform-neutral [`packages/hostbridge`](../../packages/hostbridge/src/index.ts) protocol module and its Node-only [`./node` entry point](../../packages/hostbridge/src/node.ts). The Node entry point binds only to loopback, checks the exact browser `Origin`, performs the WebSocket upgrade, and hands text frames to the HostBridge admission server. The HostBridge launch token is per server instance, and its handshake is the only place a token is accepted. Every later message is bounded, deny-manifest checked, and validated as a canonical descriptor, Record, or typed request/Result; generic proxy, file, shell, and process messages are rejected. A bounded outbound buffer drops records only with an explicit stream-gap message so a reconnecting browser can distinguish loss from an empty stream.
+
 ## Recording
 
 Recording happens after Adapter sanitisation and record ordering:
@@ -95,4 +97,3 @@ Do not create public transport, events, wallet-state, or recording-format packag
 ## Local development
 
 The runnable development composition includes the deterministic mock, GSD Connect, a local Moth daemon/devnet, a mock dApp/provider page, and the optional Node HostBridge. Conformance fixtures freeze Moth `version`/`getState`, GSD state/diagnostic/reconnect behavior, connector discovery, stream gaps, malformed payloads, cancellation races, and sanitisation.
-

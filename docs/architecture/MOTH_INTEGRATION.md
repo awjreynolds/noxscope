@@ -141,3 +141,8 @@ The repository and package manifests use Apache License 2.0.
 6. Advertise all missing DUST, transaction, address, network, log, and subscription features as unsupported.
 7. Keep connector integration in a separate Adapter instance so daemon and extension runtimes can be observed simultaneously without conflating their identities.
 
+## Noxscope implementation
+
+The read-only implementation lives in [`packages/adapter-moth`](../../packages/adapter-moth/src/index.ts). It accepts an injected transport for deterministic conformance tests and uses a Node length-prefixed socket transport for the canonical Unix endpoint or an explicitly loopback TCP endpoint. TCP requests carry a read-scoped authentication token only inside the native daemon request path; the token is never represented in a canonical descriptor, snapshot, Record, or HostBridge message. The Adapter negotiates `version` before its first `getState`, emits immutable canonical snapshots, polls with bounded failure handling, preserves the last successful snapshot when polling stalls, and maps authorization, timeout, unavailable, incompatible, and malformed responses to distinct Noxscope errors.
+
+The adapter's S2 projection pseudonymises wallet names and token identifiers using the central Core sanitizer. Amounts remain canonical decimal observations so sync and balance comparisons remain meaningful; Recording export applies the full recording policy again. No daemon mutation, process log, audit log, or native payload is admitted.
