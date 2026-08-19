@@ -215,7 +215,8 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
           checkedRecord = validateRecord(candidate);
           if (
             checkedRecord.ok &&
-            (!isCanonicalRecord(checkedRecord.value) || !safeBridgeValue(checkedRecord.value))
+            (!isCanonicalRecord(checkedRecord.value) ||
+              !safeCanonicalBridgeValue(checkedRecord.value))
           )
             continue;
         } catch {
@@ -583,7 +584,7 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
       if (
         !checked.ok ||
         !isCanonicalRuntimeDescriptor(checked.value) ||
-        !safeBridgeValue(checked.value)
+        !safeCanonicalBridgeValue(checked.value)
       ) {
         void client.close();
         return;
@@ -1038,9 +1039,8 @@ function parseWire(data: string): Result<WireMessage> {
   } catch {
     return { ok: false, error: invalid("HostBridge message is malformed") };
   }
-  const basicResponse = isRecord(value) && value.type === "response" && isRecord(value.result);
   if (
-    (!basicResponse && !safeWireMessage(value)) ||
+    !safeWireMessage(value) ||
     !isRecord(value) ||
     typeof value.type !== "string" ||
     !HOSTBRIDGE_DENY_MANIFEST.allowedMessageTypes.includes(value.type)
@@ -1498,6 +1498,25 @@ function nonNegative(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+function boundedString(
+  value: unknown,
+  maxBytes = HOSTBRIDGE_LIMITS.maxStringBytes,
+): value is string {
+  return typeof value === "string" && value.length > 0 && byteLength(value) <= maxBytes;
+}
+
+function isCanonicalRedactionPath(value: unknown): value is string {
+  return (
+    boundedString(value, 256) &&
+    value === value.normalize("NFKC") &&
+    [...value].every((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint >= 0x20 && codePoint !== 0x7f;
+    }) &&
+    /^[\p{L}\p{N}$_-]+(?:\.[\p{L}\p{N}$_-]+)*$/u.test(value)
+  );
+}
+
 function isNamespacedId(value: unknown, minimumSegments: number): value is string {
   if (!nonEmpty(value)) return false;
   const segments = value.split(".");
@@ -1511,48 +1530,58 @@ function gapKey(sessionId: string, sourceStreamId: string): string {
   return `${sessionId.length}:${sessionId}${sourceStreamId.length}:${sourceStreamId}`;
 }
 
-function isJsonValue(value: unknown): boolean {
+function isJsonValue(value: unknown, depth = 0, seen = new WeakSet<object>()): boolean {
+  if (depth > HOSTBRIDGE_LIMITS.maxDepth) return false;
   if (value === null || typeof value === "boolean") return true;
   if (typeof value === "number") return Number.isFinite(value);
   if (typeof value === "string") return byteLength(value) <= HOSTBRIDGE_LIMITS.maxStringBytes;
-  if (Array.isArray(value))
-    return value.length <= HOSTBRIDGE_LIMITS.maxArrayElements && value.every(isJsonValue);
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return (
+      value.length <= HOSTBRIDGE_LIMITS.maxArrayElements &&
+      value.every((item) => isJsonValue(item, depth + 1, seen))
+    );
+  }
   if (!isRecord(value)) return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
   return (
     Object.keys(value).length <= HOSTBRIDGE_LIMITS.maxObjectProperties &&
     Object.keys(value).every(
       (key) =>
         !HOSTBRIDGE_DENY_MANIFEST.forbiddenFields.includes(normalize(key)) &&
-        isJsonValue(value[key]),
+        isJsonValue(value[key], depth + 1, seen),
     )
   );
 }
 
 function isCanonicalRaw(value: unknown): boolean {
-  if (!Array.isArray(value) || !safeBridgeValue(value)) return false;
+  if (!Array.isArray(value) || value.length > HOSTBRIDGE_LIMITS.maxArrayElements) return false;
   return value.every((detail) => {
     if (
       !isRecord(detail) ||
       !exactKeys(detail, ["namespace", "schemaVersion", "value", "sanitization"]) ||
       !isNamespacedId(detail.namespace, 2) ||
-      !nonEmpty(detail.schemaVersion) ||
+      !boundedString(detail.namespace) ||
+      !boundedString(detail.schemaVersion) ||
       !isJsonValue(detail.value) ||
+      !safeBridgeValue(detail.value) ||
       !isRecord(detail.sanitization) ||
       !exactKeys(detail.sanitization, ["policy", "policyVersion", "redactions"]) ||
-      !nonEmpty(detail.sanitization.policy) ||
-      !nonEmpty(detail.sanitization.policyVersion) ||
-      !Array.isArray(detail.sanitization.redactions)
+      !boundedString(detail.sanitization.policy) ||
+      !boundedString(detail.sanitization.policyVersion) ||
+      !Array.isArray(detail.sanitization.redactions) ||
+      detail.sanitization.redactions.length > HOSTBRIDGE_LIMITS.maxArrayElements
     )
       return false;
     return detail.sanitization.redactions.every(
       (redaction) =>
         isRecord(redaction) &&
         exactKeys(redaction, ["path", "reason"]) &&
-        !(
-          !nonEmpty(redaction.path) ||
-          !["secret", "key-material", "private-payload", "policy"].includes(
-            redaction.reason as string,
-          )
+        isCanonicalRedactionPath(redaction.path) &&
+        ["secret", "key-material", "private-payload", "policy"].includes(
+          redaction.reason as string,
         ),
     );
   });
@@ -1707,7 +1736,6 @@ function isCanonicalDependencies(value: unknown): boolean {
 function isCanonicalError(value: unknown): boolean {
   if (
     !isRecord(value) ||
-    !safeBridgeValue(value) ||
     ![
       "unsupported",
       "unavailable",
@@ -1738,11 +1766,11 @@ function isCanonicalError(value: unknown): boolean {
 }
 
 function safeWireMessage(value: unknown): boolean {
-  if (!isRecord(value) || value.type !== "hello") return safeBridgeValue(value);
+  if (!isRecord(value) || value.type !== "hello") return safeCanonicalBridgeValue(value);
   if (typeof value.token !== "string" || byteLength(value.token) > 256) return false;
   const withoutToken = { ...value };
   delete withoutToken.token;
-  return safeBridgeValue(withoutToken);
+  return safeCanonicalBridgeValue(withoutToken);
 }
 
 function validRequest(value: unknown): value is SnapshotRequest | InvokeRequest | CancelRequest {
@@ -1949,6 +1977,53 @@ function safeBridgeValue(value: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+function safeCanonicalBridgeValue(value: unknown): boolean {
+  try {
+    return safeBridgeValue(rewriteCanonicalRawMetadata(value));
+  } catch {
+    return false;
+  }
+}
+
+function rewriteCanonicalRawMetadata(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => rewriteCanonicalRawMetadata(item, seen));
+  const object = value as Record<string, unknown>;
+  const rewritten: Record<string, unknown> = {};
+  for (const key of Object.keys(object)) {
+    const child = object[key];
+    rewritten[key] =
+      key === "raw" && isCanonicalRaw(child)
+        ? rewriteCanonicalRawDetails(child)
+        : rewriteCanonicalRawMetadata(child, seen);
+  }
+  return rewritten;
+}
+
+function rewriteCanonicalRawDetails(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((detail) => {
+    if (!isRecord(detail) || !isRecord(detail.sanitization)) return detail;
+    const sanitization = detail.sanitization;
+    if (!Array.isArray(sanitization.redactions)) return detail;
+    return {
+      ...detail,
+      sanitization: {
+        ...sanitization,
+        redactions: sanitization.redactions.map((redaction) => {
+          if (!isRecord(redaction)) return redaction;
+          return {
+            redactionPath: redaction.path,
+            reason: redaction.reason,
+          };
+        }),
+      },
+    };
+  });
 }
 
 function deepFreezeCopy<T>(value: T): T {

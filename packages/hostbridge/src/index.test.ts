@@ -8,7 +8,12 @@ import {
   type HostBridgeConnection,
   type HostBridgeSessionSource,
 } from "./index.js";
-import { NOXSCOPE_PROTOCOL, type RuntimeDescriptor, type SnapshotRecord } from "@noxscope/protocol";
+import {
+  NOXSCOPE_PROTOCOL,
+  type NoxscopeRecord,
+  type RuntimeDescriptor,
+  type SnapshotRecord,
+} from "@noxscope/protocol";
 
 const descriptor: RuntimeDescriptor = {
   protocol: NOXSCOPE_PROTOCOL,
@@ -197,6 +202,101 @@ describe("HostBridge handshake and policy", () => {
       requestId: "nested-evil",
     });
     expect(result).toEqual({ ok: false, error: expect.objectContaining({ code: "unavailable" }) });
+  });
+
+  it("admits only exact bounded sanitized redaction metadata", async () => {
+    const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
+    const base = record("1");
+    const raw = (
+      redaction: Record<string, unknown>,
+      value: Record<string, unknown> = { safe: "value" },
+    ) => ({
+      namespace: "dev.noxscope.test",
+      schemaVersion: "1",
+      value,
+      sanitization: {
+        policy: "noxscope.redaction",
+        policyVersion: "1.0.0",
+        redactions: [redaction],
+      },
+    });
+    const records = [
+      {
+        ...base,
+        snapshot: {
+          ...base.snapshot,
+          raw: [raw({ path: "$.secret", reason: "secret" })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "2" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "2",
+          raw: [raw({ path: "$.secret", reason: "secret", evil: true })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "3" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "3",
+          raw: [raw({ path: "x".repeat(257), reason: "secret" })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "4" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "4",
+          raw: [raw({ path: "$.secret", reason: "r".repeat(257) })],
+        },
+      },
+      {
+        ...base,
+        meta: { ...base.meta, sequence: "5" },
+        snapshot: {
+          ...base.snapshot,
+          revision: "5",
+          raw: [raw({ path: "$.secret", reason: "secret" }, { path: "still-forbidden" })],
+        },
+      },
+    ] as unknown as NoxscopeRecord[];
+    const source: HostBridgeSessionSource = {
+      descriptor,
+      async *records() {
+        yield* records;
+      },
+      request: (async () => ({
+        ok: true,
+        value: base.snapshot,
+      })) as unknown as HostBridgeSessionSource["request"],
+    };
+    const server = createHostBridgeServer({
+      allowedOrigins: ["http://localhost:5173"],
+      token: "t",
+    });
+    server.accept(pair.server);
+    await server.attach(source);
+    const client = createHostBridgeClient({
+      connection: pair.client,
+      token: "t",
+      origin: "http://localhost:5173",
+    });
+    expect((await client.connect()).ok).toBe(true);
+    const received: SnapshotRecord[] = [];
+    client.onRecord((item) => {
+      if (item.kind === "snapshot") received.push(item);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(received).toHaveLength(1);
+    expect(received[0]?.snapshot.raw?.[0]?.sanitization.redactions).toEqual([
+      { path: "$.secret", reason: "secret" },
+    ]);
+    await client.close();
   });
 });
 
