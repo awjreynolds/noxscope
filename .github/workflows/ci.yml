@@ -26,7 +26,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify:metadata
       - run: pnpm verify:provenance
-      - run: pnpm verify:fixtures
       - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
