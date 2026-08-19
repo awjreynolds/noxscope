@@ -194,7 +194,9 @@ class GsdRuntimeSession implements RuntimeSession {
     this.#signal = signal;
     this.#pseudonymKey = pseudonymKey;
     this.#now = now;
-    this.#queue = new RecordQueue(capacity);
+    this.#queue = new RecordQueue(capacity, (existing, incoming) =>
+      this.mergePendingOverflow(existing, incoming),
+    );
     this.#sanitizer = sanitizer;
     this.descriptor = { ...descriptor, sessionId };
     signal.addEventListener("abort", () => void this.close(), { once: true });
@@ -624,6 +626,7 @@ class GsdRuntimeSession implements RuntimeSession {
   private noteSourceGap(stream: string, sequence: bigint): boolean {
     const state = this.#streams.get(stream) ?? { next: 1n, lastSource: undefined };
     const previous = state.lastSource;
+    if (previous !== undefined && sequence <= previous) return true;
     state.lastSource = sequence;
     this.#streams.set(stream, state);
     if (previous !== undefined && sequence > previous + 1n) {
@@ -654,16 +657,45 @@ class GsdRuntimeSession implements RuntimeSession {
   }
 
   private pushRecord(record: NoxscopeRecord): void {
-    this.#queue.push(record, (dropped, incoming) => this.overflowRecords(dropped, incoming));
+    this.#queue.push(record, (dropped) => this.overflowRecords(dropped));
   }
 
-  private overflowRecords(
-    dropped: NoxscopeRecord,
+  private mergePendingOverflow(
+    existing: NoxscopeRecord,
     incoming: NoxscopeRecord,
-  ): readonly NoxscopeRecord[] {
+  ): NoxscopeRecord | undefined {
+    if (
+      existing.kind !== "diagnostic-event" ||
+      existing.event.type !== "stream-gap" ||
+      incoming.kind !== "diagnostic-event" ||
+      incoming.event.type !== "stream-gap" ||
+      existing.event.sourceStreamId !== incoming.event.sourceStreamId
+    ) {
+      return undefined;
+    }
+    const existingFirst = BigInt(existing.event.firstLostSequence);
+    const existingLast = BigInt(existing.event.lastLostSequence);
+    const incomingFirst = BigInt(incoming.event.firstLostSequence);
+    const incomingLast = BigInt(incoming.event.lastLostSequence);
+    if (existingLast + 1n < incomingFirst || incomingLast + 1n < existingFirst) {
+      return undefined;
+    }
+    return {
+      ...existing,
+      event: {
+        ...existing.event,
+        firstLostSequence: (existingFirst < incomingFirst
+          ? existingFirst
+          : incomingFirst
+        ).toString(),
+        lastLostSequence: (existingLast > incomingLast ? existingLast : incomingLast).toString(),
+      },
+    };
+  }
+
+  private overflowRecords(dropped: NoxscopeRecord): readonly NoxscopeRecord[] {
     const ranges = new Map<string, Array<[bigint, bigint]>>();
     addOverflowRanges(ranges, dropped);
-    addOverflowRanges(ranges, incoming);
     const records: NoxscopeRecord[] = [];
     for (const [sourceStreamId, intervals] of ranges) {
       for (const [first, last] of intervals) {
@@ -794,14 +826,16 @@ class RecordQueue<T> {
   readonly #capacity: number;
   readonly #buffer: T[] = [];
   readonly #pending: T[] = [];
+  readonly #mergePending: (existing: T, incoming: T) => T | undefined;
   #waiting: ((result: IteratorResult<T>) => void) | undefined;
   #closed = false;
 
-  constructor(capacity: number) {
+  constructor(capacity: number, mergePending: (existing: T, incoming: T) => T | undefined) {
     this.#capacity = capacity;
+    this.#mergePending = mergePending;
   }
 
-  push(record: T, overflowRecords: (dropped: T, incoming: T) => readonly T[]): void {
+  push(record: T, overflowRecords: (dropped: T) => readonly T[]): void {
     if (this.#closed) return;
     if (this.#waiting !== undefined) {
       const resolve = this.#waiting;
@@ -811,8 +845,9 @@ class RecordQueue<T> {
     }
     if (this.#buffer.length >= this.#capacity) {
       const dropped = this.#buffer.shift();
-      if (dropped !== undefined) this.#pending.push(...overflowRecords(dropped, record));
-      return;
+      if (dropped !== undefined) {
+        for (const overflow of overflowRecords(dropped)) this.#addPending(overflow);
+      }
     }
     this.#buffer.push(record);
   }
@@ -849,6 +884,17 @@ class RecordQueue<T> {
     this.#waiting = undefined;
     resolve?.({ done: true, value: undefined });
   }
+
+  #addPending(incoming: T): void {
+    for (let index = 0; index < this.#pending.length; index += 1) {
+      const merged = this.#mergePending(this.#pending[index] as T, incoming);
+      if (merged !== undefined) {
+        this.#pending[index] = merged;
+        return;
+      }
+    }
+    this.#pending.push(incoming);
+  }
 }
 
 class MessagePortConnection implements GsdTransportConnection {
@@ -863,7 +909,7 @@ class MessagePortConnection implements GsdTransportConnection {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  readonly #messages = new RecordQueue<unknown>(256);
+  readonly #messages = new RecordQueue<unknown>(256, (existing) => existing);
   readonly #listener: (event: { readonly data: unknown }) => void;
 
   constructor(port: GsdMessagePort, signal: AbortSignal, timeoutMs: number) {
@@ -942,21 +988,25 @@ class MessagePortConnection implements GsdTransportConnection {
 
   private receive(value: unknown): void {
     try {
-      if (!isPlainObject(value)) return;
-      const id = typeof value.id === "string" ? value.id : undefined;
+      const snapshot = snapshotMessage(value);
+      if (snapshot === undefined) {
+        this.pushInspectionOverflow();
+        return;
+      }
+      const id = typeof snapshot.id === "string" ? snapshot.id : undefined;
       if (
         id !== undefined &&
         this.#pending.has(id) &&
-        (value.kind === "response" || value.type === "response")
+        (snapshot.kind === "response" || snapshot.type === "response")
       ) {
         const pending = this.#pending.get(id);
         if (pending === undefined) return;
         this.#pending.delete(id);
         clearTimeout(pending.timer);
-        pending.resolve(value.payload);
+        pending.resolve(snapshot.payload);
         return;
       }
-      this.#messages.push(value, () => [
+      this.#messages.push(snapshot, () => [
         {
           version: GSD_TRANSPORT_VERSION,
           type: "overflow",
@@ -965,16 +1015,20 @@ class MessagePortConnection implements GsdTransportConnection {
         },
       ]);
     } catch {
-      this.#messages.push(
-        {
-          version: GSD_TRANSPORT_VERSION,
-          type: "overflow",
-          stream: "events",
-          payload: { source: "message-port-inspection" },
-        },
-        () => [],
-      );
+      this.pushInspectionOverflow();
     }
+  }
+
+  private pushInspectionOverflow(): void {
+    this.#messages.push(
+      {
+        version: GSD_TRANSPORT_VERSION,
+        type: "overflow",
+        stream: "events",
+        payload: { source: "message-port-inspection" },
+      },
+      () => [],
+    );
   }
 }
 
@@ -1305,7 +1359,7 @@ function canonicalStream(value: string | undefined): string | undefined {
     return "events";
   if (normalized === "operation" || normalized === "operations" || normalized === "response")
     return "operations";
-  return isSafeId(value) ? value : undefined;
+  return undefined;
 }
 
 function canonicalMessageType(
@@ -1352,6 +1406,28 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
+}
+
+function snapshotMessage(value: unknown): Record<string, unknown> | undefined {
+  try {
+    if (!isPlainObject(value)) return undefined;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (!descriptor.enumerable) continue;
+      if (
+        !("value" in descriptor) ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined
+      ) {
+        return undefined;
+      }
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch {
+    return undefined;
+  }
 }
 
 function isSafeId(value: string): boolean {

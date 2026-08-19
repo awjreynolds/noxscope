@@ -144,6 +144,20 @@ describe("GSD Adapter", () => {
     ).toEqual(["1", "2"]);
   });
 
+  it("does not move a source watermark backwards after stale or repeated messages", async () => {
+    const messages = [
+      healthyState("1"),
+      healthyState("2"),
+      healthyState("1"),
+      healthyState("2"),
+      healthyState("3"),
+    ];
+    const session = await connect(new FixtureConnection(healthyHandshake(), messages));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const records = await takeRecords(session, 8);
+    expect(records.filter((record) => record.kind === "snapshot")).toHaveLength(3);
+  });
+
   it("emits reconnect evidence and never claims a caller cancellation stopped wallet work", async () => {
     const messages: GsdNativeMessage[] = [
       { version: "gsd/1", type: "reconnect", stream: "events", sequence: "1" },
@@ -225,21 +239,11 @@ describe("GSD Adapter", () => {
     const stateGaps = gaps
       .filter((gap) => gap.sourceStreamId.endsWith(":state"))
       .map((gap) => [gap.first, gap.last]);
-    expect(stateGaps).toEqual([
-      ["1", "1"],
-      ["5", "5"],
-      ["2", "2"],
-      ["7", "7"],
-      ["3", "3"],
-      ["9", "9"],
-      ["4", "4"],
-    ]);
-    expect(gaps.filter((gap) => gap.sourceStreamId.endsWith(":events"))).toEqual([
-      { sourceStreamId: "session-gsd-fixture:events", first: "7", last: "7" },
-    ]);
+    expect(stateGaps).toEqual([["1", "7"]]);
+    expect(gaps.filter((gap) => gap.sourceStreamId.endsWith(":events"))).toEqual([]);
     expect(
       records.filter((record) => record.kind === "snapshot").map((record) => record.meta.sequence),
-    ).toEqual(["6", "8", "10"]);
+    ).toEqual(["8", "9", "10"]);
   });
 
   it("settles an in-flight request promptly on caller abort and cancels its transport wait", async () => {
@@ -286,6 +290,47 @@ describe("GSD Adapter", () => {
       error: { code: "cancelled", message: "GSD request was cancelled", retryable: false },
     });
     expect(port.requests.filter((request) => request.type === "getState")).toHaveLength(1);
+    lifetime.abort();
+  });
+
+  it("snapshots MessagePort data before inspecting fields and never invokes hostile getters", async () => {
+    const port = new FixturePort();
+    const lifetime = new AbortController();
+    const sessionResult = await createGsdAdapter({
+      transport: createGsdMessagePortTransport(port),
+      now: clock,
+      pseudonymKey: key,
+      sessionId: () => "session-message-port-hostile",
+    }).connect({ signal: lifetime.signal });
+    if (!sessionResult.ok) throw new Error(sessionResult.error.message);
+
+    let getterInvocations = 0;
+    const accessorPayload = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessorPayload, "type", {
+      enumerable: true,
+      get() {
+        getterInvocations += 1;
+        throw new Error("hostile getter");
+      },
+    });
+    port.emit(accessorPayload);
+    const rejected = await nextRecord(sessionResult.value);
+    expect(getterInvocations).toBe(0);
+    expect(rejected.kind).toBe("diagnostic-event");
+
+    const proxied = new Proxy(
+      { version: "gsd/1", type: "ready", stream: "events" },
+      {
+        get() {
+          getterInvocations += 1;
+          throw new Error("hostile proxy getter");
+        },
+      },
+    );
+    port.emit(proxied);
+    const ready = await nextRecord(sessionResult.value);
+    expect(getterInvocations).toBe(0);
+    expect(ready.kind).toBe("diagnostic-event");
     lifetime.abort();
   });
 
@@ -424,6 +469,31 @@ describe("GSD Adapter", () => {
     expect(record.meta.receivedAt).toBe("2026-08-19T12:00:00.000Z");
   });
 
+  it("coalesces sustained producer overflow into bounded exact loss evidence", async () => {
+    const messages = Array.from({ length: 5_000 }, (_, index) => minimalState(String(index + 1)));
+    const connection = new FixtureConnection(healthyHandshake(), messages);
+    const session = await connect(connection, { queueCapacity: 4 });
+    await connection.completed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const records = await takeRecords(session, 8);
+    const gaps = records.filter(
+      (record) =>
+        record.kind === "diagnostic-event" &&
+        record.event.type === "stream-gap" &&
+        record.event.reason === "overflow",
+    );
+    expect(gaps).toHaveLength(1);
+    expect(
+      gaps[0]?.kind === "diagnostic-event" && gaps[0].event.type === "stream-gap"
+        ? gaps[0].event
+        : undefined,
+    ).toMatchObject({
+      sourceStreamId: "session-gsd-fixture:state",
+      firstLostSequence: "1",
+      lastLostSequence: "4997",
+    });
+  }, 20_000);
+
   it("never invokes getters while rejecting hostile native payloads", async () => {
     let invoked = false;
     const payload = Object.create(null) as Record<string, unknown>;
@@ -504,10 +574,12 @@ class FixtureTransport implements GsdTransport {
 class FixtureConnection implements GsdTransportConnection {
   readonly requests: GsdRequest[] = [];
   readonly cancelledRequests: string[] = [];
+  readonly completed: Promise<void>;
   closed = false;
   readonly #handshake: unknown;
   readonly #messages: readonly unknown[];
   readonly #snapshot: unknown;
+  readonly #complete: () => void;
   readonly #options: {
     readonly describeDelayMs?: number;
     readonly requestDelayMs?: number;
@@ -523,6 +595,11 @@ class FixtureConnection implements GsdTransportConnection {
       readonly messageDelayMs?: number;
     } = {},
   ) {
+    let complete!: () => void;
+    this.completed = new Promise((resolve) => {
+      complete = resolve;
+    });
+    this.#complete = complete;
     this.#handshake = handshake;
     this.#messages = messages;
     this.#snapshot = snapshot;
@@ -544,9 +621,13 @@ class FixtureConnection implements GsdTransportConnection {
     this.closed = true;
   }
   async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
-    for (const message of this.#messages) {
-      await delay(this.#options.messageDelayMs ?? 0);
-      yield message;
+    try {
+      for (const message of this.#messages) {
+        await delay(this.#options.messageDelayMs ?? 0);
+        yield message;
+      }
+    } finally {
+      this.#complete();
     }
   }
 }
@@ -581,7 +662,7 @@ class FixturePort {
     this.#listeners.clear();
   }
 
-  private emit(data: unknown): void {
+  emit(data: unknown): void {
     for (const listener of this.#listeners) listener({ data });
   }
 }
@@ -635,5 +716,15 @@ function healthyState(sequence: string): GsdNativeMessage {
       checkpoint: "checkpoint-fixture",
       keys: { spendingKey: "spending-key-fixture" },
     },
+  };
+}
+
+function minimalState(sequence: string): GsdNativeMessage {
+  return {
+    version: "gsd/1",
+    type: "state",
+    stream: "state",
+    sequence,
+    payload: { lifecycle: "ready", network: "preprod" },
   };
 }
