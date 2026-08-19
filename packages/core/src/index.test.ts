@@ -236,6 +236,116 @@ describe("Core", () => {
     ]);
   });
 
+  it("keeps generated gaps unique when source streams use core-like and control identities", async () => {
+    const core = createCore({ signal: new AbortController().signal });
+    const runtime = descriptor("s-hyphen", "runtime");
+    const coreLikeStream = "s-hyphen-core";
+    const controlStream = "events\u0000\u0001🙂";
+    const unicodeStream = "ユニコード-core";
+    const records = [
+      diagnosticRecord(runtime, "1", "2026-08-19T12:00:00.000Z", coreLikeStream),
+      diagnosticRecord(runtime, "1", "2026-08-19T12:00:00.500Z", controlStream),
+      diagnosticRecord(runtime, "1", "2026-08-19T12:00:01.000Z", unicodeStream),
+      diagnosticRecord(runtime, "4", "2026-08-19T12:00:03.000Z", coreLikeStream),
+      diagnosticRecord(runtime, "3", "2026-08-19T12:00:02.000Z", unicodeStream),
+      diagnosticRecord(runtime, "5", "2026-08-19T12:00:04.000Z", controlStream),
+      diagnosticRecord(runtime, "6", "2026-08-19T12:00:05.000Z", coreLikeStream),
+      diagnosticRecord(runtime, "7", "2026-08-19T12:00:06.000Z", controlStream),
+    ];
+    const observed = new Promise<CoreView>((resolve) => {
+      core.subscribe((view) => {
+        const current = view.runtimes[0];
+        if (
+          current !== undefined &&
+          (current.records.length >= 13 ||
+            current.status === "complete" ||
+            current.status === "failed")
+        )
+          resolve(view);
+      });
+    });
+
+    await core.connect(staticAdapter(runtime, records));
+    const view = await observed;
+    const accepted = view.runtimes[0]?.records ?? [];
+    const identities = accepted.map((record) =>
+      JSON.stringify([record.meta.sessionId, record.meta.streamId, record.meta.sequence]),
+    );
+    const gaps = accepted.filter(
+      (record) => record.kind === "diagnostic-event" && record.event.type === "stream-gap",
+    );
+
+    expect(new Set(identities).size).toBe(accepted.length);
+    expect(view.timeline).toHaveLength(accepted.length);
+    expect(
+      new Set(
+        view.timeline.map(({ record }) =>
+          JSON.stringify([record.meta.sessionId, record.meta.streamId, record.meta.sequence]),
+        ),
+      ).size,
+    ).toBe(view.timeline.length);
+    expect(
+      [coreLikeStream, controlStream, unicodeStream].map((streamId) =>
+        view.timeline
+          .filter(({ record }) => record.meta.streamId === streamId)
+          .map(({ record }) => record.meta.sequence),
+      ),
+    ).toEqual([
+      ["1", "2", "4", "5", "6"],
+      ["1", "2", "5", "6", "7"],
+      ["1", "2", "3"],
+    ]);
+    expect(
+      gaps.map((record) =>
+        record.kind === "diagnostic-event" && record.event.type === "stream-gap"
+          ? {
+              stream: record.meta.streamId,
+              source: record.event.sourceStreamId,
+              sequence: record.meta.sequence,
+              first: record.event.firstLostSequence,
+              last: record.event.lastLostSequence,
+            }
+          : undefined,
+      ),
+    ).toEqual([
+      {
+        stream: coreLikeStream,
+        source: coreLikeStream,
+        sequence: "2",
+        first: "2",
+        last: "3",
+      },
+      {
+        stream: unicodeStream,
+        source: unicodeStream,
+        sequence: "2",
+        first: "2",
+        last: "2",
+      },
+      {
+        stream: controlStream,
+        source: controlStream,
+        sequence: "2",
+        first: "2",
+        last: "4",
+      },
+      {
+        stream: coreLikeStream,
+        source: coreLikeStream,
+        sequence: "5",
+        first: "5",
+        last: "5",
+      },
+      {
+        stream: controlStream,
+        source: controlStream,
+        sequence: "6",
+        first: "6",
+        last: "6",
+      },
+    ]);
+  });
+
   it("projects capability degradation and terminal operation failures into runtime views", async () => {
     const core = createCore({ signal: new AbortController().signal });
     const completed = new Promise<CoreView>((resolve) => {

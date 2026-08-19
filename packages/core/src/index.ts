@@ -75,7 +75,6 @@ interface MutableRuntime {
   readonly records: NoxscopeRecord[];
   readonly failures: NoxscopeError[];
   readonly lastSequenceByStream: Map<string, bigint>;
-  coreSequence: bigint;
 }
 
 export function createCore(options: CoreOptions): Core {
@@ -126,7 +125,6 @@ class RuntimeRegistry implements Core {
       records: [],
       failures: [],
       lastSequenceByStream: new Map(),
-      coreSequence: 0n,
     };
     this.#runtimes.push(runtime);
     this.#notify();
@@ -220,16 +218,14 @@ class RuntimeRegistry implements Core {
     firstLost: bigint,
     lastLost: bigint,
   ): void {
-    runtime.coreSequence += 1n;
-    const streamId = `${runtime.descriptor.sessionId}-core`;
     const gap: DiagnosticEventRecord = {
       kind: "diagnostic-event",
       meta: {
         protocol: NOXSCOPE_PROTOCOL,
         sessionId: runtime.descriptor.sessionId,
         runtimeId: runtime.descriptor.runtimeId,
-        streamId,
-        sequence: runtime.coreSequence.toString(),
+        streamId: sourceRecord.meta.streamId,
+        sequence: firstLost.toString(),
         observedAt: sourceRecord.meta.receivedAt,
         receivedAt: sourceRecord.meta.receivedAt,
       },
@@ -241,7 +237,6 @@ class RuntimeRegistry implements Core {
         reason: "source-gap",
       },
     };
-    runtime.lastSequenceByStream.set(streamId, runtime.coreSequence);
     runtime.records.push(gap);
   }
 
