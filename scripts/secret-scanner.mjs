@@ -1,24 +1,53 @@
 import { Buffer } from "node:buffer";
 import { TextDecoder } from "node:util";
 
-const SECRET_KEYS = [
+/** Canonicalized S0/S1 names from docs/security/REDACTION_AND_RECORDING.md. */
+export const SECRET_KEY_VOCABULARY = Object.freeze([
   "mnemonic",
-  "recoveryphrase",
   "seed",
   "seedbytes",
+  "entropy",
+  "recoveryphrase",
+  "secret",
   "privatekey",
-  "viewingkey",
   "spendingkey",
+  "viewingkey",
   "signingkey",
+  "keymaterial",
+  "keymaterialprovider",
   "passphrase",
   "password",
+  "passwd",
+  "pin",
+  "authorization",
+  "proxyauthorization",
   "apikey",
   "accesstoken",
   "refreshtoken",
   "sessiontoken",
+  "bearer",
+  "cookie",
+  "setcookie",
   "clientsecret",
-  "authorization",
-];
+  "credential",
+  "witness",
+  "redeemer",
+  "proof",
+  "provingkey",
+  "signature",
+  "signedtx",
+  "sealedtx",
+  "unsealedtx",
+  "rawtx",
+  "rawtransaction",
+  "transactionbytes",
+  "cbor",
+  "privatestate",
+  "privateinput",
+  "checkpoint",
+  "vault",
+]);
+const SECRET_KEYS = SECRET_KEY_VOCABULARY;
 
 const CONFUSABLES = new Map([
   ["а", "a"],
@@ -55,13 +84,16 @@ const CONFUSABLES = new Map([
 const ESCAPED_ENTITY = /&(colon|equals|lowbar|period|hyphen|amp);/giu;
 const NUMERIC_ENTITY = /&#(?:x([0-9a-f]{1,6})|([0-9]{1,7}));/giu;
 const FORBIDDEN_LITERAL = [
-  { name: "private-key", pattern: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/u },
-  { name: "secret-key-id", pattern: /\b(?:sk|pk)_(?:live|test)_[A-Za-z0-9]+/u },
-  { name: "credential-header", pattern: /\b(?:bearer|basic)\s+[A-Za-z0-9+/._=-]{16,}/iu },
-  { name: "credential-url", pattern: /:\/\/[^\s/@:]+:[^\s/@]+@/u },
+  { name: "private-key", pattern: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gu },
+  { name: "secret-key-id", pattern: /\b(?:sk|pk)_(?:live|test)_[A-Za-z0-9]+/gu },
+  {
+    name: "credential-header",
+    pattern: /\b(?:bearer|basic)\s+[A-Za-z0-9+/._=-]{16,}/giu,
+  },
+  { name: "credential-url", pattern: /:\/\/[^\s/@:]+:[^\s/@]+@/gu },
   {
     name: "jwt",
-    pattern: /\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/u,
+    pattern: /\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu,
   },
 ];
 const CODE_PLACEHOLDERS = new Set([
@@ -82,6 +114,7 @@ const CODE_PLACEHOLDERS = new Set([
   "this",
   "record",
   "candidate",
+  "new",
   "===",
   "!==",
   "==",
@@ -130,6 +163,7 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "detector-canary",
   "early-secret-canary",
   "fixture-private-payload",
+  "fixture-private-witness",
   "fixture-secret-canary",
   "fixture-secret-checkpoint",
   "fixture-secret-key",
@@ -139,6 +173,8 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "fixture-token",
   "fragment-alias-canary",
   "fragment-secret-canary",
+  "checkpoint-fixture",
+  "checkpoint-canary",
   "integrity-canary",
   "json-private-key-canary",
   "launch-token",
@@ -148,7 +184,9 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "moth-token",
   "n0xscope-secret-assignment",
   "n0xscope-secret-token-value",
+  "mnemonic abandon abandon abandon",
   "nested-assignment-canary",
+  "nested-bearer-canary",
   "never-cross-the-seam",
   "never-export",
   "never-publish",
@@ -161,6 +199,7 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "second-secret-canary",
   "secret",
   "secret-vault-must-not-cross",
+  "seed-vault-fixture",
   "seed-canary",
   "session-token-canary",
   "signing-key-canary",
@@ -170,14 +209,32 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "third-secret-canary",
   "token",
   "transaction-canary",
+  "signed-private-transaction",
+  "signed-private-payload",
+  "private-transaction-canary",
+  "never-cross",
+  "gsd-tx",
+  "deadbeef",
+  "witness-canary",
+  "redeemer-canary",
+  "proof-canary",
+  "proving-key-canary",
+  "raw-transaction-canary",
+  "session-cookie-canary",
+  "vault-canary",
+  "theme=dark",
   "user:secret",
+  "user",
   "viewing-key-canary",
   "wallet-password",
+  "wallet-user",
+  "wallet",
   "ordinary-value",
   "bearer never-export",
   "bearer connector-token",
   "bearer authorization-canary",
   "bearer detector-canary",
+  "bearer n0xscope-secret-token-value",
   "wallet-user:wallet-password@node.example.test",
   "wallet-user:wallet-password@node.example:9944",
   "json-private-key-canary",
@@ -190,22 +247,23 @@ const SYNTHETIC_CANARY_VALUES = new Set([
   "refresh token: refresh-token-canary",
   "refresh-token-canary",
   "zero-width-canary",
+  "password",
+  "a3",
 ]);
 const SYNTHETIC_JWT_VALUES = new Set([
   "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJub3hzY29wZSJ9.c2lnbmF0dXJl",
   "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJuZXN0ZWQifQ.c2lnbmF0dXJl",
 ]);
 const SYNTHETIC_PRIVATE_KEY_MARKERS = new Set(["zmfrzs1rzxk="]);
-const FORBIDDEN_VALUE_CHARACTERS = `^"'${String.fromCharCode(96)},;}=<>\\[\\]`;
 
 const ASSIGNMENT_PATTERNS = SECRET_KEYS.map((key) => {
-  const letters = [...key].map((letter) => `${letter}[\\W_]*?`).join("");
-  return new RegExp(
-    `(?:^|[^a-z0-9])${letters}\\s*(?:[:=])\\s*(?:"([^"]*)"|'([^']*)'|(\\[[^\\]]*\\])|([^${FORBIDDEN_VALUE_CHARACTERS}\\s]+))`,
-    "giu",
-  );
+  const keyGap = `(?:(?!["'\`:=;,{}\\[\\]])[\\p{P}\\s])*?`;
+  const letters = [...key].map((letter) => `${letter}${keyGap}`).join("");
+  return {
+    key,
+    pattern: new RegExp(`(?:^|[^a-z0-9])${letters}\\s*(?:[:=])\\s*`, "giu"),
+  };
 });
-
 function decodeEscapes(value) {
   const codePoint = (raw, radix, original) => {
     const point = Number.parseInt(raw, radix);
@@ -254,31 +312,154 @@ function syntheticValue(value) {
   return SYNTHETIC_CANARY_VALUES.has(normalized);
 }
 
-function containsSyntheticValue(value) {
-  const normalized = normalize(value);
-  return [...SYNTHETIC_CANARY_VALUES].some((candidate) => {
-    const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-    const simple = /^[a-z0-9]+$/u.test(candidate);
-    const boundary = simple ? "[^a-z0-9-]" : "[^a-z0-9]";
-    return new RegExp(`(?:^|${boundary})${escaped}(?:$|${boundary})`, "u").test(normalized);
-  });
-}
-
 function literalAllowed(name, context, canaryPath) {
   if (!canaryPath) return false;
   const normalized = normalize(context);
   if (name === "private-key")
     return [...SYNTHETIC_PRIVATE_KEY_MARKERS].some((marker) => normalized.includes(marker));
   if (name === "jwt")
-    return [...SYNTHETIC_JWT_VALUES].some((value) => normalized.includes(normalize(value)));
-  return containsSyntheticValue(normalized);
+    return [...SYNTHETIC_JWT_VALUES].some((value) => normalized === normalize(value));
+  if (name === "credential-header")
+    return syntheticValue(normalized.replace(/^(?:bearer|basic)\s+/iu, ""));
+  if (name === "credential-url") {
+    const authority = normalized.slice(3, -1);
+    const separator = authority.lastIndexOf(":");
+    return (
+      separator > 0 &&
+      syntheticValue(authority.slice(0, separator)) &&
+      syntheticValue(authority.slice(separator + 1))
+    );
+  }
+  return syntheticValue(normalized);
+}
+
+function detectorSpan(name, variant, index, match) {
+  if (name !== "private-key") return match;
+  const remainder = variant.slice(index + match.length, index + match.length + 16 * 1024);
+  const nextHeader = remainder.indexOf("-----BEGIN ");
+  const body = nextHeader < 0 ? remainder : remainder.slice(0, nextHeader);
+  const suffix = body.match(/-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/u);
+  if (suffix === null || suffix.index === undefined) return match;
+  const end = index + match.length + suffix.index + suffix[0].length;
+  return variant.slice(index, end);
+}
+
+function splitArrayElements(value) {
+  const elements = [];
+  let start = 1;
+  let depth = 0;
+  let quote = undefined;
+  let escaped = false;
+  for (let index = 1; index < value.length - 1; index += 1) {
+    const character = value[index];
+    if (quote !== undefined) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+    } else if (character === "[" || character === "{") {
+      depth += 1;
+    } else if (character === "]" || character === "}") {
+      depth -= 1;
+    } else if (character === "," && depth === 0) {
+      elements.push(value.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  elements.push(value.slice(start, -1).trim());
+  return elements.filter((element) => element.length > 0);
+}
+
+function stripQuoted(value) {
+  const trimmed = value.trim();
+  return /^(["'`])[^]*\1$/u.test(trimmed) ? trimmed.slice(1, -1) : trimmed;
+}
+
+function arrayValueAllowed(value, canaryPath) {
+  const elements = splitArrayElements(value);
+  if (elements.length === 0) return true;
+  const reconstructed = elements.map(stripQuoted).join(" ");
+  if (syntheticValue(reconstructed)) return true;
+  return elements.every((element) => {
+    const trimmed = element.trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]"))
+      return arrayValueAllowed(trimmed, canaryPath);
+    if (trimmed.startsWith("{") && trimmed.endsWith("}"))
+      return scanText(trimmed, { canaryPath }).length === 0;
+    return syntheticValue(stripQuoted(trimmed));
+  });
+}
+
+function readAssignmentValue(text, start) {
+  if (start >= text.length) return undefined;
+  const first = text[start];
+  if (first === '"' || first === "'" || first === "`") {
+    let escaped = false;
+    for (let index = start + 1; index < text.length; index += 1) {
+      const character = text[index];
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === first)
+        return { value: text.slice(start + 1, index), end: index + 1, kind: "literal" };
+    }
+    return undefined;
+  }
+  if (first === "[" || first === "{") {
+    const closing = first === "[" ? "]" : "}";
+    const stack = [closing];
+    let quote = undefined;
+    let escaped = false;
+    for (let index = start + 1; index < text.length; index += 1) {
+      const character = text[index];
+      if (quote !== undefined) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = undefined;
+        continue;
+      }
+      if (character === '"' || character === "'" || character === "`") quote = character;
+      else if (character === "[" || character === "{") stack.push(character === "[" ? "]" : "}");
+      else if (character === "]" || character === "}") {
+        if (character !== stack.at(-1)) return undefined;
+        stack.pop();
+        if (stack.length === 0)
+          return {
+            value: text.slice(start, index + 1),
+            end: index + 1,
+            kind: first === "[" ? "serialized" : "object",
+          };
+      }
+    }
+    return undefined;
+  }
+  if (/[=<>]/u.test(first)) return undefined;
+  let end = start;
+  while (end < text.length && !/[\s"'`,;}=<>[\]]/u.test(text[end])) end += 1;
+  return end === start ? undefined : { value: text.slice(start, end), end, kind: "bare" };
 }
 
 function valueAllowed(value, _context, canaryPath) {
-  return (
-    canaryPath &&
-    (syntheticValue(value) || (value.startsWith("[") && containsSyntheticValue(value)))
-  );
+  if (!canaryPath) return false;
+  if (value.startsWith("[") && value.endsWith("]")) return arrayValueAllowed(value, canaryPath);
+  return syntheticValue(value);
+}
+
+const SERIALIZED_SECRET_PROPERTY = new RegExp(
+  `(?:^|[,\\{])\\s*["']?(${[...SECRET_KEYS, "token"].join("|")})["']?\\s*[:=]\\s*(?:"([^"]*)"|'([^']*)')`,
+  "giu",
+);
+
+function scanSerializedObjectLiterals(value, canaryPath) {
+  const findings = [];
+  for (const match of value.matchAll(SERIALIZED_SECRET_PROPERTY)) {
+    const literal = match[2] ?? match[3] ?? "";
+    if (!valueAllowed(literal, match[0], canaryPath))
+      findings.push("assignment serialized object secret");
+  }
+  return findings;
 }
 
 function variants(text) {
@@ -298,19 +479,32 @@ export function scanText(text, { canaryPath = false } = {}) {
   const findings = [];
   for (const variant of variants(text)) {
     for (const { name, pattern } of FORBIDDEN_LITERAL) {
-      const match = variant.match(pattern)?.[0];
-      if (match === undefined) continue;
-      const index = variant.indexOf(match);
-      const context = variant.slice(Math.max(0, index - 96), index + match.length + 160);
-      if (!literalAllowed(name, context, canaryPath)) findings.push(`literal ${name}`);
+      for (const result of variant.matchAll(pattern)) {
+        const match = result[0];
+        const index = result.index ?? 0;
+        const span = detectorSpan(name, variant, index, match);
+        if (!literalAllowed(name, span, canaryPath)) findings.push(`literal ${name}`);
+      }
     }
-    for (const pattern of ASSIGNMENT_PATTERNS) {
+    for (const { pattern } of ASSIGNMENT_PATTERNS) {
       for (const match of variant.matchAll(pattern)) {
-        const value = match[1] ?? match[2] ?? match[3] ?? match[4] ?? "";
-        if (value === "" || CODE_PLACEHOLDERS.has(value.toLocaleLowerCase("en-US"))) continue;
-        const context = match[0].slice(0, 256);
-        if (!valueAllowed(value, context, canaryPath))
+        const start = (match.index ?? 0) + match[0].length;
+        const parsed = readAssignmentValue(variant, start);
+        if (parsed === undefined) {
+          if (variant[start] === "=") continue;
           findings.push(`assignment ${match[0].slice(0, 80)}`);
+          continue;
+        }
+        const value = parsed.value;
+        if (value === "" || CODE_PLACEHOLDERS.has(value.toLocaleLowerCase("en-US"))) continue;
+        const context = variant.slice(match.index ?? 0, parsed.end).slice(0, 256);
+        if (parsed.kind === "object") {
+          for (const finding of scanSerializedObjectLiterals(value, canaryPath))
+            findings.push(`nested ${finding}`);
+          continue;
+        }
+        if (!valueAllowed(value, context, canaryPath))
+          findings.push(`assignment ${context.slice(0, 80)}`);
       }
     }
   }

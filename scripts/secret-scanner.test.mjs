@@ -1,6 +1,58 @@
 import { describe, expect, it } from "vitest";
 import { TextEncoder } from "node:util";
-import { isTestOnlyPath, requireScanSet, scanBytes, scanText } from "./secret-scanner.mjs";
+import {
+  isTestOnlyPath,
+  requireScanSet,
+  scanBytes,
+  scanText,
+  SECRET_KEY_VOCABULARY,
+} from "./secret-scanner.mjs";
+
+const DOCUMENTED_S0_S1_KEYS = [
+  "mnemonic",
+  "seed",
+  "seedbytes",
+  "entropy",
+  "recoveryphrase",
+  "secret",
+  "privatekey",
+  "spendingkey",
+  "viewingkey",
+  "signingkey",
+  "keymaterial",
+  "keymaterialprovider",
+  "passphrase",
+  "password",
+  "passwd",
+  "pin",
+  "authorization",
+  "proxyauthorization",
+  "apikey",
+  "accesstoken",
+  "refreshtoken",
+  "sessiontoken",
+  "bearer",
+  "cookie",
+  "setcookie",
+  "clientsecret",
+  "credential",
+  "witness",
+  "redeemer",
+  "proof",
+  "provingkey",
+  "signature",
+  "signedtx",
+  "sealedtx",
+  "unsealedtx",
+  "rawtx",
+  "rawtransaction",
+  "transactionbytes",
+  "cbor",
+  "privatestate",
+  "privateinput",
+  "checkpoint",
+  "vault",
+];
 
 describe("release secret scanner", () => {
   it("detects encoded and separator-obscured assignments in production content", () => {
@@ -36,10 +88,67 @@ describe("release secret scanner", () => {
     expect(scanText("privateKey: real-production-value", { canaryPath: true })).not.toEqual([]);
     expect(scanText('mnemonic: ["real-production-value"]', { canaryPath: true })).not.toEqual([]);
     expect(scanText('mnemonic: ["fixture-secret-canary"]', { canaryPath: true })).toEqual([]);
+    expect(
+      scanText('mnemonic: ["fixture-secret-canary", "real-production-value"]', {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
+    expect(
+      scanText('mnemonic: [["fixture-secret-canary"], ["real-production-value"]]', {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
     expect(scanText("-----BEGIN PRIVATE KEY-----", { canaryPath: true })).not.toEqual([]);
     expect(scanText('"token": "-----BEGIN PRIVATE KEY-----"', { canaryPath: true })).not.toEqual(
       [],
     );
+  });
+
+  it("keeps literal exemptions bound to each detector span", () => {
+    expect(
+      scanText('note: "fixture-token"; Authorization: "Bearer real-production-token-value"', {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
+    expect(
+      scanText(
+        'note: "fixture-token"; url: "https://wallet:real-production-password@node.example"',
+        { canaryPath: true },
+      ),
+    ).not.toEqual([]);
+    expect(
+      scanText('url: "https://wallet-user:real-production-password@node.example"', {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
+    expect(
+      scanText('url: "https://real-production-user:wallet-password@node.example"', {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
+    expect(
+      scanText(
+        'note: "fixture-token"; jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZWFsIn0.c2lnbmF0dXJl"',
+        { canaryPath: true },
+      ),
+    ).not.toEqual([]);
+    expect(
+      scanText('note: "fixture-token"; key: "sk_live_real-production-key-value"', {
+        canaryPath: true,
+      }),
+    ).not.toEqual([]);
+    expect(
+      scanText(
+        'pem: "-----BEGIN PRIVATE KEY-----\\nZmFrZS1rZXk=\\n-----END PRIVATE KEY-----"; token: "-----BEGIN PRIVATE KEY-----"',
+        { canaryPath: true },
+      ),
+    ).not.toEqual([]);
+  });
+
+  it("tracks the complete documented S0/S1 vocabulary", () => {
+    expect([...SECRET_KEY_VOCABULARY]).toEqual(DOCUMENTED_S0_S1_KEYS);
+    for (const key of DOCUMENTED_S0_S1_KEYS)
+      expect(scanText(`${key}: real-production-value`), key).not.toEqual([]);
   });
 
   it("does not treat normal source identifiers as credentials", () => {
