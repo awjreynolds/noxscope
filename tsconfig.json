@@ -4,6 +4,7 @@
     { "path": "packages/protocol" },
     { "path": "packages/adapter-mock" },
     { "path": "packages/core" },
+    { "path": "packages/adapter-gsd" },
     { "path": "apps/web" }
   ]
 }

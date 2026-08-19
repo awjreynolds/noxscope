@@ -203,20 +203,201 @@ describe("GSD Adapter", () => {
   });
 
   it("reports bounded queue loss instead of silently dropping records", async () => {
-    const messages = Array.from({ length: 18 }, (_, index) => healthyState(String(index + 1)));
+    const messages = Array.from({ length: 10 }, (_, index) => healthyState(String(index + 1)));
     const session = await connect(new FixtureConnection(healthyHandshake(), messages), {
       queueCapacity: 4,
     });
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const records = await takeRecords(session, 12);
+    const gaps = records.flatMap((record) =>
+      record.kind === "diagnostic-event" &&
+      record.event.type === "stream-gap" &&
+      record.event.reason === "overflow"
+        ? [
+            {
+              sourceStreamId: record.event.sourceStreamId,
+              first: record.event.firstLostSequence,
+              last: record.event.lastLostSequence,
+            },
+          ]
+        : [],
+    );
+    const stateGaps = gaps
+      .filter((gap) => gap.sourceStreamId.endsWith(":state"))
+      .map((gap) => [gap.first, gap.last]);
+    expect(stateGaps).toEqual([
+      ["1", "1"],
+      ["5", "5"],
+      ["2", "2"],
+      ["7", "7"],
+      ["3", "3"],
+      ["9", "9"],
+      ["4", "4"],
+    ]);
+    expect(gaps.filter((gap) => gap.sourceStreamId.endsWith(":events"))).toEqual([
+      { sourceStreamId: "session-gsd-fixture:events", first: "7", last: "7" },
+    ]);
+    expect(
+      records.filter((record) => record.kind === "snapshot").map((record) => record.meta.sequence),
+    ).toEqual(["6", "8", "10"]);
+  });
+
+  it("settles an in-flight request promptly on caller abort and cancels its transport wait", async () => {
+    const connection = new FixtureConnection(healthyHandshake(), [], healthyState("9"), {
+      requestDelayMs: 1_000,
+    });
+    const session = await connect(connection);
+    const requestSignal = new AbortController();
+    const pending = session.request(
+      { kind: "snapshot", requestId: "snapshot-abort" },
+      { signal: requestSignal.signal, timeoutMs: 5_000 },
+    );
+    await Promise.resolve();
+    requestSignal.abort();
+    const result = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("abort timeout")), 100)),
+    ]);
+    expect(result).toEqual({
+      ok: false,
+      error: { code: "cancelled", message: "GSD request was cancelled", retryable: false },
+    });
+    expect(connection.cancelledRequests).toEqual(["snapshot-abort"]);
+  });
+
+  it("aborts a delayed handshake without creating a session or leaving the connection open", async () => {
+    const connection = new FixtureConnection(healthyHandshake(), [], undefined, {
+      describeDelayMs: 1_000,
+    });
+    const lifetime = new AbortController();
+    const pending = createGsdAdapter({
+      transport: new FixtureTransport(connection),
+      now: clock,
+      pseudonymKey: key,
+      sessionId: () => "session-never-created",
+    }).connect({ signal: lifetime.signal });
+    await Promise.resolve();
+    lifetime.abort();
+    const result = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("handshake timeout")), 100),
+      ),
+    ]);
+    expect(result).toEqual({
+      ok: false,
+      error: { code: "cancelled", message: "GSD handshake was cancelled", retryable: false },
+    });
+    expect(connection.closed).toBe(true);
+  });
+
+  it("deduplicates repeated terminal operation diagnostics and rejects later lifecycle updates", async () => {
+    const terminal = {
+      version: "gsd/1" as const,
+      type: "DIAGNOSTIC_EVENT" as const,
+      stream: "operations" as const,
+      sequence: "1",
+      requestId: "request-terminal",
+      operationId: "operation-terminal",
+      payload: {
+        name: "transaction.failed",
+        category: "transaction",
+        level: "error",
+        kind: "transaction.submit",
+        phase: "submitting",
+        state: "failed",
+        error: { code: "rejected", message: "node rejected", retryable: false },
+      },
+    };
+    const repeated = { ...terminal, sequence: "2" };
+    const lateRunning = {
+      ...terminal,
+      sequence: "3",
+      payload: { ...terminal.payload, level: "info", state: "running", phase: "retrying" },
+    };
+    const session = await connect(
+      new FixtureConnection(healthyHandshake(), [terminal, repeated, lateRunning]),
+    );
     const records = await takeRecords(session, 4);
+    expect(records.filter((record) => record.kind === "operation")).toHaveLength(1);
+    const operation = records.find((record) => record.kind === "operation");
+    expect(operation?.kind === "operation" ? operation.meta.correlation : undefined).toEqual({
+      operationId: "operation-terminal",
+      requestId: "request-terminal",
+    });
+  });
+
+  it("resets native sequence epochs on reconnect before accepting sequence one again", async () => {
+    const messages: GsdNativeMessage[] = [
+      healthyState("1"),
+      { version: "gsd/1", type: "RECONNECT", stream: "events", sequence: "1" },
+      { ...healthyState("1"), observedAt: "2026-08-19T10:00:04.000Z" },
+    ];
+    const session = await connect(new FixtureConnection(healthyHandshake(), messages));
+    const records = await takeRecords(session, 4);
+    expect(records.filter((record) => record.kind === "snapshot")).toHaveLength(2);
     expect(
       records.some(
         (record) =>
           record.kind === "diagnostic-event" &&
           record.event.type === "stream-gap" &&
-          record.event.reason === "overflow",
+          record.event.reason === "reconnect",
       ),
     ).toBe(true);
+    expect(
+      records.some(
+        (record) =>
+          record.kind === "diagnostic-event" &&
+          record.event.type === "diagnostic" &&
+          record.event.name === "gsd.protocol.invalid",
+      ),
+    ).toBe(false);
+  });
+
+  it("normalizes response type and correlation key casing", async () => {
+    const response = {
+      version: "gsd/1",
+      type: "RESPONSE",
+      stream: "OPERATIONS",
+      sequence: "1",
+      requestID: "request-response",
+      operationID: "operation-response",
+      payload: {
+        name: "transaction.succeeded",
+        category: "transaction",
+        level: "info",
+        kind: "transaction.submit",
+        phase: "confirmed",
+        state: "succeeded",
+      },
+    };
+    const session = await connect(new FixtureConnection(healthyHandshake(), [response]));
+    const record = await nextRecord(session);
+    expect(record.kind).toBe("operation");
+    if (record.kind === "operation") {
+      expect(record.meta.correlation).toEqual({
+        operationId: "operation-response",
+        requestId: "request-response",
+      });
+    }
+  });
+
+  it("uses the receive clock for receivedAt while preserving the source observation time", async () => {
+    let nowValue = "2026-08-19T11:00:00.000Z";
+    const connection = new FixtureConnection(healthyHandshake(), [healthyState("1")], undefined, {
+      messageDelayMs: 10,
+    });
+    const result = await createGsdAdapter({
+      transport: new FixtureTransport(connection),
+      now: () => nowValue,
+      pseudonymKey: key,
+      sessionId: () => "session-received-clock",
+    }).connect({ signal: new AbortController().signal });
+    if (!result.ok) throw new Error(result.error.message);
+    nowValue = "2026-08-19T12:00:00.000Z";
+    const record = await nextRecord(result.value);
+    expect(record.meta.observedAt).toBe("2026-08-19T10:00:00.000Z");
+    expect(record.meta.receivedAt).toBe("2026-08-19T12:00:00.000Z");
   });
 
   it("never invokes getters while rejecting hostile native payloads", async () => {
@@ -298,27 +479,56 @@ class FixtureTransport implements GsdTransport {
 
 class FixtureConnection implements GsdTransportConnection {
   readonly requests: GsdRequest[] = [];
+  readonly cancelledRequests: string[] = [];
+  closed = false;
   readonly #handshake: unknown;
   readonly #messages: readonly unknown[];
   readonly #snapshot: unknown;
-  constructor(handshake: unknown, messages: readonly unknown[], snapshot?: unknown) {
+  readonly #options: {
+    readonly describeDelayMs?: number;
+    readonly requestDelayMs?: number;
+    readonly messageDelayMs?: number;
+  };
+  constructor(
+    handshake: unknown,
+    messages: readonly unknown[],
+    snapshot?: unknown,
+    options: {
+      readonly describeDelayMs?: number;
+      readonly requestDelayMs?: number;
+      readonly messageDelayMs?: number;
+    } = {},
+  ) {
     this.#handshake = handshake;
     this.#messages = messages;
     this.#snapshot = snapshot;
+    this.#options = options;
   }
   async describe(): Promise<unknown> {
+    if (this.#options.describeDelayMs !== undefined) await delay(this.#options.describeDelayMs);
     return this.#handshake;
   }
   async request(request: GsdRequest): Promise<unknown> {
     this.requests.push(request);
+    if (this.#options.requestDelayMs !== undefined) await delay(this.#options.requestDelayMs);
     return this.#snapshot ?? { version: "gsd/1", type: "response", payload: {} };
+  }
+  cancel(requestId: string): void {
+    this.cancelledRequests.push(requestId);
+  }
+  async close(): Promise<void> {
+    this.closed = true;
   }
   async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
     for (const message of this.#messages) {
-      await Promise.resolve();
+      await delay(this.#options.messageDelayMs ?? 0);
       yield message;
     }
   }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function healthyHandshake() {

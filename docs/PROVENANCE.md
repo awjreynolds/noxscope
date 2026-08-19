@@ -21,7 +21,7 @@ When code is imported, add one row per file or coherent directory:
 
 | Destination | Upstream repository | Source commit | Original path | License | Copyright | Treatment | Import date | Importing commit |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `packages/adapter-gsd` | `https://github.com/awjreynolds/gsd-wallet` | `3ec1b1ffd21c371cf769fe1c49e38f837a0f9255` | `src/shared/messages.ts`, `src/background/offscreenClient.ts`, `src/offscreen/offscreen.ts`, `src/offscreen/worker.ts`, `packages/gsd-socket/src/{client,server}.ts` (wire reference only) | Apache-2.0; `packages/gsd-socket` reference is MIT | Adam Reynolds | Independent typed transport/record projection; no upstream source copied | 2026-08-19 | pending |
+| `packages/adapter-gsd` | `https://github.com/awjreynolds/gsd-wallet` | `3ec1b1ffd21c371cf769fe1c49e38f837a0f9255` | `src/shared/messages.ts`, `src/background/offscreenClient.ts`, `src/offscreen/offscreen.ts`, `src/offscreen/worker.ts`, `packages/gsd-socket/src/{client,server}.ts` (wire reference only) | Apache-2.0; `packages/gsd-socket` reference is MIT | Adam Reynolds | Independent typed transport/record projection; no upstream source copied | 2026-08-19 | `7037753` |
 
 ## Import rules
 

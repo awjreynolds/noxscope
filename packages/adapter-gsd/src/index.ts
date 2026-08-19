@@ -7,7 +7,6 @@ import {
   NOXSCOPE_PROTOCOL,
   validateOperationInput,
   validateRecord,
-  type CapabilityAvailability,
   type CapabilityDeclaration,
   type ConnectOptions,
   type DiagnosticEventRecord,
@@ -46,6 +45,7 @@ export interface GsdRequest {
 export interface GsdTransportConnection extends AsyncIterable<unknown> {
   describe(): Promise<unknown>;
   request(request: GsdRequest): Promise<unknown>;
+  cancel?(requestId: string): void;
   close?(): Promise<void> | void;
 }
 
@@ -63,9 +63,8 @@ export interface GsdAdapterOptions {
 }
 
 export interface GsdNativeMessage {
-  readonly version: typeof GSD_TRANSPORT_VERSION;
-  readonly type:
-    "state" | "diagnostic" | "response" | "ready" | "heartbeat" | "reconnect" | "overflow";
+  readonly version: string;
+  readonly type: string;
   readonly stream?: "state" | "events" | "operations" | string;
   readonly sequence?: string | number;
   readonly observedAt?: string;
@@ -111,17 +110,39 @@ export function createGsdAdapter(options: GsdAdapterOptions): NoxscopeAdapter {
     async connect(connectOptions: ConnectOptions): Promise<Result<RuntimeSession>> {
       if (connectOptions.signal.aborted) return cancelled("GSD connection was cancelled");
       let opened: Result<GsdTransportConnection>;
+      let openPromise: Promise<Result<GsdTransportConnection>>;
       try {
-        opened = await options.transport.open({ signal: connectOptions.signal });
+        openPromise = options.transport.open({ signal: connectOptions.signal });
+        const openedRace = await awaitOrAbort(openPromise, connectOptions.signal);
+        if (openedRace.state === "aborted") {
+          void openPromise.then(
+            (late) => {
+              if (late.ok) void closeQuietly(late.value);
+            },
+            () => undefined,
+          );
+          return cancelled("GSD connection was cancelled");
+        }
+        opened = openedRace.value;
       } catch {
         return transportError("GSD transport could not be opened", true);
       }
       if (!opened.ok) return opened;
 
-      const described = await describeRuntime(opened.value, sanitizer, pseudonymKey, now);
+      const described = await describeRuntime(
+        opened.value,
+        sanitizer,
+        pseudonymKey,
+        now,
+        connectOptions.signal,
+      );
       if (!described.ok) {
         await closeQuietly(opened.value);
         return described;
+      }
+      if (connectOptions.signal.aborted) {
+        await closeQuietly(opened.value);
+        return cancelled("GSD handshake was cancelled");
       }
       const sessionId = makeSessionId();
       if (!isSafeId(sessionId)) {
@@ -155,6 +176,7 @@ class GsdRuntimeSession implements RuntimeSession {
   readonly #now: () => string;
   readonly #queue: RecordQueue<NoxscopeRecord>;
   readonly #streams = new Map<string, StreamState>();
+  readonly #operations = new Map<string, { readonly kind: string; readonly terminal: boolean }>();
   #revision = 0;
   #closed = false;
 
@@ -202,6 +224,9 @@ class GsdRuntimeSession implements RuntimeSession {
         options,
       );
       if (!response.ok) return response;
+      if (this.#signal.aborted || options?.signal?.aborted || this.#closed) {
+        return cancelled("GSD request was cancelled");
+      }
       const snapshot = await this.mapSnapshotResponse(response.value, request.requestId);
       return snapshot;
     }
@@ -266,9 +291,21 @@ class GsdRuntimeSession implements RuntimeSession {
   }
 
   async ingest(native: unknown): Promise<void> {
-    const sanitized = await this.#sanitizer.sanitize(native, this.#manifest, {
-      pseudonymKey: this.#pseudonymKey,
-    });
+    let sanitized: Result<SanitizedProjection>;
+    try {
+      sanitized = await this.#sanitizer.sanitize(native, this.#manifest, {
+        pseudonymKey: this.#pseudonymKey,
+      });
+    } catch {
+      this.emitDiagnostic(
+        "gsd.adapter.rejected",
+        "storage",
+        "warn",
+        "GSD message could not be safely inspected",
+        "events",
+      );
+      return;
+    }
     if (!sanitized.ok) {
       this.emitDiagnostic(
         sanitized.error.code === "overflow" ? "gsd.adapter.overflow" : "gsd.adapter.rejected",
@@ -294,9 +331,13 @@ class GsdRuntimeSession implements RuntimeSession {
       );
       return;
     }
-    const stream = stringAt(envelope, "stream") ?? streamFor(type);
+    const stream = canonicalStream(stringAt(envelope, "stream")) ?? streamFor(type);
     const sequence = parseSourceSequence(envelope?.sequence);
-    if (sequence !== undefined && this.noteSourceGap(stream, sequence)) return;
+    if (type === "reconnect") {
+      this.resetNativeSequences();
+    } else if (sequence !== undefined && this.noteSourceGap(stream, sequence)) {
+      return;
+    }
     const observedAt = validTime(stringAt(envelope, "observedAt"))
       ? (stringAt(envelope, "observedAt") as string)
       : this.#now();
@@ -399,16 +440,21 @@ class GsdRuntimeSession implements RuntimeSession {
     };
     const checked = validateRecord({
       kind: "snapshot",
-      meta: meta(this.descriptor, `${this.#revision}`, observedAt, "state"),
+      meta: meta(this.descriptor, `${this.#revision}`, observedAt, "state", this.#now()),
       snapshot,
     });
     return checked.ok && checked.value.kind === "snapshot" ? checked.value.snapshot : undefined;
   }
 
   private async mapSnapshotResponse(value: unknown, requestId: string): Promise<Result<Snapshot>> {
-    const sanitized = await this.#sanitizer.sanitize(value, this.#manifest, {
-      pseudonymKey: this.#pseudonymKey,
-    });
+    let sanitized: Result<SanitizedProjection>;
+    try {
+      sanitized = await this.#sanitizer.sanitize(value, this.#manifest, {
+        pseudonymKey: this.#pseudonymKey,
+      });
+    } catch {
+      return invalid("GSD snapshot response could not be safely inspected");
+    }
     if (!sanitized.ok) return sanitized;
     const snapshot = this.mapSnapshot(sanitized.value, this.#now());
     if (snapshot === undefined) {
@@ -437,12 +483,14 @@ class GsdRuntimeSession implements RuntimeSession {
       phase !== undefined &&
       state !== undefined
     ) {
+      const prior = this.#operations.get(operationId);
+      if (prior !== undefined && (prior.terminal || prior.kind !== operationKind)) return undefined;
       const error = mapError(objectAt(diagnostic, "error"), state);
       const progress = numberAt(diagnostic, "progress");
       const operation: OperationRecord = {
         kind: "operation",
         meta: {
-          ...meta(this.descriptor, "0", observedAt, "operations"),
+          ...meta(this.descriptor, "0", observedAt, "operations", this.#now()),
           correlation: {
             operationId,
             ...(requestId === undefined ? {} : { requestId }),
@@ -457,16 +505,16 @@ class GsdRuntimeSession implements RuntimeSession {
         },
       };
       const checked = validateRecord(operation);
-      return checked.ok && checked.value.kind === "operation"
-        ? this.withSequence(checked.value, "operations")
-        : undefined;
+      if (!checked.ok || checked.value.kind !== "operation") return undefined;
+      this.#operations.set(operationId, { kind: operationKind, terminal: state !== "running" });
+      return this.withSequence(checked.value, "operations");
     }
     const raw = await this.mapRawDetail(sanitized);
     const message = stringAt(diagnostic, "message");
     const event: DiagnosticEventRecord = {
       kind: "diagnostic-event",
       meta: {
-        ...meta(this.descriptor, "0", observedAt, "events"),
+        ...meta(this.descriptor, "0", observedAt, "events", this.#now()),
         ...(correlation === undefined ? {} : { correlation }),
       },
       event: {
@@ -508,7 +556,7 @@ class GsdRuntimeSession implements RuntimeSession {
     const record: SnapshotRecord = {
       kind: "snapshot",
       meta: {
-        ...meta(this.descriptor, "0", observedAt, stream),
+        ...meta(this.descriptor, "0", observedAt, stream, this.#now()),
         ...(correlation === undefined ? {} : { correlation }),
       },
       snapshot,
@@ -528,7 +576,7 @@ class GsdRuntimeSession implements RuntimeSession {
     const record: DiagnosticEventRecord = {
       kind: "diagnostic-event",
       meta: {
-        ...meta(this.descriptor, "0", observedAt, stream),
+        ...meta(this.descriptor, "0", observedAt, stream, this.#now()),
         ...(correlation === undefined ? {} : { correlation }),
       },
       event: { type: "diagnostic", name, category, level, source: "adapter", message },
@@ -561,7 +609,7 @@ class GsdRuntimeSession implements RuntimeSession {
           : state.lastSource.toString());
     const record: DiagnosticEventRecord = {
       kind: "diagnostic-event",
-      meta: meta(this.descriptor, "0", observedAt, "events"),
+      meta: meta(this.descriptor, "0", observedAt, "events", this.#now()),
       event: {
         type: "stream-gap",
         sourceStreamId,
@@ -590,6 +638,10 @@ class GsdRuntimeSession implements RuntimeSession {
     return previous !== undefined && sequence <= previous;
   }
 
+  private resetNativeSequences(): void {
+    for (const state of this.#streams.values()) state.lastSource = undefined;
+  }
+
   private withSequence<T extends NoxscopeRecord>(record: T, stream: string): T {
     const state = this.#streams.get(stream) ?? { next: 1n, lastSource: undefined };
     const sequence = state.next.toString();
@@ -602,45 +654,90 @@ class GsdRuntimeSession implements RuntimeSession {
   }
 
   private pushRecord(record: NoxscopeRecord): void {
-    this.#queue.push(record, (dropped) => {
-      const gap: DiagnosticEventRecord = {
-        kind: "diagnostic-event",
-        meta: meta(this.descriptor, "0", this.#now(), "events"),
-        event: {
-          type: "stream-gap",
-          sourceStreamId: dropped.meta.streamId,
-          firstLostSequence: dropped.meta.sequence,
-          lastLostSequence: dropped.meta.sequence,
-          reason: "overflow",
-        },
-      };
-      return this.withSequence(gap, "events");
-    });
+    this.#queue.push(record, (dropped, incoming) => this.overflowRecords(dropped, incoming));
+  }
+
+  private overflowRecords(
+    dropped: NoxscopeRecord,
+    incoming: NoxscopeRecord,
+  ): readonly NoxscopeRecord[] {
+    const ranges = new Map<string, Array<[bigint, bigint]>>();
+    addOverflowRanges(ranges, dropped);
+    addOverflowRanges(ranges, incoming);
+    const records: NoxscopeRecord[] = [];
+    for (const [sourceStreamId, intervals] of ranges) {
+      for (const [first, last] of intervals) {
+        const gap: DiagnosticEventRecord = {
+          kind: "diagnostic-event",
+          meta: meta(this.descriptor, "0", this.#now(), "events", this.#now()),
+          event: {
+            type: "stream-gap",
+            sourceStreamId,
+            firstLostSequence: first.toString(),
+            lastLostSequence: last.toString(),
+            reason: "overflow",
+          },
+        };
+        records.push(this.withSequence(gap, "events"));
+      }
+    }
+    return records;
   }
 
   private async send(request: GsdRequest, options?: RequestOptions): Promise<Result<unknown>> {
     if (options?.signal?.aborted || this.#signal.aborted)
       return cancelled("GSD request was cancelled");
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const signals = [options?.signal, this.#signal].filter(
+      (signal): signal is AbortSignal => signal !== undefined,
+    );
+    let abort: (() => void) | undefined;
     try {
+      const abortPromise = new Promise<never>((_, reject) => {
+        abort = () => reject(new AdapterAbortError());
+        for (const signal of signals) signal.addEventListener("abort", abort, { once: true });
+      });
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        if (options?.timeoutMs === undefined) return;
+        timer = setTimeout(() => reject(new AdapterTimeoutError()), options.timeoutMs);
+      });
       const response = await Promise.race([
         this.#connection.request(request),
-        new Promise<never>((_, reject) => {
-          if (options?.timeoutMs === undefined) return;
-          timer = setTimeout(() => reject(new Error("timeout")), options.timeoutMs);
-        }),
+        abortPromise,
+        timeoutPromise,
       ]);
       return { ok: true, value: response };
     } catch (error) {
-      return error instanceof Error && error.message === "timeout"
-        ? {
-            ok: false,
-            error: { code: "timeout", message: "GSD request timed out", retryable: true },
-          }
-        : transportError("GSD request failed", true);
+      if (error instanceof AdapterAbortError) {
+        cancelQuietly(this.#connection, request.id);
+        return cancelled("GSD request was cancelled");
+      }
+      if (error instanceof AdapterTimeoutError) {
+        cancelQuietly(this.#connection, request.id);
+        return {
+          ok: false,
+          error: { code: "timeout", message: "GSD request timed out", retryable: true },
+        };
+      }
+      return transportError("GSD request failed", true);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      if (abort !== undefined) {
+        for (const signal of signals) signal.removeEventListener("abort", abort);
+      }
     }
+  }
+}
+
+class AdapterAbortError extends Error {
+  constructor() {
+    super("aborted");
+  }
+}
+
+class AdapterTimeoutError extends Error {
+  constructor() {
+    super("timeout");
   }
 }
 
@@ -649,9 +746,54 @@ interface StreamState {
   lastSource: bigint | undefined;
 }
 
+function addOverflowRanges(
+  ranges: Map<string, Array<[bigint, bigint]>>,
+  record: NoxscopeRecord,
+): void {
+  if (record.kind === "diagnostic-event" && record.event.type === "stream-gap") {
+    addOverflowRange(
+      ranges,
+      record.event.sourceStreamId,
+      BigInt(record.event.firstLostSequence),
+      BigInt(record.event.lastLostSequence),
+    );
+    return;
+  }
+  addOverflowRange(
+    ranges,
+    record.meta.streamId,
+    BigInt(record.meta.sequence),
+    BigInt(record.meta.sequence),
+  );
+}
+
+function addOverflowRange(
+  ranges: Map<string, Array<[bigint, bigint]>>,
+  sourceStreamId: string,
+  first: bigint,
+  last: bigint,
+): void {
+  const intervals = ranges.get(sourceStreamId) ?? [];
+  let nextFirst = first;
+  let nextLast = last;
+  const retained: Array<[bigint, bigint]> = [];
+  for (const [existingFirst, existingLast] of intervals) {
+    if (existingLast + 1n < nextFirst || nextLast + 1n < existingFirst) {
+      retained.push([existingFirst, existingLast]);
+      continue;
+    }
+    nextFirst = nextFirst < existingFirst ? nextFirst : existingFirst;
+    nextLast = nextLast > existingLast ? nextLast : existingLast;
+  }
+  retained.push([nextFirst, nextLast]);
+  retained.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  ranges.set(sourceStreamId, retained);
+}
+
 class RecordQueue<T> {
   readonly #capacity: number;
   readonly #buffer: T[] = [];
+  readonly #pending: T[] = [];
   #waiting: ((result: IteratorResult<T>) => void) | undefined;
   #closed = false;
 
@@ -659,7 +801,7 @@ class RecordQueue<T> {
     this.#capacity = capacity;
   }
 
-  push(record: T, overflowRecord: (dropped: T) => T): void {
+  push(record: T, overflowRecords: (dropped: T, incoming: T) => readonly T[]): void {
     if (this.#closed) return;
     if (this.#waiting !== undefined) {
       const resolve = this.#waiting;
@@ -669,8 +811,8 @@ class RecordQueue<T> {
     }
     if (this.#buffer.length >= this.#capacity) {
       const dropped = this.#buffer.shift();
-      if (dropped !== undefined) this.#buffer.push(overflowRecord(dropped));
-      if (this.#buffer.length >= this.#capacity) this.#buffer.shift();
+      if (dropped !== undefined) this.#pending.push(...overflowRecords(dropped, record));
+      return;
     }
     this.#buffer.push(record);
   }
@@ -685,6 +827,8 @@ class RecordQueue<T> {
     return {
       next: async () => {
         if (detached) return { done: true, value: undefined };
+        const pending = this.#pending.shift();
+        if (pending !== undefined) return { done: false, value: pending };
         const next = this.#buffer.shift();
         if (next !== undefined) return { done: false, value: next };
         if (this.#closed) return { done: true, value: undefined };
@@ -729,7 +873,17 @@ class MessagePortConnection implements GsdTransportConnection {
     this.#listener = (event) => this.receive(event.data);
     port.addEventListener("message", this.#listener);
     port.start?.();
-    signal.addEventListener("abort", () => this.close(), { once: true });
+    signal.addEventListener(
+      "abort",
+      () => {
+        try {
+          this.close();
+        } catch {
+          // A hostile port must not escape through the caller's abort event.
+        }
+      },
+      { once: true },
+    );
   }
 
   describe(): Promise<unknown> {
@@ -748,7 +902,13 @@ class MessagePortConnection implements GsdTransportConnection {
         reject(new Error("timeout"));
       }, this.#timeoutMs);
       this.#pending.set(request.id, { resolve, reject, timer });
-      this.#port.postMessage(request);
+      try {
+        this.#port.postMessage(request);
+      } catch (error) {
+        this.#pending.delete(request.id);
+        clearTimeout(timer);
+        reject(error);
+      }
     });
   }
 
@@ -773,26 +933,40 @@ class MessagePortConnection implements GsdTransportConnection {
   }
 
   private receive(value: unknown): void {
-    if (!isPlainObject(value)) return;
-    const id = typeof value.id === "string" ? value.id : undefined;
-    if (
-      id !== undefined &&
-      this.#pending.has(id) &&
-      (value.kind === "response" || value.type === "response")
-    ) {
-      const pending = this.#pending.get(id);
-      if (pending === undefined) return;
-      this.#pending.delete(id);
-      clearTimeout(pending.timer);
-      pending.resolve(value.payload);
-      return;
+    try {
+      if (!isPlainObject(value)) return;
+      const id = typeof value.id === "string" ? value.id : undefined;
+      if (
+        id !== undefined &&
+        this.#pending.has(id) &&
+        (value.kind === "response" || value.type === "response")
+      ) {
+        const pending = this.#pending.get(id);
+        if (pending === undefined) return;
+        this.#pending.delete(id);
+        clearTimeout(pending.timer);
+        pending.resolve(value.payload);
+        return;
+      }
+      this.#messages.push(value, () => [
+        {
+          version: GSD_TRANSPORT_VERSION,
+          type: "overflow",
+          stream: "events",
+          payload: { source: "message-port-queue" },
+        },
+      ]);
+    } catch {
+      this.#messages.push(
+        {
+          version: GSD_TRANSPORT_VERSION,
+          type: "overflow",
+          stream: "events",
+          payload: { source: "message-port-inspection" },
+        },
+        () => [],
+      );
     }
-    this.#messages.push(value, () => ({
-      version: GSD_TRANSPORT_VERSION,
-      type: "overflow",
-      stream: "events",
-      payload: { source: "message-port-queue" },
-    }));
   }
 }
 
@@ -805,16 +979,26 @@ async function describeRuntime(
   sanitizer: ReturnType<typeof createSanitizer>,
   pseudonymKey: Uint8Array,
   now: () => string,
+  signal: AbortSignal,
 ): Promise<Result<DescribedRuntime>> {
   let native: unknown;
+  let describePromise: Promise<unknown>;
   try {
-    native = await connection.describe();
+    describePromise = connection.describe();
+    const describedRace = await awaitOrAbort(describePromise, signal);
+    if (describedRace.state === "aborted") return cancelled("GSD handshake was cancelled");
+    native = describedRace.value;
   } catch {
     return transportError("GSD runtime handshake failed", true);
   }
-  const sanitized = await sanitizer.sanitize(native, GSD_SANITIZATION_MANIFEST, {
-    pseudonymKey,
-  });
+  let sanitized: Result<SanitizedProjection>;
+  try {
+    sanitized = await sanitizer.sanitize(native, GSD_SANITIZATION_MANIFEST, {
+      pseudonymKey,
+    });
+  } catch {
+    return invalid("GSD runtime handshake did not satisfy the adapter manifest");
+  }
   if (!sanitized.ok) return invalid("GSD runtime handshake did not satisfy the adapter manifest");
   const envelope = objectAt(sanitized.value.value, "envelope");
   if (stringAt(envelope, "version") !== GSD_TRANSPORT_VERSION) {
@@ -981,7 +1165,13 @@ function mapError(
   };
 }
 
-function meta(descriptor: RuntimeDescriptor, sequence: string, observedAt: string, stream: string) {
+function meta(
+  descriptor: RuntimeDescriptor,
+  sequence: string,
+  observedAt: string,
+  stream: string,
+  receivedAt: string,
+) {
   return {
     protocol: NOXSCOPE_PROTOCOL,
     sessionId: descriptor.sessionId,
@@ -989,7 +1179,7 @@ function meta(descriptor: RuntimeDescriptor, sequence: string, observedAt: strin
     streamId: `${descriptor.sessionId}:${stream}`,
     sequence,
     observedAt,
-    receivedAt: observedAt,
+    receivedAt,
   } as const;
 }
 
@@ -1033,9 +1223,7 @@ function parseSourceSequence(value: unknown): bigint | undefined {
 
 function lifecycleState(
   value: string | undefined,
-): Snapshot["lifecycle"] extends infer _
-  ? "starting" | "ready" | "locked" | "stopping" | "stopped" | "unknown" | undefined
-  : never {
+): "starting" | "ready" | "locked" | "stopping" | "stopped" | "unknown" | undefined {
   return ["starting", "ready", "locked", "stopping", "stopped", "unknown"].includes(value as string)
     ? (value as "starting" | "ready" | "locked" | "stopping" | "stopped" | "unknown")
     : value === undefined
@@ -1099,6 +1287,17 @@ function isErrorCode(value: string | undefined): value is NoxscopeError["code"] 
 
 function streamFor(type: string): string {
   return type === "state" ? "state" : type === "response" ? "operations" : "events";
+}
+
+function canonicalStream(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.toLowerCase().replaceAll("_", "").replaceAll("-", "");
+  if (normalized === "state") return "state";
+  if (normalized === "event" || normalized === "events" || normalized === "diagnostic")
+    return "events";
+  if (normalized === "operation" || normalized === "operations" || normalized === "response")
+    return "operations";
+  return isSafeId(value) ? value : undefined;
 }
 
 function canonicalMessageType(
@@ -1186,10 +1385,39 @@ function transportError(message: string, retryable: boolean): Result<never> {
   return { ok: false, error: { code: "unavailable", message, retryable } };
 }
 
+async function awaitOrAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+): Promise<{ readonly state: "value"; readonly value: T } | { readonly state: "aborted" }> {
+  if (signal.aborted) return { state: "aborted" };
+  let listener: (() => void) | undefined;
+  try {
+    const abort = new Promise<{ readonly state: "aborted" }>((resolve) => {
+      listener = () => resolve({ state: "aborted" });
+      signal.addEventListener("abort", listener, { once: true });
+    });
+    const value = await Promise.race([
+      promise.then((result) => ({ state: "value" as const, value: result })),
+      abort,
+    ]);
+    return value;
+  } finally {
+    if (listener !== undefined) signal.removeEventListener("abort", listener);
+  }
+}
+
 async function closeQuietly(connection: GsdTransportConnection): Promise<void> {
   try {
     await connection.close?.();
   } catch {
     /* no native errors cross the seam */
+  }
+}
+
+function cancelQuietly(connection: GsdTransportConnection, requestId: string): void {
+  try {
+    connection.cancel?.(requestId);
+  } catch {
+    /* A cancellation hint is best effort and must not mask the settled result. */
   }
 }
