@@ -10,6 +10,7 @@ import {
 } from "./index.js";
 
 const signal = () => new AbortController().signal;
+const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 describe("Moth daemon wire contract", () => {
   it("encodes and decodes a big-endian length-prefixed JSON frame", () => {
@@ -40,6 +41,53 @@ describe("Moth daemon wire contract", () => {
 });
 
 describe("read-only Moth Adapter", () => {
+  it("enforces connect deadlines and closes a factory transport that resolves late", async () => {
+    let closes = 0;
+    const transport: MothTransport = {
+      request: async () => ({ ok: true, value: {} }),
+      close: async () => {
+        closes += 1;
+      },
+    };
+    const factory: MothTransportFactory = {
+      connect: () =>
+        new Promise((resolve) => setTimeout(() => resolve({ ok: true, value: transport }), 25)),
+    };
+    const result = await createMothAdapter({
+      endpoint: { kind: "unix", path: "/tmp/moth.sock" },
+      transportFactory: factory,
+      requestTimeoutMs: 5,
+      pollingIntervalMs: 60_000,
+    }).connect({ signal: signal() });
+    expect(result).toEqual({ ok: false, error: expect.objectContaining({ code: "timeout" }) });
+    await wait(35);
+    expect(closes).toBe(1);
+  });
+
+  it("enforces request deadlines and closes a transport whose request resolves late", async () => {
+    let closes = 0;
+    const transport: MothTransport = {
+      request: async (method) => {
+        await wait(25);
+        return method === "version"
+          ? { ok: true, value: { protocol: MOTH_DAEMON_PROTOCOL } }
+          : { ok: true, value: {} };
+      },
+      close: async () => {
+        closes += 1;
+      },
+    };
+    const result = await createMothAdapter({
+      endpoint: { kind: "unix", path: "/tmp/moth.sock" },
+      transportFactory: { connect: async () => ({ ok: true, value: transport }) },
+      requestTimeoutMs: 5,
+      pollingIntervalMs: 60_000,
+    }).connect({ signal: signal() });
+    expect(result).toEqual({ ok: false, error: expect.objectContaining({ code: "timeout" }) });
+    await wait(35);
+    expect(closes).toBe(1);
+  });
+
   it("negotiates, maps getState, and advertises real unsupported gaps", async () => {
     const calls: string[] = [];
     const transport: MothTransport = {

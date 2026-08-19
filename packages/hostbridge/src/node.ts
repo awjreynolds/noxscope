@@ -169,21 +169,19 @@ class NodeWebSocketConnection implements HostBridgeConnection {
         length = this.#buffer.readUInt16BE(2);
         offset = 4;
       } else if (length === 127) {
-        if (this.#buffer.byteLength < 10 || this.#buffer.readUInt32BE(2) !== 0) {
+        if (this.#buffer.byteLength < 10) return;
+        if (this.#buffer.readUInt32BE(2) !== 0) {
           this.close();
           return;
         }
         length = this.#buffer.readUInt32BE(6);
         offset = 10;
       }
-      if (
-        !masked ||
-        length > this.#maxFrameBytes ||
-        this.#buffer.byteLength < offset + 4 + length
-      ) {
+      if (!masked || length > this.#maxFrameBytes) {
         this.close();
         return;
       }
+      if (this.#buffer.byteLength < offset + 4 + length) return;
       const control = opcode >= 0x8;
       if (control && (!fin || length > 125)) {
         this.close();

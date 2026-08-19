@@ -125,7 +125,7 @@ export interface HostBridgeServer {
 }
 
 export interface HostBridgeClient {
-  connect(): Promise<Result<HostBridgeWelcome>>;
+  connect(signal?: AbortSignal): Promise<Result<HostBridgeWelcome>>;
   close(): Promise<void>;
   waitForDescriptor(): Promise<Result<RuntimeDescriptor>>;
   request(
@@ -175,6 +175,8 @@ type WireMessage =
     }
   | { readonly type: "response"; readonly requestId: string; readonly result: Result<unknown> }
   | { readonly type: "close"; readonly reason: string };
+
+type ResponseKind = "snapshot" | "invoke" | "cancel";
 
 const CAPABILITIES = Object.freeze([
   "canonical.descriptor.read",
@@ -268,6 +270,7 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
         onRequest(message: Extract<WireMessage, { type: "request" }>) {
           const source = sessions.get(message.sessionId);
           if (source === undefined) {
+            serverConnection.expectResponse(message.requestId, message.request.kind);
             serverConnection.send({
               type: "response",
               requestId: message.requestId,
@@ -276,6 +279,7 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
             return;
           }
           if (!serverConnection.canAcceptRequest()) {
+            serverConnection.expectResponse(message.requestId, message.request.kind);
             serverConnection.send({
               type: "response",
               requestId: message.requestId,
@@ -290,6 +294,7 @@ export function createHostBridgeServer(options: HostBridgeServerOptions): HostBr
             });
             return;
           }
+          serverConnection.expectResponse(message.requestId, message.request.kind);
           serverConnection.requestStarted();
           void routeRequest(source, message.request, requestTimeoutMs).then((result) => {
             serverConnection.requestFinished();
@@ -356,6 +361,7 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
       resolve: (result: Result<unknown>) => void;
       timer: ReturnType<typeof setTimeout>;
       cleanup: () => void;
+      kind: ResponseKind;
     }
   >();
   const descriptors = new Map<string, RuntimeDescriptor>();
@@ -364,44 +370,77 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
   let descriptorWaiter: ((result: Result<RuntimeDescriptor>) => void) | undefined;
   let removeMessage: (() => void) | undefined;
   let removeClose: (() => void) | undefined;
+  let handshakeFinish: ((result: Result<HostBridgeWelcome>) => void) | undefined;
+  let handshakePromise: Promise<Result<HostBridgeWelcome>> | undefined;
+  let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
+  let handshakePoll: ReturnType<typeof setTimeout> | undefined;
+  let handshakeAbort: (() => void) | undefined;
+  let handshakeSignal: AbortSignal | undefined;
 
   const client: HostBridgeClient = {
-    async connect() {
-      if (closed) return { ok: false, error: cancelled("HostBridge client is closed") };
-      removeMessage = options.connection.onMessage((data) => onMessage(data));
-      removeClose = options.connection.onClose(() => onClose());
-      const hello: WireMessage = {
-        type: "hello",
-        protocol: HOSTBRIDGE_PROTOCOL,
-        token: options.token,
-        clientId: launchToken(),
-        capabilities: CAPABILITIES,
-      };
-      send(hello);
-      return new Promise<Result<HostBridgeWelcome>>((resolve) => {
-        const timer = setTimeout(
-          () => resolve({ ok: false, error: timeout("HostBridge handshake timed out") }),
+    connect(signal) {
+      if (closed)
+        return Promise.resolve({ ok: false, error: cancelled("HostBridge client is closed") });
+      if (signal?.aborted)
+        return Promise.resolve({
+          ok: false,
+          error: cancelled("HostBridge connection was cancelled"),
+        });
+      if (handshakePromise !== undefined) return handshakePromise;
+      handshakePromise = new Promise<Result<HostBridgeWelcome>>((resolve) => {
+        let settled = false;
+        const finish = (result: Result<HostBridgeWelcome>, shutdown = false) => {
+          if (settled) return;
+          settled = true;
+          clearHandshake();
+          handshakeFinish = undefined;
+          handshakePromise = undefined;
+          resolve(result);
+          if (shutdown) void client.close();
+        };
+        handshakeFinish = finish;
+        removeMessage = options.connection.onMessage((data) => onMessage(data));
+        removeClose = options.connection.onClose(() => onClose());
+        const hello: WireMessage = {
+          type: "hello",
+          protocol: HOSTBRIDGE_PROTOCOL,
+          token: options.token,
+          clientId: launchToken(),
+          capabilities: CAPABILITIES,
+        };
+        handshakeTimer = setTimeout(
+          () => finish({ ok: false, error: timeout("HostBridge handshake timed out") }, true),
           handshakeTimeoutMs,
         );
         const poll = () => {
+          if (settled) return;
           if (welcome !== undefined) {
-            clearTimeout(timer);
-            resolve({ ok: true, value: welcome });
+            finish({ ok: true, value: welcome });
             return;
           }
           if (closed) {
-            clearTimeout(timer);
-            resolve({ ok: false, error: unavailable("HostBridge disconnected during handshake") });
+            finish({ ok: false, error: unavailable("HostBridge disconnected during handshake") });
             return;
           }
-          setTimeout(poll, 1);
+          handshakePoll = setTimeout(poll, 1);
         };
         poll();
+        if (signal !== undefined) {
+          handshakeAbort = () =>
+            finish({ ok: false, error: cancelled("HostBridge connection was cancelled") }, true);
+          handshakeSignal = signal;
+          signal.addEventListener("abort", handshakeAbort, { once: true });
+        }
+        send(hello);
+        if (closed)
+          finish({ ok: false, error: unavailable("HostBridge disconnected during handshake") });
       });
+      return handshakePromise;
     },
     async close() {
       if (closed) return;
       closed = true;
+      clearHandshake();
       removeMessage?.();
       removeClose?.();
       options.connection.close(1000, "HostBridge client closed");
@@ -450,7 +489,7 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
         const abort = () =>
           finish({ ok: false, error: cancelled("HostBridge request was cancelled") });
         const cleanup = () => requestOptions?.signal?.removeEventListener("abort", abort);
-        pending.set(requestId, { resolve: finish, timer, cleanup });
+        pending.set(requestId, { resolve: finish, timer, cleanup, kind: request.kind });
         if (requestOptions?.signal?.aborted) abort();
         else requestOptions?.signal?.addEventListener("abort", abort, { once: true });
         if (pending.has(requestId)) send(message);
@@ -479,6 +518,16 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
   };
   return client;
 
+  function clearHandshake(): void {
+    if (handshakeTimer !== undefined) clearTimeout(handshakeTimer);
+    if (handshakePoll !== undefined) clearTimeout(handshakePoll);
+    handshakeTimer = undefined;
+    handshakePoll = undefined;
+    if (handshakeAbort !== undefined) handshakeSignal?.removeEventListener("abort", handshakeAbort);
+    handshakeAbort = undefined;
+    handshakeSignal = undefined;
+  }
+
   function send(message: WireMessage): void {
     let json: string;
     try {
@@ -498,10 +547,14 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
       void client.close();
       return;
     }
-    options.connection.send(json);
+    try {
+      options.connection.send(json);
+    } catch {
+      void client.close();
+    }
   }
   function onMessage(data: string): void {
-    if (closed || byteLength(data) > maxMessageBytes) {
+    if (closed || typeof data !== "string" || byteLength(data) > maxMessageBytes) {
       void client.close();
       return;
     }
@@ -578,7 +631,7 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
       else for (const listener of gaps) listener(gap);
     } else if (message.type === "response") {
       const request = pending.get(message.requestId);
-      if (request === undefined || !safeBridgeValue(message.result)) {
+      if (request === undefined || !validResultEnvelope(message.result, request.kind)) {
         void client.close();
         return;
       }
@@ -589,12 +642,30 @@ export function createHostBridgeClient(options: HostBridgeClientOptions): HostBr
   }
   function onClose(): void {
     closed = true;
+    clearHandshake();
+    removeMessage?.();
+    removeClose?.();
+    removeMessage = undefined;
+    removeClose = undefined;
+    const finishHandshake = handshakeFinish;
+    handshakeFinish = undefined;
+    finishHandshake?.({
+      ok: false,
+      error: unavailable("HostBridge disconnected during handshake"),
+    });
     for (const request of pending.values()) {
       request.resolve({ ok: false, error: unavailable("HostBridge disconnected") });
     }
     pending.clear();
     descriptorWaiter?.({ ok: false, error: unavailable("HostBridge disconnected") });
     descriptorWaiter = undefined;
+    bufferedRecords.clear();
+    bufferedGaps.clear();
+    descriptors.clear();
+    records.clear();
+    gaps.clear();
+    bufferedRecordCount = 0;
+    bufferedRecordBytes = 0;
   }
   function addBufferedGap(gap: HostBridgeGap): void {
     const key = `${gap.sessionId}\u0000${gap.sourceStreamId}`;
@@ -623,7 +694,7 @@ export function createHostBridgeRemoteAdapter(
     async connect(connectOptions) {
       if (connectOptions.signal.aborted)
         return { ok: false, error: cancelled("HostBridge connection was cancelled") };
-      const handshake = await options.client.connect();
+      const handshake = await options.client.connect(connectOptions.signal);
       if (!handshake.ok) return handshake;
       const descriptor = await options.client.waitForDescriptor();
       if (!descriptor.ok) return descriptor;
@@ -700,6 +771,7 @@ class ServerConnection {
   #pendingRequests = 0;
   #closed = false;
   readonly #pendingGaps = new Map<string, HostBridgeGap>();
+  readonly #responseKinds = new Map<string, ResponseKind>();
   constructor(
     connection: HostBridgeConnection,
     config: {
@@ -731,6 +803,13 @@ class ServerConnection {
   requestFinished(): void {
     this.#pendingRequests = Math.max(0, this.#pendingRequests - 1);
   }
+  expectResponse(requestId: string, kind: ResponseKind): void {
+    if (this.#closed || this.#responseKinds.size >= 128) {
+      this.close();
+      return;
+    }
+    this.#responseKinds.set(requestId, kind);
+  }
   start(): void {
     this.#timer = setTimeout(() => {
       if (!this.#authorized) this.close();
@@ -739,11 +818,17 @@ class ServerConnection {
   send(message: WireMessage): void {
     if (this.#closed) return;
     if (!this.#authorized && message.type !== "welcome") return;
+    const responseKind =
+      message.type === "response" ? this.#responseKinds.get(message.requestId) : undefined;
+    if (message.type === "response" && responseKind === undefined) {
+      this.close();
+      return;
+    }
     let json: string;
     try {
       if (
         !safeWireMessage(message) ||
-        !validWireEnvelope(message as unknown as Record<string, unknown>)
+        !validWireEnvelope(message as unknown as Record<string, unknown>, responseKind)
       ) {
         this.close();
         return;
@@ -776,6 +861,7 @@ class ServerConnection {
       return;
     }
     if (!this.#flushGaps() || !this.#trySend(json)) this.close();
+    else if (message.type === "response") this.#responseKinds.delete(message.requestId);
   }
   #trySend(json: string): boolean {
     const buffered = this.#connection.bufferedAmount ?? 0;
@@ -784,8 +870,13 @@ class ServerConnection {
       buffered + byteLength(json) > this.#config.maxBufferedBytes
     )
       return false;
-    this.#connection.send(json);
-    return true;
+    try {
+      this.#connection.send(json);
+      return true;
+    } catch {
+      this.close();
+      return false;
+    }
   }
   #queueGap(sessionId: string, sourceStreamId: string, sequence: string): void {
     const key = `${sessionId}\u0000${sourceStreamId}`;
@@ -822,6 +913,7 @@ class ServerConnection {
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#removeMessage();
     this.#removeClose();
+    this.#responseKinds.clear();
     this.#connection.close(1000, "HostBridge closed");
     this.#config.onClose();
   }
@@ -829,6 +921,7 @@ class ServerConnection {
     this.#messageCount += 1;
     if (
       this.#messageCount > HOSTBRIDGE_LIMITS.maxMessagesPerConnection ||
+      typeof data !== "string" ||
       byteLength(data) > this.#config.maxMessageBytes
     ) {
       this.close();
@@ -1041,7 +1134,7 @@ function hasDuplicateJsonKeys(json: string): boolean {
   return duplicate;
 }
 
-function validWireEnvelope(value: Record<string, unknown>): boolean {
+function validWireEnvelope(value: Record<string, unknown>, responseKind?: ResponseKind): boolean {
   switch (value.type) {
     case "hello":
       return (
@@ -1079,7 +1172,7 @@ function validWireEnvelope(value: Record<string, unknown>): boolean {
     case "request":
       return nonEmpty(value.requestId) && nonEmpty(value.sessionId) && validRequest(value.request);
     case "response":
-      return nonEmpty(value.requestId) && validResultEnvelope(value.result);
+      return nonEmpty(value.requestId) && validResultEnvelope(value.result, responseKind);
     case "close":
       return typeof value.reason === "string";
     default:
@@ -1087,13 +1180,97 @@ function validWireEnvelope(value: Record<string, unknown>): boolean {
   }
 }
 
-function validResultEnvelope(value: unknown): value is Result<unknown> {
+function validResultEnvelope(
+  value: unknown,
+  expectedKind?: ResponseKind,
+): value is Result<unknown> {
   if (!isRecord(value) || typeof value.ok !== "boolean") return false;
   const hasValue = Object.prototype.hasOwnProperty.call(value, "value");
   const hasError = Object.prototype.hasOwnProperty.call(value, "error");
   if (hasValue === hasError) return false;
-  if (value.ok) return hasValue && safeBridgeValue(value.value);
-  return hasError && isNoxscopeError(value.error);
+  if (value.ok)
+    return (
+      hasValue && exactKeys(value, ["ok", "value"]) && validResultValue(value.value, expectedKind)
+    );
+  return hasError && exactKeys(value, ["ok", "error"]) && isNoxscopeError(value.error);
+}
+
+function validResultValue(value: unknown, expectedKind?: ResponseKind): boolean {
+  if (expectedKind === "cancel")
+    return isRecord(value) && exactKeys(value, ["accepted"]) && typeof value.accepted === "boolean";
+  if (expectedKind === "invoke") return isCanonicalOperationTerminal(value);
+  if (expectedKind === "snapshot") return isCanonicalSnapshot(value);
+  return (
+    isCanonicalSnapshot(value) ||
+    isCanonicalOperationTerminal(value) ||
+    (isRecord(value) && exactKeys(value, ["accepted"]) && typeof value.accepted === "boolean")
+  );
+}
+
+function isCanonicalSnapshot(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      "revision",
+      "freshness",
+      "lifecycle",
+      "identity",
+      "network",
+      "sync",
+      "balances",
+      "addresses",
+      "dust",
+      "transactions",
+      "dependencies",
+      "raw",
+    ])
+  )
+    return false;
+  const checked = validateRecord({
+    kind: "snapshot",
+    meta: {
+      protocol: NOXSCOPE_PROTOCOL,
+      sessionId: "hostbridge",
+      runtimeId: "hostbridge",
+      streamId: "hostbridge",
+      sequence: "0",
+      observedAt: "1970-01-01T00:00:00.000Z",
+      receivedAt: "1970-01-01T00:00:00.000Z",
+    },
+    snapshot: value,
+  });
+  return checked.ok;
+}
+
+function isCanonicalOperationTerminal(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["kind", "phase", "state", "progress", "result", "error", "raw"])
+  )
+    return false;
+  if (
+    !nonEmpty(value.kind) ||
+    !nonEmpty(value.phase) ||
+    !["succeeded", "failed", "cancelled"].includes(value.state as string)
+  )
+    return false;
+  if (
+    value.progress !== undefined &&
+    (typeof value.progress !== "number" ||
+      !Number.isFinite(value.progress) ||
+      value.progress < 0 ||
+      value.progress > 100)
+  )
+    return false;
+  if (value.result !== undefined && !safeBridgeValue(value.result)) return false;
+  if (value.error !== undefined && !isNoxscopeError(value.error)) return false;
+  if (value.raw !== undefined && !safeBridgeValue(value.raw)) return false;
+  return value.state !== "failed" || value.error !== undefined;
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const keys = new Set(allowed);
+  return Object.keys(value).every((key) => keys.has(key));
 }
 
 function isNoxscopeError(value: unknown): boolean {
@@ -1118,6 +1295,7 @@ function isNoxscopeError(value: unknown): boolean {
   )
     return false;
   return (
+    exactKeys(value, ["code", "message", "retryable", "retryAfterMs", "capability", "raw"]) &&
     (value.retryAfterMs === undefined ||
       (typeof value.retryAfterMs === "number" &&
         Number.isFinite(value.retryAfterMs) &&
@@ -1214,48 +1392,34 @@ class RemoteQueue {
   readonly #descriptor: RuntimeDescriptor;
   readonly #items: NoxscopeRecord[] = [];
   readonly #waiters: ((result: IteratorResult<NoxscopeRecord>) => void)[] = [];
+  readonly #pendingGaps = new Map<string, HostBridgeGap>();
   #closed = false;
-  #pendingGap: HostBridgeGap | undefined;
   constructor(descriptor: RuntimeDescriptor) {
     this.#descriptor = descriptor;
   }
   push(record: NoxscopeRecord): void {
     if (this.#closed) return;
     if (this.#items.length >= RemoteQueue.MAX_ITEMS) {
-      const existing = this.#pendingGap;
-      this.#pendingGap =
-        existing === undefined
-          ? {
-              sessionId: record.meta.sessionId,
-              sourceStreamId: record.meta.streamId,
-              firstLostSequence: record.meta.sequence,
-              lastLostSequence: record.meta.sequence,
-            }
-          : { ...existing, lastLostSequence: record.meta.sequence };
+      this.#rememberGap(record);
       return;
     }
-    if (this.#pendingGap !== undefined) {
-      const gap = makeGapRecord(this.#descriptor, this.#pendingGap);
-      this.#pendingGap = undefined;
-      if (this.#items.length >= RemoteQueue.MAX_ITEMS) this.#items.shift();
-      this.#items.push(gap);
-      if (this.#items.length >= RemoteQueue.MAX_ITEMS) {
-        this.#pendingGap = {
-          sessionId: record.meta.sessionId,
-          sourceStreamId: record.meta.streamId,
-          firstLostSequence: record.meta.sequence,
-          lastLostSequence: record.meta.sequence,
-        };
-        return;
-      }
-    }
     const waiter = this.#waiters.shift();
-    if (waiter) waiter({ done: false, value: record });
-    else this.#items.push(record);
+    if (waiter) {
+      const gap = this.#takeGap();
+      waiter({ done: false, value: gap === undefined ? record : gap });
+      return;
+    }
+    this.#flushGaps();
+    if (this.#items.length >= RemoteQueue.MAX_ITEMS) {
+      this.#rememberGap(record);
+      return;
+    }
+    this.#items.push(record);
   }
   close(): void {
     this.#closed = true;
     this.#items.length = 0;
+    this.#pendingGaps.clear();
     for (const waiter of this.#waiters.splice(0)) waiter({ done: true, value: undefined });
   }
   iterator(): AsyncIterator<NoxscopeRecord> {
@@ -1264,6 +1428,8 @@ class RemoteQueue {
         const item = this.#items.shift();
         if (item) return { done: false, value: item };
         if (this.#closed) return { done: true, value: undefined };
+        const gap = this.#takeGap();
+        if (gap !== undefined) return { done: false, value: gap };
         if (this.#waiters.length >= RemoteQueue.MAX_WAITERS)
           return { done: true, value: undefined };
         return new Promise((resolve) => this.#waiters.push(resolve));
@@ -1272,10 +1438,42 @@ class RemoteQueue {
         this.#closed = true;
         for (const waiter of this.#waiters.splice(0)) waiter({ done: true, value: undefined });
         this.#items.length = 0;
-        this.#pendingGap = undefined;
+        this.#pendingGaps.clear();
         return { done: true, value: undefined };
       },
     };
+  }
+  #rememberGap(record: NoxscopeRecord): void {
+    const key = `${record.meta.sessionId}\u0000${record.meta.streamId}`;
+    const existing = this.#pendingGaps.get(key);
+    if (existing !== undefined) {
+      if (BigInt(record.meta.sequence) > BigInt(existing.lastLostSequence))
+        this.#pendingGaps.set(key, { ...existing, lastLostSequence: record.meta.sequence });
+      return;
+    }
+    if (this.#pendingGaps.size >= 128) {
+      this.close();
+      return;
+    }
+    this.#pendingGaps.set(key, {
+      sessionId: record.meta.sessionId,
+      sourceStreamId: record.meta.streamId,
+      firstLostSequence: record.meta.sequence,
+      lastLostSequence: record.meta.sequence,
+    });
+  }
+  #takeGap(): NoxscopeRecord | undefined {
+    const first = this.#pendingGaps.entries().next().value as [string, HostBridgeGap] | undefined;
+    if (first === undefined) return undefined;
+    this.#pendingGaps.delete(first[0]);
+    return makeGapRecord(this.#descriptor, first[1]);
+  }
+  #flushGaps(): void {
+    while (this.#items.length < RemoteQueue.MAX_ITEMS) {
+      const gap = this.#takeGap();
+      if (gap === undefined) return;
+      this.#items.push(gap);
+    }
   }
 }
 

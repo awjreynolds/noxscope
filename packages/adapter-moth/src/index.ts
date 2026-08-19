@@ -115,16 +115,35 @@ export function createMothAdapter(options: MothAdapterOptions): NoxscopeAdapter 
   return {
     async connect(connectOptions) {
       if (connectOptions.signal.aborted) return cancelled("Moth connection was cancelled");
-      const transportResult = await resolved.transportFactory.connect(resolved.endpoint, {
-        signal: connectOptions.signal,
-        timeoutMs: resolved.requestTimeoutMs,
-      });
+      const transportCall = await withMothDeadline(
+        (signal) =>
+          resolved.transportFactory.connect(resolved.endpoint, {
+            signal,
+            timeoutMs: resolved.requestTimeoutMs,
+          }),
+        connectOptions.signal,
+        resolved.requestTimeoutMs,
+        (late) => {
+          if (late.ok) void closeQuietly(late.value);
+        },
+      );
+      if (!transportCall.ok) return transportCall;
+      const transportResult = transportCall.value;
       if (!transportResult.ok) return transportResult;
       const transport = transportResult.value;
-      const versionResult = await transport.request("version", undefined, {
-        signal: connectOptions.signal,
-        timeoutMs: resolved.requestTimeoutMs,
-      });
+      const versionCall = await withMothDeadline(
+        (signal) =>
+          transport.request("version", undefined, {
+            signal,
+            timeoutMs: resolved.requestTimeoutMs,
+          }),
+        connectOptions.signal,
+        resolved.requestTimeoutMs,
+        undefined,
+        () => void closeQuietly(transport),
+      );
+      if (!versionCall.ok) return versionCall;
+      const versionResult = versionCall.value;
       if (!versionResult.ok) {
         await closeQuietly(transport);
         return publicError(versionResult.error, "Moth version negotiation failed");
@@ -145,10 +164,19 @@ export function createMothAdapter(options: MothAdapterOptions): NoxscopeAdapter 
           },
         };
       }
-      const stateResult = await transport.request("getState", undefined, {
-        signal: connectOptions.signal,
-        timeoutMs: resolved.requestTimeoutMs,
-      });
+      const stateCall = await withMothDeadline(
+        (signal) =>
+          transport.request("getState", undefined, {
+            signal,
+            timeoutMs: resolved.requestTimeoutMs,
+          }),
+        connectOptions.signal,
+        resolved.requestTimeoutMs,
+        undefined,
+        () => void closeQuietly(transport),
+      );
+      if (!stateCall.ok) return stateCall;
+      const stateResult = stateCall.value;
       if (!stateResult.ok) {
         await closeQuietly(transport);
         return publicError(stateResult.error, "Moth state request failed");
@@ -1009,6 +1037,67 @@ async function closeQuietly(transport: MothTransport): Promise<void> {
   }
 }
 
+function withMothDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  parentSignal: AbortSignal,
+  timeoutMs: number,
+  onLate?: (value: T) => void,
+  onTimeout?: () => void,
+): Promise<Result<T>> {
+  return new Promise((resolve) => {
+    const controller = new AbortController();
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      controller.abort();
+      onTimeout?.();
+      finish({
+        ok: false,
+        error: { code: "timeout", message: "Moth operation timed out", retryable: true },
+      });
+    }, timeoutMs);
+    const abort = () => {
+      if (settled) return;
+      controller.abort();
+      onTimeout?.();
+      finish(cancelled("Moth operation was cancelled"));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      parentSignal.removeEventListener("abort", abort);
+    };
+    const finish = (result: Result<T>) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    if (parentSignal.aborted) {
+      abort();
+      return;
+    }
+    parentSignal.addEventListener("abort", abort, { once: true });
+    void Promise.resolve()
+      .then(() => operation(controller.signal))
+      .then(
+        (value) => {
+          if (settled) {
+            onLate?.(value);
+            return;
+          }
+          finish({ ok: true, value });
+        },
+        () => {
+          if (settled) return;
+          finish({
+            ok: false,
+            error: { code: "unavailable", message: "Moth operation failed", retryable: true },
+          });
+        },
+      );
+  });
+}
+
 class RecordQueue {
   static readonly MAX_ITEMS = 1_024;
   static readonly MAX_WAITERS = 128;
@@ -1237,12 +1326,26 @@ class NodeMothTransport implements MothTransport {
         resolve(result);
       };
       const timer = setTimeout(() => {
+        this.#terminate();
         finish({
           ok: false,
           error: { code: "timeout", message: "Moth daemon request timed out", retryable: true },
         });
+        this.#failAll({
+          code: "unavailable",
+          message: "Moth daemon transport reset",
+          retryable: true,
+        });
       }, timeoutMs);
-      const abort = () => finish(cancelled("Moth daemon request was cancelled"));
+      const abort = () => {
+        this.#terminate();
+        finish(cancelled("Moth daemon request was cancelled"));
+        this.#failAll({
+          code: "unavailable",
+          message: "Moth daemon transport reset",
+          retryable: true,
+        });
+      };
       const cleanup = () => options.signal?.removeEventListener("abort", abort);
       this.#pending.set(id, { resolve: finish, timer, cleanup });
       this.#socket.write(frame, (error) => {
@@ -1266,9 +1369,13 @@ class NodeMothTransport implements MothTransport {
   }
   async close(): Promise<void> {
     if (this.#closed) return;
-    this.#closed = true;
-    this.#socket.destroy();
+    this.#terminate();
     this.#failAll({ code: "cancelled", message: "Moth daemon transport closed", retryable: false });
+  }
+  #terminate(): void {
+    this.#closed = true;
+    this.#buffer = new Uint8Array(0);
+    this.#socket.destroy();
   }
   #onData(chunk: Uint8Array): void {
     const next = new Uint8Array(this.#buffer.byteLength + chunk.byteLength);

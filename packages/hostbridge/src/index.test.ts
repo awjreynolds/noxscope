@@ -5,6 +5,7 @@ import {
   createHostBridgeRemoteAdapter,
   createHostBridgeServer,
   createMemoryHostBridgePair,
+  type HostBridgeConnection,
   type HostBridgeSessionSource,
 } from "./index.js";
 import { NOXSCOPE_PROTOCOL, type RuntimeDescriptor, type SnapshotRecord } from "@noxscope/protocol";
@@ -46,8 +47,51 @@ const record = (sequence: string): SnapshotRecord => ({
     },
   },
 });
+const recordOnStream = (streamId: string, sequence: string): SnapshotRecord => {
+  const value = record(sequence);
+  return { ...value, meta: { ...value.meta, streamId } };
+};
+
+const idleConnection = (): HostBridgeConnection & { readonly closeCount: () => number } => {
+  const messages = new Set<(data: string) => void>();
+  const closes = new Set<() => void>();
+  let closeCount = 0;
+  return {
+    origin: "http://localhost:5173",
+    loopback: true,
+    bufferedAmount: 0,
+    send: () => {},
+    close: () => {
+      closeCount += 1;
+      for (const listener of closes) listener();
+    },
+    onMessage: (listener) => {
+      messages.add(listener);
+      return () => messages.delete(listener);
+    },
+    onClose: (listener) => {
+      closes.add(listener);
+      return () => closes.delete(listener);
+    },
+    closeCount: () => closeCount,
+  };
+};
 
 describe("HostBridge handshake and policy", () => {
+  it("closes and cancels all handshake timers after timeout", async () => {
+    const connection = idleConnection();
+    const client = createHostBridgeClient({
+      connection,
+      token: "t",
+      origin: "http://localhost:5173",
+      handshakeTimeoutMs: 5,
+    });
+    const result = await client.connect();
+    expect(result).toEqual({ ok: false, error: expect.objectContaining({ code: "timeout" }) });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(connection.closeCount()).toBe(1);
+  });
+
   it("requires loopback, exact origin, launch token, and protocol version", async () => {
     const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
     const server = createHostBridgeServer({
@@ -92,9 +136,84 @@ describe("HostBridge handshake and policy", () => {
     pair.client.receive(JSON.stringify({ type: "proxy", command: "cat /secret" }));
     expect(server.connections()).toBe(0);
   });
+
+  it("rejects a success envelope whose value is not the requested canonical result", async () => {
+    const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
+    const source: HostBridgeSessionSource = {
+      descriptor,
+      async *records() {},
+      request: (async () => ({
+        ok: true,
+        value: { evil: "accepted" },
+      })) as unknown as HostBridgeSessionSource["request"],
+    };
+    const server = createHostBridgeServer({
+      allowedOrigins: ["http://localhost:5173"],
+      token: "t",
+    });
+    server.accept(pair.server);
+    await server.attach(source);
+    const client = createHostBridgeClient({
+      connection: pair.client,
+      token: "t",
+      origin: "http://localhost:5173",
+    });
+    expect((await client.connect()).ok).toBe(true);
+    const result = await client.request(descriptor.sessionId, {
+      kind: "snapshot",
+      requestId: "evil",
+    });
+    expect(result).toEqual({ ok: false, error: expect.objectContaining({ code: "unavailable" }) });
+  });
 });
 
 describe("remote canonical session", () => {
+  it("keeps overflow gap summaries separate for each source stream", async () => {
+    const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
+    const source: HostBridgeSessionSource = {
+      descriptor,
+      async *records() {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        for (let index = 0; index < 2_048; index += 1)
+          yield recordOnStream(index % 2 === 0 ? "stream-a" : "stream-b", (index + 1).toString());
+      },
+      request: (async () => ({
+        ok: true,
+        value: record("3").snapshot,
+      })) as unknown as HostBridgeSessionSource["request"],
+    };
+    const server = createHostBridgeServer({
+      allowedOrigins: ["http://localhost:5173"],
+      token: "t",
+    });
+    server.accept(pair.server);
+    await server.attach(source);
+    const client = createHostBridgeClient({
+      connection: pair.client,
+      token: "t",
+      origin: "http://localhost:5173",
+    });
+    const connected = await createHostBridgeRemoteAdapter({ client }).connect({
+      signal: new AbortController().signal,
+    });
+    expect(connected.ok).toBe(true);
+    if (!connected.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const iterator = connected.value[Symbol.asyncIterator]();
+    for (let index = 0; index < 1_024; index += 1) await iterator.next();
+    const firstGap = await iterator.next();
+    const secondGap = await iterator.next();
+    const streams = [firstGap, secondGap].map((item) =>
+      item.done || item.value.kind !== "diagnostic-event"
+        ? ""
+        : item.value.event.type === "stream-gap"
+          ? item.value.event.sourceStreamId
+          : "",
+    );
+    expect(new Set(streams)).toEqual(new Set(["stream-a", "stream-b"]));
+    await client.close();
+  });
+
   it("streams validated descriptors/records and turns overflow into deterministic gaps", async () => {
     const pair = createMemoryHostBridgePair({ origin: "http://localhost:5173", loopback: true });
     const source: HostBridgeSessionSource = {
